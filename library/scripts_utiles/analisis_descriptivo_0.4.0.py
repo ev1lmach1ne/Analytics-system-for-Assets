@@ -87,6 +87,19 @@ cum_returns = np.exp(r.cumsum())
 peak        = cum_returns.cummax()
 mdd         = ((cum_returns - peak) / peak).min()
 
+# ── CÁLCULO DE UMBRALES ADAPTATIVOS PARA EL DICTIONARY ────────────────────────
+er_medio         = df['ER'].mean()
+er_std           = df['ER'].std()
+
+# 1º desviación positiva (tendencia) y negativa (ruido)
+umbral_tendencia = min(0.95, er_medio + er_std)
+umbral_ruido     = max(0.05, er_medio - er_std)
+
+# Conteos basados en las desviaciones reales
+total_tendencia  = (df['ER'] > umbral_tendencia).sum()
+total_ruido      = (df['ER'] < umbral_ruido).sum()
+
+
 metricas = {
     'Periodo':                f"{df.index.min().date()} → {df.index.max().date()}",
     'Total velas':            f"{len(df):,}",
@@ -108,6 +121,7 @@ metricas = {
     'ER maximo':              f"{df['ER'].max():.4f}",
     'ER minimo':              f"{df['ER'].min():.4f}",
     'Periodos tendencia (ER>0.5)': f"{(df['ER'] > 0.5).sum():,}",
+    'Paseo aleatorio (Random Walk) (ER 0.3-0.5)': f"{((df['ER'] >= 0.3) & (df['ER'] <= 0.5)).sum():,}",
     'Periodos ruido (ER<0.3)':     f"{(df['ER'] < 0.3).sum():,}",
     'Jarque-Bera stat':       f"{stat_jb:.2f}",
     'Jarque-Bera p-value':    f"{p_jb:.6f}",
@@ -391,6 +405,7 @@ with PdfPages(OUTPUT_PDF) as pdf:
         print("Generando página 5/5 — Análisis de Riesgos ")
     except Exception as e:
         print(f"ERROR EN PÁGINA 5: {e}")
+
 
 # ── FINALIZACIÓN ──────────────────────────────────────────────────────────────
 print(f"{'='*60}")
