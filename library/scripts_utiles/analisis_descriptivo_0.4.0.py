@@ -349,19 +349,22 @@ with PdfPages(OUTPUT_PDF) as pdf:
 
     pdf.savefig(fig, facecolor=fig.get_facecolor())
     plt.close()
-    print("Generando página 4/5 — Precio por régimen ER... ✅")
-
-    # ── PÁGINA 5 — Análisis de Riesgo: Diario vs Anual ────────
+    print("Generando página 4/5 — Precio por régimen ER... ")
+    
+# ── PÁGINA 5 — Análisis de Riesgo: Diario vs Anual ────────
     try:
         fig = plt.figure(figsize=(11.69, 8.27))
         fig.patch.set_facecolor('#0f0f0f')
-        gs = gridspec.GridSpec(2, 1, height_ratios=[1, 1], hspace=0.4)
+        gs = gridspec.GridSpec(2, 1, height_ratios=[1, 1], hspace=0.55)
 
         # Configuraciones de desviaciones: 1σ, 2σ, 3σ
         sigmas = [1, 2, 3]
         colores_sigmas = ['#1D9E75', '#BA7517', '#E24B4A'] # Verde, Naranja, Rojo
+        
+        # Limpieza de la serie de retornos original (horaria, minutal, etc.)
+        r_limp = r[np.isfinite(r)].copy()
 
-        def dibujar_campana_extendida(ax, media, std, titulo):
+        def dibujar_campana_extendida(ax, media, std, titulo, factor_velas, es_anual=False):
             ax.set_facecolor('#111111')
             # Ajustamos el rango de x
             x = np.linspace(media - 4*std, media + 4*std, 200)
@@ -374,35 +377,66 @@ with PdfPages(OUTPUT_PDF) as pdf:
                 ax.fill_between(x, y, where=(x >= media-s*std) & (x <= media+s*std), 
                                 color=colores_sigmas[s-1], alpha=0.15)
                 
-                # Etiquetas
                 for lado in [-1, 1]:
                     val = media + (lado * s * std)
-                    ax.axvline(val, color=colores_sigmas[s-1], linestyle=':', alpha=0.6)
+                    # Línea vertical completamente limpia en el lienzo, sin texto acoplado flotando
+                    ax.axvline(val, color=colores_sigmas[s-1], linestyle=':', alpha=0.5)
                     
+                    # --- CÁLCULO DE FRECUENCIA EMPÍRICA REAL EN LAS COLAS ---
+                    # Desescalamos el umbral actual a nivel de la vela individual del CSV
+                    umbral_individual = val / np.sqrt(factor_velas)
+                    
+                    if lado == -1:
+                        prob_evento = np.mean(r_limp <= umbral_individual)
+                    else:
+                        prob_evento = np.mean(r_limp >= umbral_individual)
+                    
+                    # --- FORMATEO DINÁMICO DE CADENCIA CON DECIMALES ---
+                    if prob_evento > 0:
+                        velas_espera = 1 / prob_evento
+                        if not es_anual:
+                            # Convertimos la espera de velas a días usando el factor dinámico
+                            unidades_espera = velas_espera / (velas_por_dia if velas_por_dia else 24)
+                            texto_frecuencia = f"1 c/{unidades_espera:.1f}d" if unidades_espera >= 1 else f"{int(1/unidades_espera)}x/d"
+                        else:
+                            # Convertimos la espera de velas a años usando el factor dinámico
+                            unidades_espera = velas_espera / (velas_por_anio if velas_por_anio else 8760)
+                            texto_frecuencia = f"1 c/{unidades_espera:.1f}añ" if unidades_espera >= 1 else f"{int(1/unidades_espera)}x/añ"
+                    else:
+                        texto_frecuencia = "No reg."
+
                     # Limitamos visualmente el retorno negativo a -99.9%
                     val_mostrado = max(val, -0.999) if lado == -1 else val
                     
-                    etiqueta = f"{lado*s}σ\n({val_mostrado:.2%})" 
-                    ax.text(val, max(y)*0.75, etiqueta, color='white', fontsize=7, 
-                            ha='center', fontweight='bold', bbox=dict(facecolor='black', alpha=0.5, edgecolor='none', pad=1))
+                    # Colocación alterna y ordenada de los textos estrictamente en la base del eje X
+                    nivel_escalon = 0.05 if s % 2 != 0 else 0.14
+                    etiqueta = f"{lado*s}σ: {val_mostrado:.1%}\n({texto_frecuencia})" 
+                    
+                    ax.text(val, -max(y) * nivel_escalon, etiqueta, color=colores_sigmas[s-1], fontsize=6.5, 
+                            ha='center', fontweight='bold', bbox=dict(facecolor='black', alpha=0.8, edgecolor='none', pad=1))
 
-            ax.axvline(media, color='white', linestyle='--', linewidth=1.2, label=f'Media: {media:.2%}')
+            # Línea central de la media y etiqueta en la base
+            ax.axvline(media, color='white', linestyle='--', linewidth=1.2, alpha=0.5)
+            ax.text(media, -max(y)*0.05, f"μ: {media:.2%}", color='white', fontsize=7.5,
+                    ha='center', fontweight='bold', bbox=dict(facecolor='black', alpha=0.8, edgecolor='none', pad=1))
+
+            ax.set_ylim(-max(y)*0.24, max(y)*1.15)
             ax.set_title(titulo, color='white', fontsize=12)
             ax.tick_params(colors='#888780')
-            ax.grid(True, alpha=0.1)
+            ax.grid(True, alpha=0.03)
             ax.legend(facecolor='#222', labelcolor='white', fontsize=8, loc='upper right')
 
-        # 1. Gráfico Diario
+        # 1. Gráfico Diario (Frecuencia evaluada en días)
         ax1 = fig.add_subplot(gs[0])
-        dibujar_campana_extendida(ax1, ret_diario, vol_diaria, f"Retorno Diario (Vol: {vol_diaria:.2%})")
+        dibujar_campana_extendida(ax1, ret_diario, vol_diaria, f"Retorno Diario (Vol: {vol_diaria:.2%})", velas_por_dia, es_anual=False)
 
-        # 2. Gráfico Anual
+        # 2. Gráfico Anual (Frecuencia evaluada en años)
         ax2 = fig.add_subplot(gs[1])
-        dibujar_campana_extendida(ax2, ret_anual, vol_anual, f"Retorno Anual (Vol: {vol_anual:.2%})")
+        dibujar_campana_extendida(ax2, ret_anual, vol_anual, f"Retorno Anual (Vol: {vol_anual:.2%})", velas_por_anio, es_anual=True)
 
         pdf.savefig(fig, facecolor=fig.get_facecolor())
         plt.close()
-        print("Generando página 5/5 — Análisis de Riesgos ")
+        print("Generando página 5/5 — Análisis de Riesgos (Estructura Original Corregida)")
     except Exception as e:
         print(f"ERROR EN PÁGINA 5: {e}")
 
