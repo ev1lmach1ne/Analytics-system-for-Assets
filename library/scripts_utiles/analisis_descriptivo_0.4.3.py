@@ -643,12 +643,11 @@ with PdfPages(OUTPUT_PDF) as pdf:
     plt.close()
     print("Generando página 4/5 — Precio por régimen ER...")
 
-# ── PÁGINA 5 — Análisis de Riesgo y Value at Risk (VaR) ────────
+# ── PÁGINA 5 — Análisis de Riesgo: Diario vs Anual ────────
     try:
         fig = plt.figure(figsize=(11.69, 8.27))
         fig.patch.set_facecolor('#0f0f0f')
-        # Cambiamos a 3 filas con ratios iguales y un hspace ajustado para que queden perfectos
-        gs = gridspec.GridSpec(3, 1, height_ratios=[1, 1, 1], hspace=0.65)
+        gs = gridspec.GridSpec(2, 1, height_ratios=[1, 1], hspace=0.55)
 
         sigmas = [1, 2, 3]
         colores_sigmas = ['#1D9E75', '#BA7517', '#E24B4A'] # Verde, Naranja, Rojo
@@ -668,10 +667,12 @@ with PdfPages(OUTPUT_PDF) as pdf:
                 
                 for lado in [-1, 1]:
                     val = media + (lado * s * std)
+                    # Línea de puntos completamente limpia en el lienzo gráfico
                     ax.axvline(val, color=colores_sigmas[s-1], linestyle=':', alpha=0.5)
                     
                     if not es_anual:
                         # --- GRÁFICO 1: FRECUENCIA EN DÍAS REALES ---
+                        # Evaluamos el umbral de este nivel sigma directamente en la serie diaria real
                         if lado == -1:
                             prob_evento = np.mean(r_diario_real <= val)
                         else:
@@ -684,6 +685,7 @@ with PdfPages(OUTPUT_PDF) as pdf:
                             texto_frecuencia = "No reg."
                     else:
                         # --- GRÁFICO 2: FRECUENCIA EN AÑOS REALES ---
+                        # Para evaluar el umbral anualizado en datos diarios, lo desescalamos con la raíz del tiempo
                         factor_regimen_dias = 365 if CONFIG['activo'] == 'CRYPTO' else 252
                         umbral_corte_desescalado = val / np.sqrt(factor_regimen_dias)
                         
@@ -699,86 +701,44 @@ with PdfPages(OUTPUT_PDF) as pdf:
                         else:
                             texto_frecuencia = "No reg."
 
+                    # Ajuste visual para evitar que los retornos negativos rompan la escala del 100%
                     val_mostrado = max(val, -0.999) if lado == -1 else val
                     
+                    # Colocación ordenada y escalonada de textos estrictamente en la base del eje X
                     nivel_escalon = 0.05 if s % 2 != 0 else 0.14
                     etiqueta = f"{lado*s}σ: {val_mostrado:.1%}\n({texto_frecuencia})" 
                     
-                    ax.text(val, -max(y) * nivel_escalon, etiqueta, color=colores_sigmas[s-1], fontsize=6, 
+                    ax.text(val, -max(y) * nivel_escalon, etiqueta, color=colores_sigmas[s-1], fontsize=6.5, 
                             ha='center', fontweight='bold', bbox=dict(facecolor='black', alpha=0.8, edgecolor='none', pad=1))
 
+            # Línea central de la media (μ)
             ax.axvline(media, color='white', linestyle='--', linewidth=1.2, alpha=0.5)
-            ax.text(media, -max(y)*0.05, f"μ: {media:.2%}", color='white', fontsize=7,
+            ax.text(media, -max(y)*0.05, f"μ: {media:.2%}", color='white', fontsize=7.5,
                     ha='center', fontweight='bold', bbox=dict(facecolor='black', alpha=0.8, edgecolor='none', pad=1))
 
             ax.set_ylim(-max(y)*0.24, max(y)*1.15)
-            ax.set_title(titulo, color='white', fontsize=10)
-            ax.tick_params(colors='#888780', labelsize=8)
+            ax.set_title(titulo, color='white', fontsize=12)
+            ax.tick_params(colors='#888780')
             ax.grid(True, alpha=0.03)
             
+            # Mostramos en la esquina superior la asimetría y curtosis reales de la serie diaria agrupada
             skew_local = stats.skew(r_diario_real)
             kurt_local = stats.kurtosis(r_diario_real, fisher=True)
             texto_stats = f"Skewness (Muestra Diaria): {skew_local:.2f} | Kurtosis (Muestra Diaria): {kurt_local:.2f}"
-            ax.text(0.015, 0.93, texto_stats, transform=ax.transAxes, color='#888780', fontsize=7, verticalalignment='top')
-            ax.legend(facecolor='#222', labelcolor='white', fontsize=7, loc='upper right')
+            ax.text(0.015, 0.95, texto_stats, transform=ax.transAxes, color='#888780', fontsize=7.5, verticalalignment='top')
+            ax.legend(facecolor='#222', labelcolor='white', fontsize=8, loc='upper right')
 
-        # 1. Gráfico Diario
+        # 1. Gráfico Diario (Consume la variable global estructurada arriba)
         ax1 = fig.add_subplot(gs[0])
-        dibujar_campana_extendida(ax1, ret_diario, vol_diaria, f"Proyección de Retorno Diario (Vol Proyectada: {vol_diaria:.2%})", es_anual=False)
+        dibujar_campana_extendida(ax1, ret_diario, vol_diaria, f"Retorno Diario (Vol Proyectada: {vol_diaria:.2%})", es_anual=False)
 
-        # 2. Gráfico Anual
+        # 2. Gráfico Anual (Consume la misma variable para proyectar las frecuencias formalmente)
         ax2 = fig.add_subplot(gs[1])
-        dibujar_campana_extendida(ax2, ret_anual, vol_anual, f"Proyección de Retorno Anual (Vol Proyectada: {vol_anual:.2%})", es_anual=True)
-
-        # 3. [REINCORPORADO] Gráfico de Análisis de Muestra y Value at Risk (VaR)
-        ax3 = fig.add_subplot(gs[2])
-        ax3.set_facecolor('#111111')
-        
-        # Para la curva base del VaR usamos los parámetros de la muestra diaria agrupada
-        mu_var = r_diario_real.mean()
-        std_var = r_diario_real.std()
-        x_v = np.linspace(mu_var - 4*std_var, mu_var + 4*std_var, 200)
-        y_v = stats.norm.pdf(x_v, mu_var, std_var)
-        
-        ax3.plot(x_v, y_v, color='#555555', linewidth=1.5, linestyle='--', label='Perfil de Riesgo Diario')
-        
-        # Mapeo de configuraciones del VaR (usando las variables ya calculadas en tu script principal)
-        # Nota: Multiplicamos por la escala diaria si tus variables originales venían a nivel de vela corta, 
-        # o las dejamos nativas si usas los percentiles de la muestra.
-        lista_vars = [
-            {'val': var_95_hist,  'col': '#BA7517', 'ls': '-',  'lbl': 'VaR 95% Hist', 'esc': 0.05},
-            {'val': var_99_hist,  'col': '#E24B4A', 'ls': '-',  'lbl': 'VaR 99% Hist', 'esc': 0.14},
-            {'val': var_95_param, 'col': '#1D9E75', 'ls': ':',  'lbl': 'VaR 95% Par',  'esc': 0.05},
-            {'val': var_99_param, 'col': '#A04BE2', 'ls': ':',  'lbl': 'VaR 99% Par',  'esc': 0.14}
-        ]
-        
-        # Dibujamos las zonas de estrés y las líneas de corte del VaR limpias
-        ax3.fill_between(x_v, y_v, where=(x_v <= mu_var), color='#E24B4A', alpha=0.08)
-        
-        for v in lista_vars:
-            if v['val'] is not None:
-                # Línea vertical totalmente nítida
-                ax3.axvline(v['val'], color=v['col'], linestyle=v['ls'], linewidth=1.2, alpha=0.7)
-                
-                # Rotulado exclusivo en la base del gráfico con su color correspondiente
-                etiqueta_var = f"{v['lbl']}\n{v['val']:.2%}"
-                ax3.text(v['val'], -max(y_v) * v['esc'], etiqueta_var, color=v['col'], fontsize=6,
-                         ha='center', fontweight='bold', bbox=dict(facecolor='black', alpha=0.8, edgecolor='none', pad=1))
-
-        # Media de referencia en el gráfico de VaR
-        ax3.axvline(mu_var, color='white', linestyle='--', linewidth=1, alpha=0.4)
-        ax3.text(mu_var, -max(y_v)*0.05, f"μ: {mu_var:.2%}", color='white', fontsize=6.5,
-                 ha='center', fontweight='bold', bbox=dict(facecolor='black', alpha=0.8, edgecolor='none', pad=1))
-
-        ax3.set_ylim(-max(y_v)*0.24, max(y_v)*1.15)
-        ax3.set_title("Análisis Estocástico: Modelado del Value at Risk (VaR) Diario", color='white', fontsize=10)
-        ax3.tick_params(colors='#888780', labelsize=8)
-        ax3.grid(True, alpha=0.03)
-        ax3.legend(facecolor='#222', labelcolor='white', fontsize=7, loc='upper right')
+        dibujar_campana_extendida(ax2, ret_anual, vol_anual, f"Retorno Anual (Vol Proyectada: {vol_anual:.2%})", es_anual=True)
 
         pdf.savefig(fig, facecolor=fig.get_facecolor())
         plt.close()
-        print("Generando página 5/5 — Análisis de Riesgos Estructura Completa (3 Campanas)")
+        print("Generando página 5/5 — Análisis de Riesgos Global Multi-Timeframe")
     except Exception as e:
         print(f"ERROR EN PÁGINA 5: {e}")
 
