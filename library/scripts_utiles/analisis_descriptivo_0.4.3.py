@@ -340,11 +340,11 @@ metricas = {
         'Tiempo recuperación (velas)': f"{recovery_velas_max:,}",
         'Tiempo recuperación (real)': recovery_str
     },
-    '5. VaR, Campana and Risks': {
-        'VaR 95% (histórico)': f"{var_95_hist*100:.4f}%",
-        'VaR 99% (histórico)': f"{var_99_hist*100:.4f}%",
-        'VaR 95% (paramétrico)': f"{var_95_param*100:.4f}%",
-        'VaR 99% (paramétrico)': f"{var_99_param*100:.4f}%",
+'5. VaR y Riesgo del Activo': {
+    f'VaR 95% Histórico ({tf_actual})': f"{-var_95_hist*100:.4f}%",
+    f'VaR 99% Histórico ({tf_actual})': f"{-var_99_hist*100:.4f}%",
+    f'VaR 95% Paramétrico ({tf_actual})': f"{-var_95_param*100:.4f}%",
+    f'VaR 99% Paramétrico ({tf_actual})': f"{-var_99_param*100:.4f}%",
         'Minimo': f"{r.min()*100:.4f}%",
         'Maximo': f"{r.max()*100:.4f}%",
         'Skewness': f"{r.skew():.4f}",

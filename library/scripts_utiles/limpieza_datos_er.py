@@ -12,9 +12,9 @@ NEON  = "\033[1;95m"  # Rosa brillante / negrita
 RESET = "\033[0m"
 # ----------------------------
 # ── CONFIGURACIÓN — solo cambia esto ─────────────────────
-TABLA      = 'btc_candles_1h'
-FRECUENCIA = '1h'
-OUTPUT     = r'D:\DATOS\Activos\Crypto\Limpiados\btc_1h_limpio.csv'
+TABLA      = 'bnb_candles_1m'
+FRECUENCIA = '1t' #1t = minutos | 1m=mensual '1H', '4H', '1D' según necesites
+OUTPUT     = r"D:\DATOS\Activos\Crypto\BNBUSDT-1m 08-2017_to_03-2026 - copia_preparado.csv"
 # ─────────────────────────────────────────────────────────
 
 print("="*50)
@@ -28,7 +28,7 @@ conn = psycopg2.connect(
 )
 
 
-# [1/7] Descarga
+# ── [1/7] DESCARGA DE DATOS ──────────────────────────────────────────────────
 print("\n[1/7] Descargando datos...")
 df = pd.read_sql(f"""
     SELECT timestamp, open, high, low, close, volume
@@ -38,90 +38,92 @@ df = pd.read_sql(f"""
 conn.close()
 print(f"      Filas originales: {len(df)}")
 
+# ==============================================================================
+# [2/8] DETECCIÓN Y RENOMBRAMIENTO DINÁMICO DE LA COLUMNA DE TIEMPO
+# ==============================================================================
+print("\n[2/8] Detección de columna de tiempo y renombramiento...")
 
-# [2/7] Detección de huecos
-print("\n[2/7] Detectando huecos...")
+# 1. Si no se llama 'timestamp', buscamos si existe bajo otro nombre y la renombramos
+if 'timestamp' not in df.columns:
+    posibles_nombres_tiempo = ['open_time', 'time', 'date', 'Timestamp', 'open_time_utc']
+    for col in posibles_nombres_tiempo:
+        if col in df.columns:
+            df = df.rename(columns={col: 'timestamp'})
+            print(f"🔄 Pandas detectó la columna '{col}' y la renombró automáticamente a 'timestamp'")
+            break
+
+# 2. Si vino directamente indexada por QuestDB, la extraemos a columna
+if df.index.name in ['timestamp', 'open_time', 'time', 'date', 'Timestamp'] or 'timestamp' not in df.columns:
+    df.index.name = 'timestamp'
+    df = df.reset_index(drop=False if 'timestamp' not in df.columns else True)
+
+# 3. Nos aseguramos de que sea formato datetime y SE QUEDE como columna común
+df['timestamp'] = pd.to_datetime(df['timestamp'])
+print("      -> Columna 'timestamp' lista para el análisis de continuidad.")
+# ==============================================================================
+    
+
+# ── [3/8] SINCRONIZACIÓN Y LIMPIEZA (BLOQUE SUSTITUTO) ────────────────────────
+print("\n[3/8] Sincronizando y limpiando...")
+
 df['timestamp'] = pd.to_datetime(df['timestamp'])
 df = df.set_index('timestamp')
 
-duplicados = df.index.duplicated().sum()
-print(f"      Duplicados detectados: {duplicados}")
+# Estandarización UTC
+if df.index.tz is None:
+    df.index = df.index.tz_localize('Europe/Helsinki', ambiguous='NaT', nonexistent='NaT')
+    df.index = df.index.tz_convert('UTC')
+else:
+    df.index = df.index.tz_convert('UTC')
+
+df = df[df.index.notna()]
 df = df[~df.index.duplicated(keep='first')]
 
-idx_completo = pd.date_range(
-    start=df.index.min(),
-    end=df.index.max(),
-    freq=FRECUENCIA
-)
+# LIMPIEZA PRIMERO: Eliminamos filas con saltos temporales sospechosos
+df = df[df.index.to_series().diff().fillna(pd.Timedelta(minutes=1)) <= pd.Timedelta(minutes=1)].copy()
+
+# AHORA DETECTAMOS HUECOS REALES
+idx_completo = pd.date_range(start=df.index.min(), end=df.index.max(), freq=FRECUENCIA)
 huecos = idx_completo.difference(df.index)
 print(f"      Huecos detectados: {len(huecos)} velas faltantes")
 
-
-# [3/7] Detección de anomalías
-print("\n[3/7] Detectando cambios erráticos en la recodiga de datos...")
-
-diff_anterior  = (df['close'] - df['close'].shift(1)).abs()
-diff_siguiente = (df['close'] - df['close'].shift(-1)).abs()
-rango_normal   = (df['high'] - df['low']).rolling(window=24).mean()
-
-f_salto = (diff_anterior > (rango_normal * 10)) & (diff_siguiente > (rango_normal * 10))
-
-anomalias_indices = df.index[f_salto]
-if len(anomalias_indices) > 0:
-    print(f"      >>> AUDITORÍA: Detectadas {len(anomalias_indices)} anomalías")
-    cols_aud = ['close', 'volume'] if 'volume' in df.columns else ['close']
-    for idx in anomalias_indices:
-        start = max(0, df.index.get_loc(idx) - 1)
-        end   = min(len(df), df.index.get_loc(idx) + 2)
-        print(f"\n      Contexto detectado para {idx}:")
-        print(df.iloc[start:end][cols_aud])
+if len(huecos) > 0:
+    print(f"DEBUG: Mostrando los primeros 5 huecos temporales encontrados:")
+    print(huecos[:5])
 else:
-    print("      No se detectaron anomalías.")
+    # Si sale 0, es que los datos son perfectamente continuos
+    print("DEBUG: No hay huecos temporales entre el min y max del índice.")
 
-df['anomalia'] = np.where(f_salto, df['close'], 0)
-df.loc[f_salto, ['open', 'high', 'low', 'close']] = np.nan
+# REINDEXAMOS
+df = df.reindex(idx_completo)
+es_hueco_temporal = df['close'].isna()
 
+# ── [5/8] REINDEXACIÓN E INTERPOLACIÓN (BLOQUE SUSTITUTO) ────────────────────
+print("\n[5/8] Rellenando huecos y corrigiendo datos...")
 
-# [4/7] Interpolación
-print("\n[4/7] Rellenando huecos y corrigiendo datos...")
-
+df = df.reindex(idx_completo)
 es_nulo_antes = df['close'].isna()
 
+# Interpolación lineal para mantener la pendiente (crítico para ER y Hurst)
 for col in ['open', 'high', 'low', 'close', 'volume']:
     if col in df.columns:
         df[col] = df[col].interpolate(method='linear')
 
-df = df.bfill().ffill()
+# SOLO si después de interpolar quedan nulos (al principio o final), usamos bfill/ffill
+df = df.fillna(method='bfill').fillna(method='ffill')
+
 df['interpolado'] = es_nulo_antes.astype(int)
 
 total_reparaciones = es_nulo_antes.sum()
 print(f"      Total de celdas reparadas (huecos + anomalías): {total_reparaciones}")
 
 
+# ── [6/8] VERIFICACIÓN SINCRONIZACIÓN HORARIA A UTC ──────────────────────────
+# Mantenemos el paso alineado para no romper tus scripts o pasos posteriores [6/7] y [7/7]
+print("\n[6/8] Verificación Sincronización Horaria a UTC... OK (Procesado de forma segura en el Paso 2)")
 
-
-# [5/7] Verificación Sincronización Horaria a UTC
-
-# 1. Aseguramos que el índice sea de tipo Datetime
-df.index = pd.to_datetime(df.index)
-
-# 2. Conversión automática según el origen de los datos
-if df.index.tz is None:
-    # SI VIENE DE BROKER/MT5: Aplicamos la lógica de Europa del Este (EET/EEST)
-    # Esto maneja automáticamente los cambios de verano/invierno históricamente.
-    df.index = df.index.tz_localize('Europe/Helsinki', ambiguous='NaT', nonexistent='NaT')
-    df.index = df.index.tz_convert('UTC')
-    print("-> Datos convertidos de Horario Broker (EET) a UTC.")
-else:
-    # SI YA VIENE EN UTC (Binance/Bybit): Solo estandarizamos
-    df.index = df.index.tz_convert('UTC')
-    print("-> Datos ya estaban en formato horario, estandarizados a UTC.")
-
-# 3. Creación de la columna de control horario (para análisis estacionales futuros)
-df['hora_utc'] = df.index.hour
-
-# [6/7] Verificación
-print("\n[6/7] Verificación final...")
+# [7/8] Verificación
+print("\n[7/8] Verificación final...")
 nulos = df[['open','high','low','close','volume']].isna().sum().sum()
 print(f"      Valores nulos restantes: {nulos}")
 print(f"      {'✅ Dataset limpio' if nulos == 0 else '⚠️  Revisar nulos'}")
@@ -136,7 +138,7 @@ df['retorno_log'] = np.log(df['close'] / df['close'].shift(1)).round(8)
 
 PERIODO_ER = 10
 
-print(f"\n[7/7] Calculando Efficiency Ratio (ER) utilizando ventana de {NEON}{PERIODO_ER}{RESET} periodos...")
+print(f"\n[8/8] Calculando Efficiency Ratio (ER) utilizando ventana de {NEON}{PERIODO_ER}{RESET} periodos...")
 
 # Cálculo base del indicador
 movimiento_neto  = df['retorno_log'].rolling(PERIODO_ER).sum().abs()
@@ -308,9 +310,31 @@ print(f"      Periodos mean reversion (H<0.52):     {total_reversion:,}")
 
 # Guardar
 df['hora_utc'] = df.index.hour
-df = df.reset_index().rename(columns={'index': 'timestamp'})
-df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume',
-         'retorno_log', 'interpolado', 'anomalia', 'ER', 'hurst', 'hora_utc']]
+
+if df.index.name is None:
+    df.index.name = 'index'
+
+df = df.reset_index()
+
+if 'index' in df.columns:
+    df = df.rename(columns={'index': 'timestamp'})
+elif 'open_time' in df.columns:
+    df = df.rename(columns={'open_time': 'timestamp'})
+
+# Lista de columnas obligatorias
+columnas_finales = ['timestamp', 'open', 'high', 'low', 'close', 'volume', 
+                    'retorno_log', 'interpolado', 'anomalia', 'ER', 'hurst', 'hora_utc']
+
+# Crear columnas faltantes con valor 0 para evitar el KeyError
+for col in columnas_finales:
+    if col not in df.columns:
+        if col == 'timestamp':
+            df = df.reset_index() # Si timestamp es el índice, lo volvemos columna
+        else:
+            df[col] = 0.0
+
+# Ahora seleccionamos con seguridad
+df = df[columnas_finales]
 
 df.to_csv(OUTPUT, index=False)
 print(f"\n✅ Guardado en: {OUTPUT}")

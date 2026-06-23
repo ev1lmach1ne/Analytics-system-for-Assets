@@ -18,32 +18,23 @@ CONFIG = {
 
 FACTORES = {
     'CRYPTO': {
-        # ... CRYPTO (24/7) 
-        '1min':  {'anual': 525600, 'trimestral': 129600, 'mensual': 43200, 'semanal': 10080, 'dia': 1440},
-        '5min':  {'anual': 105120, 'trimestral': 25920,  'mensual': 8640,  'semanal': 2016,  'dia': 288},
-        '15min': {'anual': 35040,  'trimestral': 8640,   'mensual': 2880,  'semanal': 672,   'dia': 96},
-        '30min': {'anual': 17520,  'trimestral': 4320,   'mensual': 1440,  'semanal': 336,   'dia': 48},
-        '1h':    {'anual': 8760,   'trimestral': 2160,   'mensual': 720,   'semanal': 168,   'dia': 24},
-        '4h':    {'anual': 2190,   'trimestral': 540,    'mensual': 180,   'semanal': 42,    'dia': 6},
-        '1d':    {'anual': 365,    'trimestral': 90,     'mensual': 30,    'semanal': 7,     'dia': 1}
+        '1min':  {'anual': 525600, 'dia': 1440}, #24/7 abierto
+        '5min':  {'anual': 105120, 'dia': 288},
+        '15min': {'anual': 35040,  'dia': 96},
+        '30min': {'anual': 17520,  'dia': 48},
+        '1h':    {'anual': 8760,   'dia': 24},
+        '4h':    {'anual': 2190,   'dia': 6},
+        '1d':    {'anual': 365,    'dia': 1}
     },
     'FUTURO': {
-        # 1 día = 1440 min
-        '1min':  {'anual': 362880, 'trimestral': 90720, 'mensual': 30240, 'semanal': 7056, 'dia': 1440, 'horaria': 60},
-        '5min':  {'anual': 72576,  'trimestral': 18144, 'mensual': 6048,  'semanal': 1411, 'dia': 288,  'horaria': 12},
-        '15min': {'anual': 24192,  'trimestral': 6048,  'mensual': 2016,  'semanal': 470,  'dia': 96,   'horaria': 4},
-        '30min': {'anual': 12096,  'trimestral': 3024,  'mensual': 1008,  'semanal': 235,  'dia': 48,   'horaria': 2},
-        '1h':    {'anual': 6048,   'trimestral': 1512,  'mensual': 504,   'semanal': 118,  'dia': 24,   'horaria': 1},
-        '4h':    {'anual': 1512,   'trimestral': 378,   'mensual': 126,   'semanal': 29,   'dia': 6,    'horaria': 0.25},
+        '1min':  {'anual': 362880, 'dia': 1440}, # Ajusta según mercado
+        '1h':    {'anual': 6048,   'dia': 24},
+        '1d':    {'anual': 365,    'dia': 1}
     },
     'STOCK': {
-        # 1 día = 390 min (Sesión 6.5h)
-        '1min':  {'anual': 98280,  'trimestral': 24570, 'mensual': 8190,  'semanal': 1950, 'dia': 390,  'horaria': 60},
-        '5min':  {'anual': 19656,  'trimestral': 4914,  'mensual': 1638,  'semanal': 390,  'dia': 78,   'horaria': 12},
-        '15min': {'anual': 6552,   'trimestral': 1638,  'mensual': 546,   'semanal': 130,  'dia': 26,   'horaria': 4},
-        '30min': {'anual': 3276,   'trimestral': 819,   'mensual': 273,   'semanal': 65,   'dia': 13,   'horaria': 2},
-        '1h':    {'anual': 1638,   'trimestral': 409,   'mensual': 136,   'semanal': 32.5, 'dia': 6.5,  'horaria': 1},
-        '4h':    {'anual': 409,    'trimestral': 102,   'mensual': 34,    'semanal': 8,    'dia': 1.6,  'horaria': 0.25},
+        '1min':  {'anual': 98280,  'dia': 390}, # 6.5 horas trading
+        '1h':    {'anual': 1638,   'dia': 6.5},
+        '1d':    {'anual': 252,    'dia': 1}
     }
 }
 
@@ -153,45 +144,38 @@ else:
     print(f"⚠️ No se encontró la columna '{col_flag}'. Verifica el nombre exacto en tu CSV.")
 
 
-# ── 6. CONFIGURACIÓN DE BLOQUES MULTI-TIMEFRAME ──────────
+
+
+# ── 6. CONFIGURACIÓN DE BLOQUES DIARIOS MULTI-TIMEFRAME (ROBUSTA) ──────────
+# ==============================================================================
+
+# ── 6. CONFIGURACIÓN DE BLOQUES DIARIOS MULTI-TIMEFRAME ──────────
 activo_cfg = CONFIG['activo']
 tf_cfg = CONFIG['tf']
 
-# Extraemos los factores del diccionario según la config actual
 if activo_cfg in FACTORES and tf_cfg in FACTORES[activo_cfg]:
-    bloques = FACTORES[activo_cfg][tf_cfg]
+    bloques_dia   = FACTORES[activo_cfg][tf_cfg]['dia']
+    bloques_anual = FACTORES[activo_cfg][tf_cfg]['anual']
 else:
-    # Fallback por si la combinación no existe
-    bloques = {'dia': 1, 'semanal': 7, 'mensual': 30, 'trimestral': 90, 'anual': 365}
+    bloques_dia = 24 
+    bloques_anual = 8760
 
 def normalizar_serie(serie, bloques_agrupacion):
-    # La división entera // agrupa los datos en bloques exactos
-    s = serie.groupby(np.arange(len(serie)) // int(bloques_agrupacion)).sum()
+    # Usamos reindexado para manejar fechas y sumas
+    s = serie.groupby(np.arange(len(serie)) // bloques_agrupacion).sum()
     return s[np.isfinite(s)]
 
-# Diccionario para almacenar las series calculadas
-series_temporales = {}
-stats_temporales = {}
+# Variables Globales (Para que P5 las pueda leer)
+global r_diario_real, vol_diaria, ret_diario, ret_anual, vol_anual
+r_diario_real = normalizar_serie(df['retorno'], int(bloques_dia))
+r_anual_real  = normalizar_serie(df['retorno'], int(bloques_anual))
 
-# Cálculo dinámico de todas las frecuencias definidas en los factores
-for periodo, n_bloques in bloques.items():
-    series_temporales[periodo] = normalizar_serie(df['retorno'], n_bloques)
-    stats_temporales[periodo] = {
-        'media': series_temporales[periodo].mean(),
-        'std':   series_temporales[periodo].std()
-    }
+ret_diario = r_diario_real.mean()
+vol_diaria = r_diario_real.std()
+ret_anual  = r_anual_real.mean()
+vol_anual  = r_anual_real.std()
 
-# Variables globales para acceso rápido en las páginas del PDF
-r_diario_real = series_temporales['dia']
-ret_diario, vol_diaria = stats_temporales['dia']['media'], stats_temporales['dia']['std']
-
-ret_semanal, vol_semanal       = stats_temporales['semanal']['media'], stats_temporales['semanal']['std']
-ret_mensual, vol_mensual       = stats_temporales['mensual']['media'], stats_temporales['mensual']['std']
-ret_trimestral, vol_trimestral = stats_temporales['trimestral']['media'], stats_temporales['trimestral']['std']
-ret_anual, vol_anual           = stats_temporales['anual']['media'], stats_temporales['anual']['std']
-
-print(f" [INFO] Bloque 6: Series normalizadas. Volatilidad Diaria: {vol_diaria:.6f}")
-
+print(f"   [INFO] Bloque 6: Datos normalizados. Vol diaria: {vol_diaria:.6f}")
 # ── 7. MÉTRICAS ───────────────────────────────────────────────────────────────
 
 # ==========================================================================
@@ -846,12 +830,14 @@ with PdfPages(OUTPUT_PDF) as pdf:
     plt.close()
     print("Generado página 4/7 — Precio por régimen ER...")
 
+# ── PÁGINA 5 — Análisis de Riesgo: Diario, Anual y VaR Inteligente ────────
 # ── PÁGINA 5 — Análisis de Riesgo: Diario y Anual ────────
     try:
         fig = plt.figure(figsize=(11.69, 8.27))
         fig.patch.set_facecolor('#0f0f0f')
         gs = gridspec.GridSpec(2, 1, height_ratios=[1, 1], hspace=0.50)
 
+        # Usamos la misma lógica que en la P6
         sigmas = [1, 2, 3]
         colores_sigmas = ['#1D9E75', '#BA7517', '#E24B4A']
 
@@ -861,11 +847,6 @@ with PdfPages(OUTPUT_PDF) as pdf:
             y = stats.norm.pdf(x, media, std)
             ax.plot(x, y, color='#185FA5', linewidth=2, label='Distribución Proyectada', rasterized=True)
 
-            # Etiqueta de la Media (μ)
-            ax.axvline(media, color='white', linestyle='--', linewidth=1.2, alpha=0.6)
-            ax.text(media, -max(y) * 0.06, f"μ: {media:.2%}", color='white', fontsize=7,
-                    ha='center', fontweight='bold', bbox=dict(facecolor='black', alpha=0.8, edgecolor='none', pad=1))
-
             # Lógica de niveles sigma
             for s in sigmas:
                 ax.fill_between(x, y, where=(x >= media-s*std) & (x <= media+s*std),
@@ -874,10 +855,12 @@ with PdfPages(OUTPUT_PDF) as pdf:
                     val = media + (lado * s * std)
                     ax.axvline(val, color=colores_sigmas[s-1], linestyle=':', alpha=0.5)
                     
+                    # Cálculo de frecuencia (ajustado según si es diario o anual)
                     if not es_anual:
                         prob = np.mean(r_diario_real <= val) if lado == -1 else np.mean(r_diario_real >= val)
                         txt = f"1 c/{1/prob:.1f}d" if prob > 0 else "No reg."
                     else:
+                        # Escalamos el umbral para el cálculo anualizado
                         factor = 365 if CONFIG['activo'] == 'CRYPTO' else 252
                         umbral = val / np.sqrt(factor)
                         prob = np.mean(r_diario_real <= umbral) if lado == -1 else np.mean(r_diario_real >= umbral)
@@ -888,6 +871,7 @@ with PdfPages(OUTPUT_PDF) as pdf:
                             color=colores_sigmas[s-1], fontsize=6, ha='center', fontweight='bold',
                             bbox=dict(facecolor='black', alpha=0.8, edgecolor='none', pad=1))
 
+            ax.axvline(media, color='white', linestyle='--', linewidth=1.2, alpha=0.5)
             ax.set_ylim(-max(y)*0.24, max(y)*1.15)
             ax.set_title(titulo, color='white', fontsize=11, pad=8)
             ax.tick_params(colors='#888780', labelsize=7)
@@ -904,7 +888,7 @@ with PdfPages(OUTPUT_PDF) as pdf:
 
         pdf.savefig(fig, facecolor=fig.get_facecolor(), dpi=150)
         plt.close()
-        print("Generado página 5/7 — Riesgo Diario/Anual con Media...")
+        print("Generado página 5/7 — Riesgo Diario/Anual...")
     except Exception as e:
         print(f"ERROR EN PÁGINA 5: {e}")
         plt.close()
