@@ -63,7 +63,7 @@ print("      -> Columna 'timestamp' lista para el análisis de continuidad.")
 # ==============================================================================
     
 
-# ── [3/8] SINCRONIZACIÓN Y LIMPIEZA (BLOQUE SUSTITUTO) ────────────────────────
+# ── [3/8] SINCRONIZACIÓN Y LIMPIEZA (BLOQUE SUSTITUTO CON FILTRO ANTI-BAD TICKS) ──
 print("\n[3/8] Sincronizando y limpiando...")
 
 df['timestamp'] = pd.to_datetime(df['timestamp'])
@@ -79,6 +79,25 @@ else:
 df = df[df.index.notna()]
 df = df[~df.index.duplicated(keep='first')]
 
+# ==============================================================================
+# FILTRO ADICIONAL: DETECCIÓN Y BORRADO DE ANOMALÍAS DE COTIZACIÓN (BAD TICKS)
+# ==============================================================================
+# Calculamos retornos aritméticos brutos inter-minuto solo para detectar anomalías extremas
+retornos_sucios = df['close'].pct_change().abs()
+
+# Definimos un umbral absurdo para 1 minuto (p. ej., variaciones > 30% en 60 segundos)
+UMBRAL_ANOMALIA = 0.30 
+mascara_anomalias = retornos_sucios > UMBRAL_ANOMALIA
+
+# Guardamos cuántas anomalías se detectaron
+anomalias_detectadas = mascara_anomalias.sum()
+
+if anomalias_detectadas > 0:
+    print(f"⚠️ DETECTADAS {anomalias_detectadas} anomalías extremas de cotización (Bad Ticks).")
+    # Borramos los precios de esas filas para obligar al paso [5/8] a interpolarlas con datos sanos
+    df.loc[mascara_anomalias, ['open', 'high', 'low', 'close', 'volume']] = np.nan
+# ==============================================================================
+
 # LIMPIEZA PRIMERO: Eliminamos filas con saltos temporales sospechosos
 df = df[df.index.to_series().diff().fillna(pd.Timedelta(minutes=1)) <= pd.Timedelta(minutes=1)].copy()
 
@@ -91,7 +110,6 @@ if len(huecos) > 0:
     print(f"DEBUG: Mostrando los primeros 5 huecos temporales encontrados:")
     print(huecos[:5])
 else:
-    # Si sale 0, es que los datos son perfectamente continuos
     print("DEBUG: No hay huecos temporales entre el min y max del índice.")
 
 # REINDEXAMOS
