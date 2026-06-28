@@ -1,0 +1,13 @@
+# Entorno virtual
+venv/
+
+# Archivos de caché
+__pycache__/
+.ipynb_checkpoints/
+
+# Configuración del editor
+.vscode/
+
+# Bases de datos locales
+*.db
+*.sqlite

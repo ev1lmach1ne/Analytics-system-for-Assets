@@ -1,0 +1,11 @@
+pandas
+numpy
+numba
+scipy
+backtrader
+vectorbt
+matplotlib
+plotly
+sqlalchemy
+psycopg2-binary
+requests
