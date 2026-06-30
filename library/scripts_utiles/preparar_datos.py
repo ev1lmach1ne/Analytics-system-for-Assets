@@ -8,9 +8,8 @@ import csv
 import sys
 import tkinter as tk
 from tkinter import filedialog
-import matplotlib.pyplot as plt
-from matplotlib.patches import Circle
-from matplotlib.widgets import Button
+import customtkinter as ctk
+import re
 sys.stdout.reconfigure(encoding='utf-8')
 
 # ── CONFIG ──────────────────────────────────────────
@@ -32,291 +31,197 @@ if not CSV_INPUT:
 # ── 2. INTERACTIVE CONFIG WINDOW ────────────────────
 SEL_NOMBRE  = ['']
 SEL_TIPO    = [0]  # 0=Futuro, 1=Stock, 2=Crypto
-SEL_TF      = [4]  # index in TF_LABELS
-TF_LABELS   = ['1m','5m','15m','30m','1h','4h','1d','ticks','rango']
-TIPO_LABELS = ['Futuro', 'Stock', 'Crypto']
+SEL_TF      = [6]  # index in TF_LABELS (default = 1h)
+TF_LABELS   = ['30s','1m','3m','5m','15m','30m','1h','2h','4h','1d','ticks','rango','Custom']
+TIPO_LABELS = ['Futuro/Cfd', 'Forex', 'Stock', 'Crypto']
 CANCELADO   = [False]
+TF_CUSTOM_STR = ['']  # custom timeframe string (ej. '3m', '10m', '30s')
 
 def ventana_config():
-    fig = plt.figure(figsize=(9, 7))
-    fig.patch.set_facecolor('#E8F4FD')
+    ctk.set_appearance_mode("Light")
+    ctk.set_default_color_theme("blue")
 
-    # ── helpers para radio buttons custom ──
-    class CustomRadios:
-        def __init__(self, fig, labels, positions, default, color_sel='#5B9BD5', callback=None):
-            self.fig = fig
-            self.labels = labels
-            self.pos = positions
-            self.selected = default
-            self.color_sel = color_sel
-            self.callback = callback
-            self.circles = []
-            self.txts = []
-            for i, (lbl, (x, y)) in enumerate(zip(labels, positions)):
-                c = Circle((x, y), 0.015, facecolor='white', edgecolor='#4A6FA5',
-                           linewidth=1.5, transform=fig.transFigure, zorder=5)
-                fig.patches.append(c)
-                self.circles.append(c)
-                t = fig.text(x + 0.028, y, lbl, fontsize=10, color='#4A6FA5',
-                             va='center', transform=fig.transFigure, zorder=5)
-                self.txts.append(t)
-            self._draw()
-
-        def _draw(self):
-            for i, c in enumerate(self.circles):
-                sel = i == self.selected
-                c.set_radius(0.022 if sel else 0.015)
-                c.set_facecolor(self.color_sel if sel else 'white')
-                c.set_edgecolor(self.color_sel if sel else '#4A6FA5')
-                c.set_linewidth(3 if sel else 1.5)
-                c.set_alpha(0.9 if sel else 0.6)
-                self.txts[i].set_fontsize(11 if sel else 10)
-                self.txts[i].set_fontweight('bold' if sel else 'normal')
-                self.txts[i].set_color('#1E3A5F' if sel else '#4A6FA5')
-            self.fig.canvas.draw_idle()
-
-        def hit(self, x, y):
-            for i, c in enumerate(self.circles):
-                cx, cy = c.center
-                dx, dy = x - cx, y - cy
-                if dx*dx + dy*dy < 0.003:
-                    return i
-            return -1
-
-        def set_active(self, idx):
-            if 0 <= idx < len(self.labels):
-                self.selected = idx
-                self._draw()
-                if self.callback:
-                    self.callback(self.labels[idx])
-
-    # ── rectángulos de foco visual ──
-    focus_rects = {}
-
-    def make_focus_rect(key, x, y, w, h):
-        r = plt.Rectangle((x, y), w, h, fill=False, linewidth=2.5,
-                          edgecolor='#B0C4DE', visible=True, transform=fig.transFigure, zorder=2)
-        fig.patches.append(r)
-        focus_rects[key] = r
-        return r
-
-    # ── TITLE ──
-    fig.text(0.5, 0.96, '☁  CONFIGURACIÓN DEL ACTIVO  ☁', ha='center', va='top',
-             fontsize=16, fontweight='bold', color='#1E3A5F')
-
-    # ── ARCHIVO ──
-    nombre_csv = os.path.basename(CSV_INPUT)
-    fig.text(0.12, 0.89, f'📁  {nombre_csv}', fontsize=10, color='#4A6FA5')
-
-    # ── NOMBRE ACTIVO ──
-    fig.text(0.12, 0.82, 'Nombre del activo:', fontsize=11, color='#4A6FA5', fontweight='bold')
-    name_text = fig.text(0.12, 0.76, f'✏️  {SEL_NOMBRE[0]}', fontsize=13, color='#1E3A5F',
-                         fontweight='bold')
-    make_focus_rect('nombre', 0.115, 0.745, 0.515, 0.07)
-
-    EDITANDO = [False]
-    BUF_NOMBRE = ['']
-
-    # ── TIPO DE ACTIVO ──
-    fig.text(0.12, 0.66, 'Tipo de activo:', fontsize=11, color='#4A6FA5', fontweight='bold')
-    pos_tipo = [(0.14, 0.60), (0.42, 0.60), (0.70, 0.60)]
-    radio_tipo = CustomRadios(fig, TIPO_LABELS, pos_tipo, SEL_TIPO[0])
-    make_focus_rect('tipo', 0.10, 0.565, 0.80, 0.07)
-
-    # ── TIMEFRAME ──
-    fig.text(0.12, 0.48, 'Timeframe:', fontsize=11, color='#4A6FA5', fontweight='bold')
-    xs_r1 = [0.14, 0.32, 0.50, 0.68]
-    pos_tf1 = [(x, 0.42) for x in xs_r1]
-    radio_tf1 = CustomRadios(fig, TF_LABELS[:4], pos_tf1, -1 if SEL_TF[0] >= 4 else SEL_TF[0])
-    xs_r2 = [0.14, 0.32, 0.50, 0.68, 0.86]
-    pos_tf2 = [(x, 0.34) for x in xs_r2]
-    radio_tf2 = CustomRadios(fig, TF_LABELS[4:], pos_tf2, max(0, SEL_TF[0] - 4) if SEL_TF[0] >= 4 else -1)
-    make_focus_rect('tf', 0.10, 0.305, 0.82, 0.15)
-
-    def _iniciar_edicion():
-        EDITANDO[0] = True
-        BUF_NOMBRE[0] = SEL_NOMBRE[0]
-        name_text.set_text(f'✏️  {BUF_NOMBRE[0]}_')
-        fig.canvas.draw_idle()
-
-    def _confirmar_edicion():
-        if BUF_NOMBRE[0].strip():
-            SEL_NOMBRE[0] = BUF_NOMBRE[0].strip().lower()
-        name_text.set_text(f'✏️  {SEL_NOMBRE[0]}')
-        EDITANDO[0] = False
-        fig.canvas.draw_idle()
-
-    def _cancelar_edicion():
-        name_text.set_text(f'✏️  {SEL_NOMBRE[0]}')
-        EDITANDO[0] = False
-        fig.canvas.draw_idle()
-
-    def sync_tf():
-        s1 = radio_tf1.selected
-        s2 = radio_tf2.selected
-        if s1 >= 0:
-            SEL_TF[0] = s1
-            radio_tf2.selected = -1
-        elif s2 >= 0:
-            SEL_TF[0] = 4 + s2
-            radio_tf1.selected = -1
-        else:
-            SEL_TF[0] = 4
-            radio_tf2.selected = 0
-        radio_tf1._draw()
-        radio_tf2._draw()
-
-    def _click(event):
-        tf = fig.transFigure.inverted()
-        fx, fy = tf.transform((event.x, event.y))
-        if 0.115 <= fx <= 0.63 and 0.745 <= fy <= 0.815:
-            _iniciar_edicion()
-            return
-        h1 = radio_tf1.hit(fx, fy)
-        if h1 >= 0:
-            radio_tf1.selected = h1
-            radio_tf2.selected = -1
-            sync_tf()
-            return
-        h2 = radio_tf2.hit(fx, fy)
-        if h2 >= 0:
-            radio_tf2.selected = h2
-            radio_tf1.selected = -1
-            sync_tf()
-            return
-        ht = radio_tipo.hit(fx, fy)
-        if ht >= 0:
-            radio_tipo.set_active(ht)
-            SEL_TIPO[0] = ht
-
-    # ── BUTTONS ──
-    ax_ok = plt.axes([0.25, 0.16, 0.15, 0.06])
-    btn_ok = Button(ax_ok, '✅ Aceptar', color='#2E86C1', hovercolor='#1A6DA0')
-    btn_ok.label.set_color('white')
-
-    ax_cancel = plt.axes([0.55, 0.16, 0.15, 0.06])
-    btn_cancel = Button(ax_cancel, '❌ Cancelar', color='#BDC3C7', hovercolor='#A0A0A0')
+    root = ctk.CTk()
+    root.title("☁  CONFIGURADOR DE ARCHIVO  ☁")
+    root.geometry("640x580")
+    root.resizable(False, False)
 
     OK_PRESSED = [False]
+    IS_CUSTOM = [SEL_TF[0] == 12 and bool(TF_CUSTOM_STR[0])]
 
-    def on_ok(event):
-        OK_PRESSED[0] = True
-        if EDITANDO[0]:
-            _confirmar_edicion()
-        if not SEL_NOMBRE[0].strip():
+    # ── TOP BAR: title + theme toggle ──
+    top_bar = ctk.CTkFrame(root, fg_color="transparent")
+    top_bar.pack(pady=(18, 0), padx=30, fill="x")
+
+    ctk.CTkLabel(top_bar, text="☁  CONFIGURADOR DE ARCHIVO  ☁",
+                 font=ctk.CTkFont(size=17, weight="bold"),
+                 anchor="center").pack(side="left", expand=True, fill="x")
+
+    def toggle_theme():
+        n = "Dark" if ctk.get_appearance_mode() == "Light" else "Light"
+        ctk.set_appearance_mode(n)
+        theme_btn.configure(text="☀️" if n == "Light" else "🌙")
+
+    theme_btn = ctk.CTkButton(top_bar, text="🌙", width=36, height=30, command=toggle_theme,
+                              fg_color=("gray75", "gray40"), hover_color=("gray65", "gray50"),
+                              corner_radius=8)
+    theme_btn.pack(side="right", padx=(0, 5))
+
+    # ── FILE INFO ──
+    ctk.CTkLabel(root, text=f"📁  {os.path.basename(CSV_INPUT)}",
+                 font=ctk.CTkFont(size=11)).pack(pady=(8, 12))
+
+    # ── MAIN FRAME ──
+    main = ctk.CTkFrame(root)
+    main.pack(fill="both", expand=True, padx=35, pady=(0, 15))
+
+    # ── NOMBRE ──
+    ctk.CTkLabel(main, text="Nombre del activo:",
+                 font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", pady=(18, 5))
+    nombre_entry = ctk.CTkEntry(main, placeholder_text="xauusd", width=320)
+    nombre_entry.pack(anchor="w", padx=10)
+
+    # ── TIPO ──
+    ctk.CTkLabel(main, text="Tipo de activo:",
+                 font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", pady=(15, 5))
+    tipo_frame = ctk.CTkFrame(main, fg_color="transparent")
+    tipo_frame.pack(padx=10, anchor="w")
+    tipo_var = ctk.StringVar(value=TIPO_LABELS[SEL_TIPO[0]])
+    radios_tipo = []
+    for lbl in TIPO_LABELS:
+        rb = ctk.CTkRadioButton(tipo_frame, text=lbl, variable=tipo_var,
+                                value=lbl, font=ctk.CTkFont(size=12))
+        rb.pack(side="left", padx=(0, 20))
+        radios_tipo.append(rb)
+
+    def cycle_tipo(delta):
+        i = TIPO_LABELS.index(tipo_var.get())
+        tipo_var.set(TIPO_LABELS[(i + delta) % len(TIPO_LABELS)])
+
+    for rb in radios_tipo:
+        rb.bind("<Left>", lambda e: cycle_tipo(-1))
+        rb.bind("<Right>", lambda e: cycle_tipo(1))
+
+    # ── TIMEFRAME ──
+    ctk.CTkLabel(main, text="Timeframe:",
+                 font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", pady=(15, 5))
+    tf_main = ctk.CTkFrame(main, fg_color="transparent")
+    tf_main.pack(padx=5, fill="x")
+
+    tf_sel = ctk.StringVar()
+
+    def make_callback(btn, others):
+        def cb(v):
+            if v:
+                for o in others:
+                    o.set(None)
+                tf_sel.set(v)
+                _toggle_custom_frame(v)
+            else:
+                tf_sel.set("")
+        return cb
+
+    def _toggle_custom_frame(v):
+        if v == "Custom":
+            custom_frame.pack(padx=10, pady=(8, 0), anchor="w")
+            custom_entry.focus_set()
+        else:
+            custom_frame.pack_forget()
+
+    seg1 = ctk.CTkSegmentedButton(tf_main, values=TF_LABELS[:6],
+                                  font=ctk.CTkFont(size=11), dynamic_resizing=False)
+    seg1.pack(pady=2, fill="x")
+
+    seg2 = ctk.CTkSegmentedButton(tf_main, values=TF_LABELS[6:10],
+                                  font=ctk.CTkFont(size=11), dynamic_resizing=False)
+    seg2.pack(pady=2, fill="x")
+
+    seg3 = ctk.CTkSegmentedButton(tf_main, values=TF_LABELS[10:],
+                                  font=ctk.CTkFont(size=11), dynamic_resizing=False)
+    seg3.pack(pady=2, fill="x")
+
+    seg1.configure(command=make_callback(seg1, [seg2, seg3]))
+    seg2.configure(command=make_callback(seg2, [seg1, seg3]))
+    seg3.configure(command=make_callback(seg3, [seg1, seg2]))
+
+    # ── Restore initial selection ──
+    if IS_CUSTOM[0]:
+        seg3.set("Custom")
+        tf_sel.set("Custom")
+    else:
+        idx = SEL_TF[0]
+        if idx < 6:
+            seg1.set(TF_LABELS[idx])
+            tf_sel.set(TF_LABELS[idx])
+        elif idx < 10:
+            seg2.set(TF_LABELS[idx])
+            tf_sel.set(TF_LABELS[idx])
+        else:
+            seg3.set(TF_LABELS[idx])
+            tf_sel.set(TF_LABELS[idx])
+
+    # ── CUSTOM TF ──
+    custom_frame = ctk.CTkFrame(main, fg_color="transparent")
+    ctk.CTkLabel(custom_frame, text="Custom:", font=ctk.CTkFont(size=12)).pack(side="left", padx=(0, 8))
+    custom_entry = ctk.CTkEntry(custom_frame, placeholder_text="ej. 3m, 10m, 2h, 30s", width=200)
+    custom_entry.pack(side="left")
+    if IS_CUSTOM[0] and TF_CUSTOM_STR[0]:
+        custom_entry.insert(0, TF_CUSTOM_STR[0])
+        custom_frame.pack(padx=10, pady=(8, 0), anchor="w")
+
+    # ── BUTTONS ──
+    btn_frame = ctk.CTkFrame(main, fg_color="transparent")
+    btn_frame.pack(pady=(20, 8))
+
+    def on_ok():
+        nombre = nombre_entry.get().strip().lower()
+        if not nombre:
             print("⚠️  El nombre del activo no puede estar vacío.")
-            OK_PRESSED[0] = False
+            nombre_entry.focus_set()
             return
-        SEL_NOMBRE[0] = SEL_NOMBRE[0].strip().lower()
-        sync_tf()
-        plt.close(fig)
+        SEL_NOMBRE[0] = nombre
+        SEL_TIPO[0] = TIPO_LABELS.index(tipo_var.get())
 
-    def on_cancel(event):
+        selected = tf_sel.get()
+        if selected == "Custom":
+            custom_val = custom_entry.get().strip().lower()
+            if not custom_val:
+                print("⚠️  El timeframe personalizado está vacío.")
+                custom_entry.focus_set()
+                return
+            if not re.match(r'^\d+(?:s|sec|min|m|h|d|w)$', custom_val):
+                print("⚠️  Formato inválido: ej. 3m, 10m, 2h, 30s")
+                custom_entry.focus_set()
+                return
+            TF_CUSTOM_STR[0] = custom_val
+            SEL_TF[0] = 12
+        else:
+            SEL_TF[0] = TF_LABELS.index(selected)
+
+        OK_PRESSED[0] = True
+        root.destroy()
+
+    def on_cancel():
         CANCELADO[0] = True
-        plt.close(fig)
+        root.destroy()
 
-    btn_ok.on_clicked(on_ok)
-    btn_cancel.on_clicked(on_cancel)
-
-    # ── KEYBOARD NAV ──
-    FOCUS_GROUPS = ['nombre', 'tipo', 'tf', 'btn_ok', 'btn_cancel']
-    focus_idx = [0]
-    focus_order = [('nombre', 0), ('tipo', 1), ('tf', 2), ('btn_ok', 3), ('btn_cancel', 4)]
-
-    def highlight_focus(idx):
-        for key, r in focus_rects.items():
-            if key in ('nombre', 'tipo', 'tf'):
-                r.set_edgecolor('#4A90D9' if key == FOCUS_GROUPS[idx] else '#B0C4DE')
-                r.set_linewidth(2.5 if key == FOCUS_GROUPS[idx] else 1)
-        ax_ok.spines['bottom'].set_color('#4A90D9' if FOCUS_GROUPS[idx] == 'btn_ok' else '#B0C4DE')
-        ax_cancel.spines['bottom'].set_color('#4A90D9' if FOCUS_GROUPS[idx] == 'btn_cancel' else '#B0C4DE')
-        fig.canvas.draw_idle()
-
-    def on_key(event):
-        if EDITANDO[0]:
-            if event.key == 'enter':
-                _confirmar_edicion()
-            elif event.key == 'escape':
-                _cancelar_edicion()
-            elif event.key == 'backspace':
-                BUF_NOMBRE[0] = BUF_NOMBRE[0][:-1]
-                name_text.set_text(f'✏️  {BUF_NOMBRE[0]}_')
-                fig.canvas.draw_idle()
-            elif event.key == 'space':
-                BUF_NOMBRE[0] += '_'
-                name_text.set_text(f'✏️  {BUF_NOMBRE[0]}_')
-                fig.canvas.draw_idle()
-            elif event.key == 'ctrl+u':
-                BUF_NOMBRE[0] = ''
-                name_text.set_text(f'✏️  _')
-                fig.canvas.draw_idle()
-            elif len(event.key) == 1:
-                BUF_NOMBRE[0] += event.key.lower()
-                name_text.set_text(f'✏️  {BUF_NOMBRE[0]}_')
-                fig.canvas.draw_idle()
-            return
-        if event.key in ('down', 'tab'):
-            focus_idx[0] = (focus_idx[0] + 1) % len(FOCUS_GROUPS)
-            highlight_focus(focus_idx[0])
-            event.guiEvent = None
-        elif event.key == 'up':
-            focus_idx[0] = (focus_idx[0] - 1) % len(FOCUS_GROUPS)
-            highlight_focus(focus_idx[0])
-        elif event.key == 'right':
-            g = FOCUS_GROUPS[focus_idx[0]]
-            if g == 'tipo':
-                radio_tipo.set_active(min(len(TIPO_LABELS)-1, radio_tipo.selected + 1))
-                SEL_TIPO[0] = radio_tipo.selected
-            elif g == 'tf':
-                n = SEL_TF[0]
-                n = min(len(TF_LABELS)-1, n+1)
-                if n < 4:
-                    radio_tf1.selected = n
-                    radio_tf2.selected = -1
-                else:
-                    radio_tf2.selected = n - 4
-                    radio_tf1.selected = -1
-                SEL_TF[0] = n
-                radio_tf1._draw()
-                radio_tf2._draw()
-        elif event.key == 'left':
-            g = FOCUS_GROUPS[focus_idx[0]]
-            if g == 'tipo':
-                radio_tipo.set_active(max(0, radio_tipo.selected - 1))
-                SEL_TIPO[0] = radio_tipo.selected
-            elif g == 'tf':
-                n = SEL_TF[0]
-                n = max(0, n-1)
-                if n < 4:
-                    radio_tf1.selected = n
-                    radio_tf2.selected = -1
-                else:
-                    radio_tf2.selected = n - 4
-                    radio_tf1.selected = -1
-                SEL_TF[0] = n
-                radio_tf1._draw()
-                radio_tf2._draw()
-        elif event.key == 'enter':
-            g = FOCUS_GROUPS[focus_idx[0]]
-            if g == 'nombre':
-                _iniciar_edicion()
-            elif g == 'btn_ok':
-                on_ok(None)
-            elif g == 'btn_cancel':
-                on_cancel(None)
-        elif event.key == 'escape':
-            on_cancel(None)
-
-    fig.canvas.mpl_connect('key_press_event', on_key)
-    fig.canvas.mpl_connect('button_press_event', _click)
-    fig.canvas.mpl_connect('close_event', lambda e: CANCELADO.__setitem__(0, not OK_PRESSED[0]))
+    ctk.CTkButton(btn_frame, text="✅  Aceptar", command=on_ok, width=120,
+                  font=ctk.CTkFont(size=13)).pack(side="left", padx=8)
+    ctk.CTkButton(btn_frame, text="✕  Cancelar", command=on_cancel, width=120,
+                  fg_color="#5D6D7E", hover_color="#4A5A6B",
+                  font=ctk.CTkFont(size=13)).pack(side="left", padx=8)
 
     # ── HINT ──
-    fig.text(0.5, 0.06, '↑↓ entre grupos · ←→ cambia opción · Enter/Click confirma · Esc cancela',
-             ha='center', fontsize=9, color='#7FB3D8', style='italic')
+    ctk.CTkLabel(main, text="Tab entre grupos · ←→ cambia opción · Enter confirma · Esc cancela",
+                 font=ctk.CTkFont(size=10), text_color="gray").pack(pady=(5, 10))
 
-    highlight_focus(0)
-    plt.show(block=True)
+    # ── KEYBOARD BINDINGS ──
+    root.bind("<Return>", lambda e: on_ok())
+    root.bind("<Escape>", lambda e: on_cancel())
+
+    root.protocol("WM_DELETE_WINDOW", on_cancel)
+    root.grab_set()
+    root.mainloop()
 
 ventana_config()
 
@@ -325,8 +230,12 @@ if CANCELADO[0]:
     sys.exit(0)
 
 NOMBRE_ACTIVO = SEL_NOMBRE[0]
-TIPO_ACTIVO   = TIPO_LABELS[SEL_TIPO[0]].upper()
-TIMEFRAME     = TF_LABELS[SEL_TF[0]]
+_mapa_tipo = {'Futuro/Cfd': 'FUTURO', 'Forex': 'FOREX', 'Stock': 'STOCK', 'Crypto': 'CRYPTO'}
+TIPO_ACTIVO   = _mapa_tipo[TIPO_LABELS[SEL_TIPO[0]]]
+if SEL_TF[0] == 12 and TF_CUSTOM_STR[0].strip():
+    TIMEFRAME = TF_CUSTOM_STR[0].strip().lower()
+else:
+    TIMEFRAME = TF_LABELS[SEL_TF[0]]
 
 # ── 3. SESSION CONFIG ───────────────────────────────
 CONFIG_PATH = r"D:\DATOS\Activos\sesion_config.json"
@@ -397,8 +306,15 @@ if 'timestamp' not in df.columns:
             print(f"      ⚠️ No se pudo parsear '{primera_col}' como fecha. Usando índice numérico.")
             df['timestamp'] = pd.Timestamp.now().normalize() + pd.to_timedelta(range(len(df)), unit='h')
 
-df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce', dayfirst=True)
+# Sanitizar columna timestamp antes de parsear
+ts_raw = df['timestamp'].astype(str).str.strip().str.replace('\ufeff', '', regex=False)
+ts_raw = ts_raw.str.replace(r'[^\x20-\x7E]', '', regex=True)
+antes = len(df)
+df['timestamp'] = pd.to_datetime(ts_raw, errors='coerce', dayfirst=True)
+nat_count = df['timestamp'].isna().sum()
+print(f"      ⚠️ Timestamps NaT tras parseo: {nat_count:,} de {antes:,} filas ({nat_count/antes:.1%})")
 df = df.dropna(subset=['timestamp'])
+print(f"      Filas tras dropna: {len(df):,} ({len(df)/antes:.1%})")
 
 # Estandarizar a UTC
 if df['timestamp'].dt.tz is None:
@@ -411,7 +327,7 @@ if df['timestamp'].dt.tz is None:
     df['timestamp'] = df['timestamp'].dt.tz_localize('UTC')
 else:
     df['timestamp'] = df['timestamp'].dt.tz_convert('UTC')
-df['timestamp'] = df['timestamp'].dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+df['timestamp'] = df['timestamp'].dt.strftime('%Y-%m-%dT%H:%M:%S.000000Z')
 
 if 'volume' not in df.columns: df['volume'] = 0
 if 'spread' not in df.columns: df['spread'] = 0

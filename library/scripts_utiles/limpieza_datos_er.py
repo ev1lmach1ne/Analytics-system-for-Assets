@@ -31,6 +31,21 @@ else:
     ACTIVO     = 'futuro'
     print("↳ Usando config manual (sin sesion_config.json)")
 
+# Mapear timeframe de usuario ('1m','5m','1h','1d') a frecuencia pandas ('1min','5min','1H','1D')
+_tf = FRECUENCIA.lower().strip()
+import re as _re
+_m = _re.match(r'(\d+)([a-z]+)', _tf)
+if _m:
+    _num, _unit = _m.groups()
+    _mapa = {'s':'S','sec':'S','m':'min','min':'min','h':'H','d':'D','w':'W'}
+    if _unit in _mapa:
+        FRECUENCIA_PD = f"{_num}{_mapa[_unit]}"
+    else:
+        FRECUENCIA_PD = _tf
+else:
+    FRECUENCIA_PD = _tf
+print(f"      Frecuencia pandas: {FRECUENCIA_PD}")
+
 OUTPUT_DIR  = r"D:\DATOS\Activos\Limpiados"
 nombre_activo = TABLA.split('_')[0]
 OUTPUT = os.path.join(OUTPUT_DIR, nombre_activo, f"{nombre_activo}_{FRECUENCIA}_limpiado.csv")
@@ -137,7 +152,10 @@ else:
 # region ── 5. REINDEX Y FORWARD FILL ───────────────────────────
 # ── [4/8] REINDEX A RANGO COMPLETO ────────────────────────────────────────────
 print("\n[4/8] Reindexando a rango temporal completo...")
-idx_completo = pd.date_range(start=df.index.min(), end=df.index.max(), freq=FRECUENCIA)
+ts_min, ts_max = df.index.min(), df.index.max()
+dias_totales = (ts_max - ts_min).days
+print(f"      Rango timestamps: {ts_min} → {ts_max} ({dias_totales} días)")
+idx_completo = pd.date_range(start=ts_min, end=ts_max, freq=FRECUENCIA_PD)
 huecos = len(idx_completo) - len(df)
 print(f"      Huecos temporales detectados: {huecos} velas faltantes")
 df = df.reindex(idx_completo)
@@ -240,6 +258,16 @@ print(f"      Periodos con ER < {umbral_ruido:.3f} (Extremo bajo de la media 1º
 
 VENTANA_HURST = 1024
 PASO          = 10
+lags_estandar = np.array([16, 32, 64, 128, 256], dtype=np.int64)
+
+if FRECUENCIA.endswith('d'):
+    VENTANA_HURST = 504
+    PASO = 5
+    lags_estandar = np.array([16, 32, 64, 128], dtype=np.int64)
+elif FRECUENCIA.endswith('w'):
+    VENTANA_HURST = 256
+    PASO = 2
+    lags_estandar = np.array([8, 16, 32, 64, 128], dtype=np.int64)
 
 print(f"\n[8/8] Calculando Exponente de Hurst (Numba) utilizando ventana de {NEON}{VENTANA_HURST}{RESET} periodos y paso de {NEON}{PASO}{RESET} periodos...")
 
@@ -341,7 +369,6 @@ def calcular_hurst_array(retornos, ventana, paso, lags):
         resultado[i] = hurst_rs_numba(retornos[i - ventana:i], lags)
     return resultado
 
-lags_estandar = np.array([16, 32, 64, 128, 256], dtype=np.int64)
 retornos_puros = np.array(df['retorno_log'].fillna(0.0).values, dtype=np.float64, copy=True)
 
 hurst_vals = calcular_hurst_array(retornos_puros, VENTANA_HURST, PASO, lags_estandar)
