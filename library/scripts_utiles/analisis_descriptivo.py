@@ -9,6 +9,7 @@ from statsmodels.tsa.stattools import acf, pacf
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 from scipy import stats
 import os
+import json
 import subprocess
 import re
 import seaborn as sns
@@ -17,13 +18,31 @@ from matplotlib.dates import num2date, date2num
 from matplotlib.widgets import RangeSlider
 
 # region ── 1. CONFIGURACIÓN — solo cambiar estos valores ────────────────────────────
-CONFIG = {
-    'activo':     'FUTURO',
-    'nombre':     'xauusd',
-    'tf':         '1min',
-    'input_path': r"D:\DATOS\Activos\XAUUSD_M15_202103220700_202506122215_preparado.csv",
-    'interactive': True,  # True = abrir selector visual al inicio
-}
+CONFIG_PATH = r"D:\DATOS\Activos\sesion_config.json"
+if os.path.exists(CONFIG_PATH):
+    with open(CONFIG_PATH) as f:
+        sesion = json.load(f)
+    input_clean = os.path.join(
+        r"D:\DATOS\Activos\Limpiados", sesion['nombre'],
+        f"{sesion['nombre']}_{sesion['tf']}_limpiado.csv"
+    )
+    CONFIG = {
+        'activo':     sesion['activo'],
+        'nombre':     sesion['nombre'],
+        'tf':         sesion['tf'],
+        'input_path': input_clean,
+        'interactive': True,
+    }
+    print(f"↳ Config desde sesión: {sesion['nombre']} {sesion['tf']} → {input_clean}")
+else:
+    CONFIG = {
+        'activo':     'FUTURO',
+        'nombre':     'xauusd',
+        'tf':         '1h',
+        'input_path': r"D:\DATOS\Activos\Limpiados\xauusd\xauusd_1h_limpiado.csv",
+        'interactive': True,
+    }
+    print("↳ Usando config manual (sin sesion_config.json)")
 
 FACTORES = {
     'CRYPTO': {
@@ -37,13 +56,13 @@ FACTORES = {
         '1d':    {'anual': 365,    'trimestral': 90,     'mensual': 30,    'semanal': 7,     'dia': 1}
     },
     'FUTURO': {
-        # 1 día = 1440 min
-        '1min':  {'anual': 362880, 'trimestral': 90720, 'mensual': 30240, 'semanal': 7056, 'dia': 1440, 'horaria': 60},
-        '5min':  {'anual': 72576,  'trimestral': 18144, 'mensual': 6048,  'semanal': 1411, 'dia': 288,  'horaria': 12},
-        '15min': {'anual': 24192,  'trimestral': 6048,  'mensual': 2016,  'semanal': 470,  'dia': 96,   'horaria': 4},
-        '30min': {'anual': 12096,  'trimestral': 3024,  'mensual': 1008,  'semanal': 235,  'dia': 48,   'horaria': 2},
-        '1h':    {'anual': 6048,   'trimestral': 1512,  'mensual': 504,   'semanal': 118,  'dia': 24,   'horaria': 1},
-        '4h':    {'anual': 1512,   'trimestral': 378,   'mensual': 126,   'semanal': 29,   'dia': 6,    'horaria': 0.25},
+        '1min':  {'anual': 362880, 'trimestral': 90720, 'mensual': 30240, 'semanal': 7056, 'dia': 1440},
+        '5min':  {'anual': 72576,  'trimestral': 18144, 'mensual': 6048,  'semanal': 1411, 'dia': 288},
+        '15min': {'anual': 24192,  'trimestral': 6048,  'mensual': 2016,  'semanal': 470,  'dia': 96},
+        '30min': {'anual': 12096,  'trimestral': 3024,  'mensual': 1008,  'semanal': 235,  'dia': 48},
+        '1h':    {'anual': 6048,   'trimestral': 1512,  'mensual': 504,   'semanal': 118,  'dia': 24},
+        '4h':    {'anual': 1512,   'trimestral': 378,   'mensual': 126,   'semanal': 29,   'dia': 6},
+        '1d':    {'anual': 252,    'trimestral': 63,    'mensual': 21,    'semanal': 5,    'dia': 1},
     },
     'STOCK': {
         # 1 día = 390 min (Sesión 6.5h)
@@ -53,6 +72,7 @@ FACTORES = {
         '30min': {'anual': 3276,   'trimestral': 819,   'mensual': 273,   'semanal': 65,   'dia': 13,   'horaria': 2},
         '1h':    {'anual': 1638,   'trimestral': 409,   'mensual': 136,   'semanal': 32.5, 'dia': 6.5,  'horaria': 1},
         '4h':    {'anual': 409,    'trimestral': 102,   'mensual': 34,    'semanal': 8,    'dia': 1.6,  'horaria': 0.25},
+        '1d':    {'anual': 252,    'trimestral': 63,    'mensual': 21,    'semanal': 5,    'dia': 1},
     }
 }
 
@@ -147,10 +167,12 @@ if start_sel is not None:
 nombre_activo = CONFIG['nombre'].replace('/', '_')
 inicio = df.index.min().strftime('%Y-%m-%d')
 fin = df.index.max().strftime('%Y-%m-%d')
+OUTPUT_DIR = r"D:\DATOS\Activos\Limpiados\Informes"
 OUTPUT_PDF = os.path.join(
-    os.path.dirname(CONFIG['input_path']),
+    OUTPUT_DIR, nombre_activo,
     f"informe_{nombre_activo}_{CONFIG['tf']}_{inicio}_to_{fin}.pdf"
 )
+os.makedirs(os.path.dirname(OUTPUT_PDF), exist_ok=True)
 
 # ── DETECCIÓN Y COMPROBACIÓN TEMPORAL UNIFICADA ─────────────────────────────────────────────
 # [AÑADIDO] Sustituye la dependencia rígida de FACTORES (manual) por una
@@ -193,7 +215,7 @@ if 'ER'          not in df.columns: df['ER']          = 0.0
 # region ── 5. CÁLCULO DE RETORNOS ────────────────────────────────────────────────────
 print("[4/5] Calculando métricas estadísticas...")
 df['retorno'] = np.log(df['close'] / df['close'].shift(1))
-df = df.dropna(subset=['retorno'])
+df['retorno'] = df['retorno'].fillna(0)
 r  = df['retorno']
 
 if es_datetime_valido:
@@ -216,9 +238,13 @@ if col_flag in df.columns:
     total_originales = total_filas - total_interpoladas
     
     # Calculamos la distancia real por calendario basada en tus fechas exactas
-    fecha_inicio = pd.to_datetime('2017-12-31 23:00:00+00:00')
-    fecha_fin = pd.to_datetime('2026-06-07 18:00:00+00:00')
-    horas_teoricas = int((fecha_fin - fecha_inicio).total_seconds() / 3600) + 1
+    fecha_inicio = df.index.min()
+    fecha_fin = df.index.max()
+    segundos_reales = (fecha_fin - fecha_inicio).total_seconds()
+    if segundos_reales > 0:
+        horas_teoricas = int(segundos_reales / 3600) + 1
+    else:
+        horas_teoricas = total_filas
     
     # Cálculos de control
     filas_fantasma = horas_teoricas - total_filas
@@ -266,6 +292,8 @@ series_temporales = {}
 stats_temporales = {}
 
 for periodo, n_bloques in bloques.items():
+    if n_bloques < 1:
+        continue
     series_temporales[periodo] = normalizar_serie(df['retorno'], n_bloques)
     s_actual = series_temporales[periodo]
     
@@ -282,7 +310,7 @@ for periodo, n_bloques in bloques.items():
     
     if es_datetime_valido and len(df) > 0:
         fechas_bloque = df.index[bloques_id == idx_peor_bloque]
-        fecha_peor = fechas_bloque[0].strftime('%Y-%m-%d')
+        fecha_peor = fechas_bloque[0].strftime('%Y-%m-%d') if len(fechas_bloque) > 0 else "N/A"
     else:
         fecha_peor = "N/A"
     
@@ -643,8 +671,13 @@ try:
     tiempo_positiva = (df_clean_corr['corr_leverage'] > 0).mean() * 100
     
     vol_por_hora = df.groupby('hora_utc')['retorno'].std() * 100
-    hora_mas_volatil = vol_por_hora.idxmax()
-    vol_maxima = vol_por_hora.max()
+    vol_por_hora = vol_por_hora.dropna()
+    if vol_por_hora.empty:
+        hora_mas_volatil = 0
+        vol_maxima = 0.0
+    else:
+        hora_mas_volatil = vol_por_hora.idxmax()
+        vol_maxima = vol_por_hora.max()
 
 except Exception as e:
     print(f"AVISO: Cálculo de correlaciones saltado: {e}")
@@ -937,7 +970,7 @@ with PdfPages(OUTPUT_PDF) as pdf:
                 fig.text(0.04, y_current, nombre_metrica, fontsize=key_fsize, color='#a0a0a0', va='center')
                 
                 # Valores por defecto para la columna izquierda
-                valor_str = str(v)
+                valor_str = re.sub(r'\033\[[0-9;]*m', '', str(v))
                 x_val = 0.33
                 f_size = 7.0 if len(valor_str) > 30 else 9
                 
@@ -976,7 +1009,7 @@ with PdfPages(OUTPUT_PDF) as pdf:
                 fig.text(0.54, y_current, nombre_metrica, fontsize=key_fsize, color='#a0a0a0', va='center')
                 
                 # Valores por defecto para la columna derecha
-                valor_str = str(v)
+                valor_str = re.sub(r'\033\[[0-9;]*m', '', str(v))
                 x_val = 0.74
                 f_size = 7.0 if len(valor_str) > 30 else 9
                 
@@ -1111,13 +1144,13 @@ with PdfPages(OUTPUT_PDF) as pdf:
     step = 500
     df_sub = df.iloc[::step]
 
-    # Umbrales dinámicos 1σ
-    umbral_tend = min(0.95, df['ER'].mean() + df['ER'].std())
-    umbral_ruid = max(0.05, df['ER'].mean() - df['ER'].std())
+    # Umbrales fijos
+    UMBRAL_TEND = 0.5
+    UMBRAL_RUID = 0.3
 
     def color_regimen_dinamico(er_val):
-        if er_val > umbral_tend:   return '#00d4aa'
-        elif er_val > umbral_ruid: return '#8b949e'
+        if er_val > UMBRAL_TEND:   return '#00d4aa'
+        elif er_val > UMBRAL_RUID: return '#8b949e'
         else:                      return '#f85149'
 
     ax4 = fig.add_subplot(gs[0])
@@ -1139,9 +1172,9 @@ with PdfPages(OUTPUT_PDF) as pdf:
     ax4.autoscale()
 
     legend_elements = [
-        Line2D([0], [0], color='#00d4aa', linewidth=2, label=f'Tendencia (ER>{umbral_tend:.2f})'),
-        Line2D([0], [0], color='#8b949e', linewidth=2, label=f'Transicion ({umbral_ruid:.2f}-{umbral_tend:.2f})'),
-        Line2D([0], [0], color='#f85149', linewidth=2, label=f'Ruido (ER<{umbral_ruid:.2f})'),
+        Line2D([0], [0], color='#00d4aa', linewidth=2, label=f'Tendencia (ER>0.50)'),
+        Line2D([0], [0], color='#8b949e', linewidth=2, label=f'Transicion (0.30-0.50)'),
+        Line2D([0], [0], color='#f85149', linewidth=2, label=f'Ruido (ER<0.30)'),
     ]
     ax4.legend(handles=legend_elements, facecolor='#161b22', labelcolor='#e6edf3', fontsize=8, loc='upper right')
 
@@ -1158,9 +1191,12 @@ with PdfPages(OUTPUT_PDF) as pdf:
     ax5.plot(x_plot, er_suavizado[::step], color='#e6edf3', linewidth=1.0, label='Tendencia (SMA 200)', rasterized=True)
     
     media_er = df['ER'].mean()
-    ax5.axhline(media_er, color='#58a6ff', linewidth=1.2, linestyle='-', label=f'Media: {media_er:.2f}')
-    ax5.axhline(umbral_tend, color='#00d4aa', linewidth=0.8, linestyle='--', label=f'Tendencia ({umbral_tend:.2f})')
-    ax5.axhline(umbral_ruid, color='#f85149', linewidth=0.8, linestyle='--', label=f'Ruido ({umbral_ruid:.2f})')
+    er_std   = df['ER'].std()
+    ax5.axhline(0.5,     color='#00d4aa', linewidth=0.8, linestyle='--', label='Direccionalidad (0.5)')
+    ax5.axhline(0.3,     color='#f85149', linewidth=0.8, linestyle='--', label='Alto Ruido (0.3)')
+    ax5.axhline(media_er,               color='#58a6ff', linewidth=1.0, linestyle='-',  alpha=0.7, label=f'Media ({media_er:.2f})')
+    ax5.axhline(media_er + er_std,      color='#58a6ff', linewidth=0.7, linestyle=':',  alpha=0.7, label=f'+1σ ({media_er+er_std:.2f})')
+    ax5.axhline(media_er - er_std,      color='#58a6ff', linewidth=0.7, linestyle=':',  alpha=0.7, label=f'-1σ ({media_er-er_std:.2f})')
 
     ax5.set_facecolor('#0d1117')
     ax5.set_ylabel('ER', color='#8b949e')

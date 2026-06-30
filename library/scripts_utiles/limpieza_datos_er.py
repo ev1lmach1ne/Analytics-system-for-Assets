@@ -2,6 +2,8 @@
 import pandas as pd
 import numpy as np
 import psycopg2
+import json
+import os
 import warnings
 warnings.filterwarnings('ignore')
 from numba import njit
@@ -15,10 +17,24 @@ NEON  = "\033[1;95m"  # Rosa brillante / negrita
 RESET = "\033[0m"
 # ----------------------------
 # ── CONFIGURACIÓN — solo cambia esto ─────────────────────
-TABLA      = 'xauusd_candles_15m'
-FRECUENCIA = '15min' # 1min, '5min', '15min', '30min', '1H', '4H', '1D' según necesites
-OUTPUT     = r"D:\DATOS\Activos\XAUUSD_M15_202103220700_202506122215_preparado.csv"
-ACTIVO = 'futuro' # 'crypto', 'futuro', 'stock' — para la etiqueta del desglose
+CONFIG_PATH = r"D:\DATOS\Activos\sesion_config.json"
+if os.path.exists(CONFIG_PATH):
+    with open(CONFIG_PATH) as f:
+        sesion = json.load(f)
+    TABLA      = f"{sesion['nombre']}_candles_{sesion['tf']}"
+    FRECUENCIA = sesion['tf']
+    ACTIVO     = sesion['activo'].lower()
+    print(f"↳ Config desde sesión: {TABLA}")
+else:
+    TABLA      = 'xauusd_candles_1h'
+    FRECUENCIA = '1h'
+    ACTIVO     = 'futuro'
+    print("↳ Usando config manual (sin sesion_config.json)")
+
+OUTPUT_DIR  = r"D:\DATOS\Activos\Limpiados"
+nombre_activo = TABLA.split('_')[0]
+OUTPUT = os.path.join(OUTPUT_DIR, nombre_activo, f"{nombre_activo}_{FRECUENCIA}_limpiado.csv")
+os.makedirs(os.path.dirname(OUTPUT), exist_ok=True)
 # ─────────────────────────────────────────────────────────
 # endregion
 
@@ -91,7 +107,7 @@ df = df.set_index('timestamp')
 
 # Estandarización UTC
 if df.index.tz is None:
-    df.index = df.index.tz_localize('Europe/Helsinki', ambiguous='NaT', nonexistent='NaT')
+    df.index = df.index.tz_localize('UTC')
     df.index = df.index.tz_convert('UTC')
 else:
     df.index = df.index.tz_convert('UTC')
@@ -128,6 +144,12 @@ df = df.reindex(idx_completo)
 
 # ── [5/8] FORWARD FILL (sin interpolación lineal) ────────────────────────────
 print("\n[5/8] Rellenando huecos con Forward Fill...")
+
+# Precio 0 no es válido — tratarlo como NaN para que ffill propague el último real
+for col in ['open', 'high', 'low', 'close']:
+    if col in df.columns:
+        df.loc[df[col] == 0, col] = np.nan
+
 era_nulo = df['close'].isna()
 total_reparaciones = era_nulo.sum()
 
