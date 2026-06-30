@@ -1,0 +1,24 @@
+# Entrar con portatil y descargar librerias necesarias:
+pip install -r requirements.txt
+
+# Comprobar conexión con base de datos QUESTDB:
+python "D:\Proyectos\Analytics-system-for-Assets\Conexión\test_conexion.py"
+o
+cd "Conexión"
+python test_conexion.py
+
+# Analizar en QUEST DB si hay cambios bruscos o anomalías en la estructura de datos:
+SELECT * FROM (
+    SELECT timestamp, 
+           close, 
+           (close / lag(close) OVER (ORDER BY timestamp ASC)) AS cambio_relativo
+    FROM 'nombre de la tabla'
+) 
+WHERE cambio_relativo > 1.5 
+   OR cambio_relativo < 0.5
+ORDER BY timestamp ASC;
+
+# EN ANALISIS DESCRIPTIVO:
+Modificar linea 8 Cambiar ruta de archivo
+Modificar linea 9 Cambiar temporalidad de datos
+
