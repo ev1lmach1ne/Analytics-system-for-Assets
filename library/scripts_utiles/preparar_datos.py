@@ -249,9 +249,9 @@ TABLA_DESTINO = f"{NOMBRE_ACTIVO}_candles_{TIMEFRAME}"
 _p = Path(CSV_INPUT)
 CSV_OUTPUT = str(_p.parent / f"{_p.stem}_preparado{_p.suffix}")
 
-print("="*50)
-print("PREPARACIÓN DE DATOS")
-print("="*50)
+print(f"\n{'='*60}")
+print(f"PREPARACIÓN DE DATOS — {NOMBRE_ACTIVO.upper()} ({TIMEFRAME})")
+print(f"{'='*60}\n")
 
 # Detectar separador automáticamente
 with open(CSV_INPUT, 'r', encoding='utf-8') as f:

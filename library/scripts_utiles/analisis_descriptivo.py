@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
+import matplotlib.ticker as mticker
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.lines import Line2D
 from matplotlib.collections import LineCollection
@@ -13,10 +14,11 @@ import json
 import subprocess
 import re
 import math
+import sys
 import seaborn as sns
 from matplotlib.widgets import SpanSelector
 from matplotlib.dates import num2date, date2num
-from matplotlib.widgets import RangeSlider
+from matplotlib.widgets import RangeSlider, TextBox, Button
 
 # region ── 1. CONFIGURACIÓN — solo cambiar estos valores ────────────────────────────
 CONFIG_PATH = r"D:\DATOS\Activos\sesion_config.json"
@@ -77,7 +79,7 @@ def seleccionar_rango_interactivo(df):
     ax.fill_between(df_plot.index, df_plot['close'], alpha=0.25, color='#00d4aa', zorder=1)
     ax.plot(df_plot.index, df_plot['close'], color='#00d4aa', linewidth=1.2, zorder=2)
 
-    ax.set_title("Selecciona el rango arrastrando los controles — Cierra la ventana al terminar",
+    ax.set_title("Selecciona el rango con el slider — Aceptar para confirmar",
                  color='#e6edf3', fontsize=11, fontweight='bold')
     ax.set_xlabel('Fecha', color='#8b949e')
     ax.set_ylabel('Precio', color='#8b949e')
@@ -90,27 +92,160 @@ def seleccionar_rango_interactivo(df):
     idx_max = df_plot.index.max()
     x_min_num = date2num(idx_min)
     x_max_num = date2num(idx_max)
+    tz = df_plot.index.tz
+    ax.set_xlim(idx_min, idx_max)
+    fig.subplots_adjust(bottom=0.09)
+    pos = ax.get_position()
 
     highlight = [ax.axvspan(idx_min, idx_max, alpha=0.12, facecolor='#00d4aa', zorder=0)]
 
-    ax_slider = fig.add_axes([0.12, 0.03, 0.76, 0.035])
+    ax.text(0.01, 0.99, f"Velas totales: {len(df):,}",
+            transform=ax.transAxes, ha='left', va='top',
+            fontsize=9, color='#8b949e',
+            bbox=dict(facecolor='#0d1117', alpha=0.7, edgecolor='#30363d', linewidth=0.5))
+
+    ax_slider = fig.add_axes([pos.x0, 0.04, pos.width, 0.030])
     ax_slider.set_facecolor('#21262d')
     slider = RangeSlider(ax_slider, '', x_min_num, x_max_num,
                          valinit=(x_min_num, x_max_num), valfmt='')
 
-    def update(val):
-        vmin, vmax = slider.val
-        dmin = pd.Timestamp(num2date(vmin).replace(tzinfo=None)).tz_localize(df_plot.index.tz)
-        dmax = pd.Timestamp(num2date(vmax).replace(tzinfo=None)).tz_localize(df_plot.index.tz)
+    bx0 = pos.x0
+    bw = pos.width
+    ax_reset   = fig.add_axes([bx0, 0.01, 0.07, 0.028])
+    ax_manual  = fig.add_axes([bx0 + 0.08, 0.01, 0.09, 0.028])
+    ax_cancel  = fig.add_axes([bx0 + bw - 0.17, 0.01, 0.08, 0.028])
+    ax_accept  = fig.add_axes([bx0 + bw - 0.08, 0.01, 0.08, 0.028])
+
+    for bax in [ax_reset, ax_manual, ax_cancel, ax_accept]:
+        bax.set_facecolor('#21262d')
+
+    btn_reset  = Button(ax_reset, 'Reset', color='#21262d', hovercolor='#30363d')
+    btn_manual = Button(ax_manual, 'Manual', color='#21262d', hovercolor='#30363d')
+    btn_cancel = Button(ax_cancel, 'Cancelar', color='#21262d', hovercolor='#3d1a1a')
+    btn_accept = Button(ax_accept, 'Aceptar', color='#1D9E75', hovercolor='#15805e')
+
+    for btn in [btn_reset, btn_manual, btn_cancel, btn_accept]:
+        for t in btn.ax.texts:
+            t.set_fontsize(7.5)
+
+    btn_cancel.label.set_color('#f85149')
+    btn_accept.label.set_color('white')
+
+    fmt_dmy = '%d/%m/%Y'
+    mx0 = pos.x0
+    ax_start = fig.add_axes([mx0, 0.085, 0.15, 0.035])
+    ax_end   = fig.add_axes([mx0 + 0.20, 0.085, 0.15, 0.035])
+    ax_apply = fig.add_axes([mx0 + 0.38, 0.085, 0.07, 0.035])
+    for bax in [ax_start, ax_end, ax_apply]:
+        bax.set_facecolor('#21262d')
+        bax.set_visible(False)
+
+    start_box = TextBox(ax_start, 'Inicio:', initial=idx_min.strftime(fmt_dmy),
+                        color='#21262d', hovercolor='#30363d')
+    end_box   = TextBox(ax_end, 'Fin:', initial=idx_max.strftime(fmt_dmy),
+                        color='#21262d', hovercolor='#30363d')
+    btn_apply = Button(ax_apply, 'Ir', color='#1D9E75', hovercolor='#15805e')
+
+    for box in [start_box, end_box]:
+        box.label.set_color('#8b949e')
+        box.label.set_fontsize(7)
+        if hasattr(box, 'text_disp'):
+            box.text_disp.set_color('white')
+        for t in box.ax.texts:
+            t.set_fontsize(8)
+
+    btn_apply.label.set_color('white')
+    for t in btn_apply.ax.texts:
+        t.set_fontsize(8)
+
+    for box in [start_box, end_box]:
+        box.on_submit(lambda _: on_apply(None))
+
+    manual_visible = False
+    accion = 'ninguna'
+
+    def actualizar_todo(vmin_num, vmax_num):
+        nonlocal accion
+        dmin = pd.Timestamp(num2date(vmin_num).replace(tzinfo=None)).tz_localize(tz)
+        dmax = pd.Timestamp(num2date(vmax_num).replace(tzinfo=None)).tz_localize(tz)
         highlight[0].remove()
         highlight[0] = ax.axvspan(dmin, dmax, alpha=0.12, facecolor='#00d4aa', zorder=0)
         ax.set_title(f"Rango: {dmin:%d %b %Y, %H:%M}  →  {dmax:%d %b %Y, %H:%M}",
                      color='#ff9900', fontsize=11, fontweight='bold')
+        if manual_visible:
+            start_box.set_val(dmin.strftime(fmt_dmy))
+            end_box.set_val(dmax.strftime(fmt_dmy))
         fig.canvas.draw_idle()
 
-    slider.on_changed(update)
-    fig.subplots_adjust(bottom=0.1)
+    def sincronizar_slider(dmin, dmax):
+        dmin_num = date2num(dmin)
+        dmax_num = date2num(dmax)
+        slider.set_val((dmin_num, dmax_num))
+        actualizar_todo(dmin_num, dmax_num)
+
+    def on_slider(val):
+        vmin, vmax = slider.val
+        actualizar_todo(vmin, vmax)
+
+    def on_manual_toggle(event):
+        nonlocal manual_visible
+        manual_visible = not manual_visible
+        for bax in [ax_start, ax_end, ax_apply]:
+            bax.set_visible(manual_visible)
+        fig.subplots_adjust(bottom=0.14 if manual_visible else 0.09)
+        fig.canvas.draw_idle()
+
+    def on_apply(event):
+        try:
+            texto_inicio = start_box.text.strip()
+            texto_fin = end_box.text.strip()
+            dmin = pd.to_datetime(texto_inicio, format=fmt_dmy)
+            dmax = pd.to_datetime(texto_fin, format=fmt_dmy)
+            if tz is not None:
+                dmin = dmin.tz_localize(tz) if dmin.tz is None else dmin
+                dmax = dmax.tz_localize(tz) if dmax.tz is None else dmax
+            sincronizar_slider(dmin, dmax)
+        except Exception as e:
+            print(f"      ⚠️ Error al aplicar fecha manual: {e}")
+
+    def on_reset(event):
+        sincronizar_slider(idx_min, idx_max)
+
+    def on_accept(event):
+        nonlocal accion
+        accion = 'aceptar'
+        plt.close(fig)
+
+    def on_cancel(event):
+        nonlocal accion
+        accion = 'cancelar'
+        plt.close(fig)
+
+    def on_key(event):
+        if event.key == 'escape':
+            nonlocal accion
+            accion = 'cancelar'
+            plt.close(fig)
+
+    def on_close(event):
+        nonlocal accion
+        if accion == 'ninguna':
+            accion = 'cancelar'
+
+    slider.on_changed(on_slider)
+    btn_reset.on_clicked(on_reset)
+    btn_manual.on_clicked(on_manual_toggle)
+    btn_accept.on_clicked(on_accept)
+    btn_cancel.on_clicked(on_cancel)
+    btn_apply.on_clicked(on_apply)
+    fig.canvas.mpl_connect('key_press_event', on_key)
+    fig.canvas.mpl_connect('close_event', on_close)
+
     plt.show()
+
+    if accion == 'cancelar':
+        print("      ❌ Selección cancelada por el usuario.")
+        sys.exit(0)
 
     vmin, vmax = slider.val
     dmin = pd.Timestamp(num2date(vmin).replace(tzinfo=None)).tz_localize(df.index.tz)
@@ -121,7 +256,7 @@ def seleccionar_rango_interactivo(df):
         print(f"      Rango seleccionado: {dmin} → {dmax}")
         return dmin, dmax
 
-    print("      ⚠️ Sin selección — usando dataset completo.")
+    print("        Sin selección — usando dataset completo.")
     return None, None
 # endregion
 # region ── 2. VALIDACIÓN ─────────────────────────────────────────────────────────────
@@ -226,18 +361,26 @@ if col_flag in df.columns:
     fecha_fin = df.index.max()
     segundos_reales = (fecha_fin - fecha_inicio).total_seconds()
     if segundos_reales > 0:
-        horas_teoricas = int(segundos_reales / 3600) + 1
+        try:
+            vpd_teorico = get_factores(CONFIG['activo'], CONFIG['tf'])['dia']
+        except Exception:
+            vpd_teorico = None
+        if vpd_teorico is not None and vpd_teorico > 0:
+            velas_teoricas = int((segundos_reales / 86400) * vpd_teorico) + 1
+        else:
+            velas_teoricas = int(segundos_reales / 3600) + 1
     else:
-        horas_teoricas = total_filas
+        velas_teoricas = total_filas
     
     # Cálculos de control
-    filas_fantasma = horas_teoricas - total_filas
+    filas_fantasma = max(0, velas_teoricas - total_filas)
+    pct_completitud = total_filas / velas_teoricas * 100 if velas_teoricas > 0 else 0
 
     print(f"\n📊 [AUDITORÍA] DIAGNÓSTICO DE CONTROL DE CALIDAD:")
     print(f"======================================================================")
-    print(f" • Horas teóricas por calendario:        {horas_teoricas} velas.")
-    print(f" • Filas físicas en tu archivo actual:   {total_filas} velas.")
-    print(f"   └── ⚠️ Huecos temporales ('Fantasma'): {filas_fantasma} horas que NO existen en el CSV.")
+    print(f" • Velas teóricas por calendario:  {velas_teoricas:>12,} velas.")
+    print(f" • Filas físicas en tu archivo:    {total_filas:>12,} velas.")
+    print(f"   └── {'⚠️' if filas_fantasma > 0 else '✅'} Huecos temporales:          {filas_fantasma:>12,} velas ({pct_completitud:.2f}% completitud)")
     print(f" 📊 DESGLOSE DE LOS DATOS DEL ARCHIVO:")
     print(f" ======================================================================")
     print(f"    Total filas en el archivo:                    {total_filas:>10,}")
@@ -659,6 +802,7 @@ vol_weekend_ratio = 0.0
 pivot_week = pd.DataFrame(dtype=float)
 pivot_month = pd.DataFrame(dtype=float)
 corr_24 = pd.DataFrame(dtype=float)
+overall_vol = 0.0
 
 try:
     if 'hora_utc' not in df.columns:
@@ -710,9 +854,9 @@ try:
 
         # ── Matrices para heatmaps ──
         df['retorno_pct'] = df['retorno'] * 100
-        pivot_week = df[df.index.dayofweek < 5].pivot_table(
+        pivot_week = df.pivot_table(
             values='retorno_pct',
-            index=df[df.index.dayofweek < 5].index.dayofweek,
+            index=df.index.dayofweek,
             columns='hora_utc',
             aggfunc='std'
         )
@@ -827,11 +971,15 @@ h_total = h_tend + h_alet + h_rev
 hv_vals = [v for v in [val_hv_7d, val_hv_30d, val_hv_90d, val_hv_365d] if v is not None]
 max_hv = max(hv_vals) if hv_vals else 1
 
-vol_hora_vals = [vol_por_hora.get(h, 0) for h in [int(hora_mas_volatil), 8, 14]]
-max_vol_hora = max(vol_hora_vals) if max(vol_hora_vals) > 0 else 1
+# Min-max normalization for HV bars
+_hv_raw = [v for v in [val_hv_7d, val_hv_30d, val_hv_90d, val_hv_365d] if v is not None]
+_hv_min = min(_hv_raw) if _hv_raw else 0
+_hv_rng = max(_hv_raw) - _hv_min if _hv_raw and max(_hv_raw) > _hv_min else 1
 
-rel_sesion_vals = [v for v in [vol_relativa_asia, vol_relativa_london, vol_relativa_ny, vol_weekend_ratio] if v > 0]
-max_rel_sesion = max(rel_sesion_vals) if rel_sesion_vals else 1
+# Min-max normalization for session bars
+_rel_hours = [v for v in [vol_relativa_asia, vol_relativa_london, vol_relativa_ny] if v > 0]
+_rel_h_min = min(_rel_hours) if _rel_hours else 0
+_rel_h_rng = max(_rel_hours) - _rel_h_min if _rel_hours and max(_rel_hours) > _rel_h_min else 1
 
 metricas = {
     '1. Información General y tipo de muestreo': {
@@ -850,10 +998,10 @@ metricas = {
     },
     '3. Avanzada & Volatilidad Histórica': {
         'Volatilidad Histórica Total': f"{vol_historica_total*100:.2f}%",
-        'HV 7d': f"{barra(val_hv_7d, max_hv)} {val_hv_7d*100:.2f}%" if val_hv_7d is not None else "N/A",
-        'HV 30d': f"{barra(val_hv_30d, max_hv)} {val_hv_30d*100:.2f}%" if val_hv_30d is not None else "N/A",
-        f'HV {dias_trimestre}d': f"{barra(val_hv_90d, max_hv)} {val_hv_90d*100:.2f}%" if val_hv_90d is not None else "N/A",
-        f'HV {dias_ano}d': f"{barra(val_hv_365d, max_hv)} {val_hv_365d*100:.2f}%" if val_hv_365d is not None else "N/A",
+        'HV 7d': f"{barra(val_hv_7d - _hv_min, _hv_rng)} {val_hv_7d / vol_historica_total:.3f}x" if val_hv_7d is not None else "N/A",
+        'HV 30d': f"{barra(val_hv_30d - _hv_min, _hv_rng)} {val_hv_30d / vol_historica_total:.3f}x" if val_hv_30d is not None else "N/A",
+        f'HV {dias_trimestre}d': f"{barra(val_hv_90d - _hv_min, _hv_rng)} {val_hv_90d / vol_historica_total:.3f}x" if val_hv_90d is not None else "N/A",
+        f'HV {dias_ano}d': f"{barra(val_hv_365d - _hv_min, _hv_rng)} {val_hv_365d / vol_historica_total:.3f}x" if val_hv_365d is not None else "N/A",
         'Desviación Escalado Fractal': f"{desviacion_escalado:.4%}",
         ' ': '',
     },
@@ -925,14 +1073,10 @@ metricas = {
         'Minima correlación (Panic)': f"{corr_min:.4f}",
         'Tiempo corr. negativa (%)': f"{tiempo_negativa:.2f}%",
     }, **({
-        'Hora más volátil (UTC)': f"{int(hora_mas_volatil):02d}:00",
-        'Vol. hora pico (%)': f"{barra(vol_maxima, max_vol_hora)} {vol_maxima:.4f}%",
-        'Vol. Londres (08:00)': f"{barra(vol_por_hora.get(8, 0), max_vol_hora)} {vol_por_hora.get(8, 0):.4f}%",
-        'Vol. NY (14:00)': f"{barra(vol_por_hora.get(14, 0), max_vol_hora)} {vol_por_hora.get(14, 0):.4f}%",
-        'Vol. relativa Asia (00-08)': f"{barra(vol_relativa_asia, max_rel_sesion)} {vol_relativa_asia:.2f}x",
-        'Vol. relativa Londres (08-14)': f"{barra(vol_relativa_london, max_rel_sesion)} {vol_relativa_london:.2f}x",
-        'Vol. relativa NY (14-22)': f"{barra(vol_relativa_ny, max_rel_sesion)} {vol_relativa_ny:.2f}x",
-        'Vol. fin de semana vs laborable': f"{barra(vol_weekend_ratio, max_rel_sesion)} {vol_weekend_ratio:.2f}x"
+        'Volatilidad promedio Asia (00-08)': f"{barra(vol_relativa_asia - _rel_h_min, _rel_h_rng)} {vol_relativa_asia:.2f}x" if vol_relativa_asia > 0 else f"{barra(0, 1)} N/A",
+        'Volatilidad promedio Londres (08-14)': f"{barra(vol_relativa_london - _rel_h_min, _rel_h_rng)} {vol_relativa_london:.2f}x" if vol_relativa_london > 0 else f"{barra(0, 1)} N/A",
+        'Volatilidad promedio NY (14-22)': f"{barra(vol_relativa_ny - _rel_h_min, _rel_h_rng)} {vol_relativa_ny:.2f}x" if vol_relativa_ny > 0 else f"{barra(0, 1)} N/A",
+        'Vol. fin de semana vs laborable': f"{vol_weekend_ratio:.1%}" if vol_weekend_ratio > 0 else "N/A"
     } if len(vol_por_hora) > 0 else {})),
     '9. Análisis de dependencia — Autocorrelación (ACF) y Parcial (PACF)': {
         'Contexto': f"Análisis basado en PACF Lag 1",
@@ -962,7 +1106,7 @@ for categoria, items in metricas.items():
     print(f"\n ▶ {categoria}")
     print(f"  {'─' * (len(categoria) + 2)}")
     for metrica, valor in items.items():
-        print(f"    {metrica:<35} : {valor}")
+        print(f"    {metrica:<40} : {valor}")
 
 print(f"\n{'═'*70}\n")
 
@@ -999,8 +1143,7 @@ if es_datetime_valido:
     })
 
     mes_stats = (df.groupby('mes_nombre')['factor_crecimiento'].prod() - 1) * 100
-    mask_lab = df.index.dayofweek < 5
-    dia_stats = (df[mask_lab].groupby(df[mask_lab]['dia_nombre'])['factor_crecimiento'].prod() - 1) * 100
+    dia_stats = (df.groupby('dia_nombre')['factor_crecimiento'].prod() - 1) * 100
     mes_stats = mes_stats.reindex(orden_meses)
     dia_stats = dia_stats.reindex(orden_dias)
 else:
@@ -1017,7 +1160,7 @@ with PdfPages(OUTPUT_PDF) as pdf:
     # Configuración de diseño: Máximo de categorías por página (2 por columna)
     CATS_POR_PAGINA = 6
     dy = 0.020
-    TOTAL_PAGINAS = math.ceil(len(categorias_reales) / CATS_POR_PAGINA) + 10
+    TOTAL_PAGINAS = math.ceil(len(categorias_reales) / CATS_POR_PAGINA) + 9
     PRIMERA_PAG_NO_METRICAS = math.ceil(len(categorias_reales) / CATS_POR_PAGINA) + 1
     
     for pag_num, i in enumerate(range(0, len(categorias_reales), CATS_POR_PAGINA), start=1):
@@ -1128,42 +1271,74 @@ with PdfPages(OUTPUT_PDF) as pdf:
         print(f"Generado página {pag_num}/{TOTAL_PAGINAS} — Métricas")
         
     # endregion
-# region ── PÁGINA 2 — Precio y Retornos ─────────────────────
+# region ── PÁGINA 2 — Precio, Equity Curve y Underwater Drawdown ─────
     fig = plt.figure(figsize=(11.69, 8.27))
     fig.patch.set_facecolor('#0f0f0f')
-    gs  = gridspec.GridSpec(2, 1, hspace=0.35)
+    gs  = gridspec.GridSpec(3, 1, hspace=0.50, height_ratios=[1.2, 1, 1])
     
     paso = 200
     df_plot = df.iloc[::paso]
-    r_plot = r[::paso]
+    equity_plot = cum_returns.iloc[::paso]
+    dd_plot = drawdown_series.iloc[::paso]
     eje_x_plot = df_plot.index if es_datetime_valido else np.arange(len(df_plot))
 
     ax1 = fig.add_subplot(gs[0])
-    ax1.plot(eje_x_plot, df_plot['close'], color='#1D9E75', linewidth=0.5, rasterized=True)
+    ax1.fill_between(eje_x_plot, df_plot['close'].min(), df_plot['close'],
+                      color='#1D9E75', alpha=0.08, rasterized=True)
+    ax1.plot(eje_x_plot, df_plot['close'], color='#1D9E75', linewidth=1.6, rasterized=True)
+    if 'SMA_Regimen' in df_plot.columns:
+        ax1.plot(eje_x_plot, df_plot['SMA_Regimen'], color='#d29922', linewidth=0.6, alpha=0.6, linestyle='--', rasterized=True)
+        ax1.text(0.98, 0.98, 'SMA (200pp)', transform=ax1.transAxes, fontsize=8,
+                 color='#d29922', ha='right', va='top',
+                 bbox=dict(facecolor='#111111', alpha=0.7, edgecolor='#d29922', linewidth=0.5))
     ax1.set_facecolor('#111111')
     ax1.set_title(f"{CONFIG['nombre']} — Precio de Cierre ({CONFIG['tf']})",
                   color='white', fontsize=11)
     ax1.set_ylabel('Precio', color='#888780')
-    ax1.set_xlabel('Tiempo' if es_datetime_valido else 'Nº de vela (TICKS)', color='#888780')
     ax1.tick_params(colors='#888780')
     ax1.grid(True, alpha=0.2, color='#444')
     for spine in ax1.spines.values(): spine.set_edgecolor('#333')
+    ax1.set_xticklabels([])
 
     ax2 = fig.add_subplot(gs[1])
-    ax2.plot(eje_x_plot, r_plot, color='#185FA5', linewidth=0.3, alpha=0.8, rasterized=True)
-    ax2.axhline(0, color='#E24B4A', linewidth=0.8, linestyle='--')
+    ax2.fill_between(eje_x_plot, 1, equity_plot, where=(equity_plot >= 1),
+                      color='#1D9E75', alpha=0.15, step='pre', rasterized=True)
+    ax2.fill_between(eje_x_plot, 1, equity_plot, where=(equity_plot < 1),
+                      color='#E24B4A', alpha=0.15, step='pre', rasterized=True)
+    ax2.plot(eje_x_plot, equity_plot, color='#58a6ff', linewidth=0.8, rasterized=True)
+    ax2.axhline(1, color='#888780', linewidth=0.5, linestyle='--')
     ax2.set_facecolor('#111111')
-    ax2.set_title(f"{CONFIG['nombre']} — Retornos Logaritmicos ({CONFIG['tf']})",
+    ax2.set_title(f"{CONFIG['nombre']} — Curva de Equity (Base 1.0)",
                   color='white', fontsize=11)
-    ax2.set_ylabel('Retorno log', color='#888780')
-    ax2.set_xlabel('Tiempo' if es_datetime_valido else 'Nº de vela (TICKS)', color='#888780')
+    ax2.set_ylabel('Capital (×)', color='#888780')
     ax2.tick_params(colors='#888780')
     ax2.grid(True, alpha=0.2, color='#444')
     for spine in ax2.spines.values(): spine.set_edgecolor('#333')
+    ax2.set_xticklabels([])
+
+    ax3 = fig.add_subplot(gs[2])
+    ax3.fill_between(eje_x_plot, 0, dd_plot * 100,
+                      color='#E24B4A', alpha=0.4, step='pre', rasterized=True)
+    ax3.plot(eje_x_plot, dd_plot * 100, color='#f85149', linewidth=0.5, rasterized=True)
+    ax3.axhline(0, color='#888780', linewidth=0.5, linestyle='--')
+    ax3.set_facecolor('#111111')
+    ax3.set_title(f"{CONFIG['nombre']} — Underwater Drawdown (%)",
+                  color='white', fontsize=11)
+    ax3.set_ylabel('Drawdown %', color='#888780')
+    ax3.set_xlabel('Tiempo' if es_datetime_valido else 'Nº de vela (TICKS)', color='#888780')
+    ax3.tick_params(colors='#888780')
+    ax3.grid(True, alpha=0.2, color='#444')
+    for spine in ax3.spines.values(): spine.set_edgecolor('#333')
+
+    if es_datetime_valido:
+        for y in pd.date_range(df_plot.index[0], df_plot.index[-1], freq='YS'):
+            ax1.axvline(y, color='#444', linewidth=0.4, alpha=0.4)
+            ax2.axvline(y, color='#444', linewidth=0.4, alpha=0.4)
+            ax3.axvline(y, color='#444', linewidth=0.4, alpha=0.4)
 
     pdf.savefig(fig, facecolor=fig.get_facecolor(), dpi=150)
     plt.close()
-    print(f"Generado página {PRIMERA_PAG_NO_METRICAS + 0}/{TOTAL_PAGINAS} — Precio y Retornos...")
+    print(f"Generado página {PRIMERA_PAG_NO_METRICAS + 0}/{TOTAL_PAGINAS} — Precio, Equity y Underwater...")
 
 # endregion
 # region ── PÁGINA 3 — Análisis de Estacionalidad ────────
@@ -1305,11 +1480,11 @@ with PdfPages(OUTPUT_PDF) as pdf:
     print(f"Generado página {PRIMERA_PAG_NO_METRICAS + 2}/{TOTAL_PAGINAS} — Precio por régimen ER...")
 
 # endregion
-# region ── PÁGINA 5 — Análisis de Riesgo: Diario y Anual ────────
+# region ── PÁGINA 5 — Riesgo Diario/Anual + QQ-Plot ────────
     try:
         fig = plt.figure(figsize=(11.69, 8.27))
         fig.patch.set_facecolor('#0f0f0f')
-        gs = gridspec.GridSpec(2, 1, height_ratios=[1, 1], hspace=0.50)
+        gs = gridspec.GridSpec(3, 1, height_ratios=[1, 1, 0.8], hspace=0.45)
 
         sigmas = [1, 2, 3]
         colores_sigmas = ['#1D9E75', '#BA7517', '#E24B4A']
@@ -1318,20 +1493,18 @@ with PdfPages(OUTPUT_PDF) as pdf:
             ax.set_facecolor('#111111')
             x = np.linspace(media - 4*std, media + 4*std, 200)
             y = stats.norm.pdf(x, media, std)
-            ax.plot(x, y, color='#185FA5', linewidth=2, label='Distribución Proyectada', rasterized=True)
+            ax.plot(x, y, color='#185FA5', linewidth=1.8, label='Distribución Proyectada', rasterized=True)
 
-            # Etiqueta de la Media (μ)
-            ax.axvline(media, color='white', linestyle='--', linewidth=1.2, alpha=0.6)
-            ax.text(media, -max(y) * 0.06, f"μ: {media:.2%}", color='white', fontsize=7,
+            ax.axvline(media, color='white', linestyle='--', linewidth=1, alpha=0.5)
+            ax.text(media, -max(y) * 0.06, f"μ: {media:.2%}", color='white', fontsize=6.5,
                     ha='center', fontweight='bold', bbox=dict(facecolor='black', alpha=0.8, edgecolor='none', pad=1))
 
-            # Lógica de niveles sigma
             for s in sigmas:
                 ax.fill_between(x, y, where=(x >= media-s*std) & (x <= media+s*std),
-                                color=colores_sigmas[s-1], alpha=0.15, rasterized=True)
+                                color=colores_sigmas[s-1], alpha=0.12, rasterized=True)
                 for lado in [-1, 1]:
                     val = media + (lado * s * std)
-                    ax.axvline(val, color=colores_sigmas[s-1], linestyle=':', alpha=0.5)
+                    ax.axvline(val, color=colores_sigmas[s-1], linestyle=':', alpha=0.4)
                     
                     if not es_anual:
                         prob = np.mean(r_diario_real <= val) if lado == -1 else np.mean(r_diario_real >= val)
@@ -1344,36 +1517,49 @@ with PdfPages(OUTPUT_PDF) as pdf:
                     
                     etiqueta = f"{lado*s}σ: {val:.2%}\n({txt})"
                     ax.text(val, -max(y) * (0.05 if s % 2 != 0 else 0.14), etiqueta,
-                            color=colores_sigmas[s-1], fontsize=6, ha='center', fontweight='bold',
-                            bbox=dict(facecolor='black', alpha=0.8, edgecolor='none', pad=1))
+                            color=colores_sigmas[s-1], fontsize=5.5, ha='center', fontweight='bold',
+                            bbox=dict(facecolor='black', alpha=0.8, edgecolor='none', pad=0.5))
 
             ax.set_ylim(-max(y)*0.24, max(y)*1.15)
-            ax.set_title(titulo, color='white', fontsize=11, pad=8)
-            ax.tick_params(colors='#888780', labelsize=7)
+            ax.set_title(titulo, color='white', fontsize=10, pad=6)
+            ax.tick_params(colors='#888780', labelsize=6)
             ax.grid(True, alpha=0.03)
-            ax.legend(facecolor='#222', labelcolor='white', fontsize=7, loc='upper right')
+            ax.legend(facecolor='#222', labelcolor='white', fontsize=6, loc='upper right')
             for spine in ax.spines.values(): spine.set_edgecolor('#333')
 
-        # Subplots 1 y 2
         ax1 = fig.add_subplot(gs[0])
         dibujar_campana_p5(ax1, ret_diario, vol_diaria, "Retorno Diario (Proyección)", es_anual=False)
 
         ax2 = fig.add_subplot(gs[1])
         dibujar_campana_p5(ax2, ret_anual, vol_anual, "Retorno Anual (Proyección)", es_anual=True)
 
+        ax3 = fig.add_subplot(gs[2])
+        ax3.set_facecolor('#111111')
+        (osm, osr), (slope, intercept, r_sq) = stats.probplot(r_clean, dist="norm")
+        ax3.scatter(osm, osr, color='#58a6ff', s=8, alpha=0.4, rasterized=True)
+        ax3.plot(osm, slope * osm + intercept, color='#E24B4A', linewidth=1.2, linestyle='--')
+        ax3.set_title(f"QQ-Plot: Retornos {CONFIG['tf']} vs Normal", color='white', fontsize=10, pad=6)
+        ax3.set_xlabel('Cuantiles teóricos', color='#888780', fontsize=7)
+        ax3.set_ylabel('Cuantiles observados', color='#888780', fontsize=7)
+        ax3.tick_params(colors='#888780', labelsize=6)
+        ax3.grid(True, alpha=0.15, color='#444')
+        for spine in ax3.spines.values(): spine.set_edgecolor('#333')
+        ax3.text(0.98, 0.05, f"R² ajuste: {r_sq:.4f}", transform=ax3.transAxes, ha='right', va='bottom',
+                 fontsize=7, color='#888780', fontweight='bold')
+
         pdf.savefig(fig, facecolor=fig.get_facecolor(), dpi=150)
         plt.close()
-        print(f"Generado página {PRIMERA_PAG_NO_METRICAS + 3}/{TOTAL_PAGINAS} — Riesgo Diario/Anual con Media...")
+        print(f"Generado página {PRIMERA_PAG_NO_METRICAS + 3}/{TOTAL_PAGINAS} — Riesgo Diario/Anual + QQ-Plot...")
     except Exception as e:
         print(f"ERROR EN PÁGINA 5: {e}")
         plt.close()
 
 # endregion
-# region ── PÁGINA 6 — Análisis de Riesgo Intradiario: Temporalidad Pura ────────
+# region ── PÁGINA 6 — Riesgo Intradiario + Rolling VaR ────────
     try:
         fig = plt.figure(figsize=(11.69, 8.27))
         fig.patch.set_facecolor('#0f0f0f')
-        gs = gridspec.GridSpec(2, 1, height_ratios=[1, 1], hspace=0.50)
+        gs = gridspec.GridSpec(3, 1, height_ratios=[1, 1, 0.8], hspace=0.45)
 
         sigmas = [1, 2, 3]
         colores_sigmas = ['#1D9E75', '#BA7517', '#E24B4A']
@@ -1384,42 +1570,42 @@ with PdfPages(OUTPUT_PDF) as pdf:
             ax.set_facecolor('#111111')
             x = np.linspace(media - 4*std, media + 4*std, 200)
             y = stats.norm.pdf(x, media, std)
-            ax.plot(x, y, color='#185FA5', linewidth=2, label='Distribución Proyectada', rasterized=True)
+            ax.plot(x, y, color='#185FA5', linewidth=1.8, label='Distribución Proyectada', rasterized=True)
 
             if tipo_grafico == 'tf_puro':
                 for s in sigmas:
                     ax.fill_between(x, y, where=(x >= media-s*std) & (x <= media+s*std),
-                                    color=colores_sigmas[s-1], alpha=0.15, rasterized=True)
+                                    color=colores_sigmas[s-1], alpha=0.12, rasterized=True)
                     for lado in [-1, 1]:
                         val = media + (lado * s * std)
-                        ax.axvline(val, color=colores_sigmas[s-1], linestyle=':', alpha=0.5)
+                        ax.axvline(val, color=colores_sigmas[s-1], linestyle=':', alpha=0.4)
                         prob_evento = np.mean(r <= val) if lado == -1 else np.mean(r >= val)
                         texto_frecuencia = f"1 c/{1/prob_evento:.1f}vel" if prob_evento > 0 else "No reg."
                         etiqueta = f"{lado*s}σ: {val:.2%}\n({texto_frecuencia})"
                         ax.text(val, -max(y) * (0.05 if s % 2 != 0 else 0.14), etiqueta,
-                                color=colores_sigmas[s-1], fontsize=6, ha='center', fontweight='bold',
-                                bbox=dict(facecolor='black', alpha=0.8, edgecolor='none', pad=1))
+                                color=colores_sigmas[s-1], fontsize=5.5, ha='center', fontweight='bold',
+                                bbox=dict(facecolor='black', alpha=0.8, edgecolor='none', pad=0.5))
             else:
                 niveles_var  = [0.95, 0.99]
                 colores_var  = ['#BA7517', '#E24B4A']
                 z_scores_var = [1.645, 2.326]
                 for idx, (conf, z) in enumerate(zip(niveles_var, z_scores_var)):
                     val_var = media - (z * std) if es_normal_p6 else np.percentile(r, (1-conf)*100)
-                    ax.fill_between(x, y, where=(x <= val_var), color=colores_var[idx], alpha=0.2, rasterized=True)
-                    ax.axvline(val_var, color=colores_var[idx], linestyle='-', linewidth=1.5, alpha=0.7)
+                    ax.fill_between(x, y, where=(x <= val_var), color=colores_var[idx], alpha=0.18, rasterized=True)
+                    ax.axvline(val_var, color=colores_var[idx], linestyle='-', linewidth=1.3, alpha=0.6)
                     prob_evento = np.mean(r <= val_var)
                     texto_frecuencia = f"1 c/{1/prob_evento:.1f}vel" if prob_evento > 0 else "No reg."
                     etiqueta = f"VaR ({int(conf*100)}%): {val_var:.2%}\n({texto_frecuencia})"
                     ax.text(val_var, -max(y) * (0.06 if idx == 0 else 0.16), etiqueta,
-                            color=colores_var[idx], fontsize=6, ha='center', fontweight='bold',
-                            bbox=dict(facecolor='black', alpha=0.8, edgecolor='none', pad=1))
+                            color=colores_var[idx], fontsize=5.5, ha='center', fontweight='bold',
+                            bbox=dict(facecolor='black', alpha=0.8, edgecolor='none', pad=0.5))
 
-            ax.axvline(media, color='white', linestyle='--', linewidth=1.2, alpha=0.5)
+            ax.axvline(media, color='white', linestyle='--', linewidth=1, alpha=0.4)
             ax.set_ylim(-max(y)*0.24, max(y)*1.15)
-            ax.set_title(titulo, color='white', fontsize=11, pad=8)
-            ax.tick_params(colors='#888780', labelsize=7)
+            ax.set_title(titulo, color='white', fontsize=10, pad=6)
+            ax.tick_params(colors='#888780', labelsize=6)
             ax.grid(True, alpha=0.03)
-            ax.legend(facecolor='#222', labelcolor='white', fontsize=7, loc='upper right')
+            ax.legend(facecolor='#222', labelcolor='white', fontsize=6, loc='upper right')
             for spine in ax.spines.values(): spine.set_edgecolor('#333')
 
         ax1 = fig.add_subplot(gs[0])
@@ -1431,16 +1617,42 @@ with PdfPages(OUTPUT_PDF) as pdf:
                               f"VaR {'Paramétrico' if es_normal_p6 else 'Histórico'} ({CONFIG['tf']})",
                               tipo_grafico='var')
 
+        ax3 = fig.add_subplot(gs[2])
+        ax3.set_facecolor('#111111')
+        rolling_window = max(20, int(velas_por_dia * 20)) if velas_por_dia is not None else 100
+        if len(r) > rolling_window * 2:
+            r_var95 = r.rolling(window=rolling_window).quantile(0.05)
+            r_var99 = r.rolling(window=rolling_window).quantile(0.01)
+            paso_rolling = max(1, len(r_var95) // 2000)
+            idx_r = r_var95.index[::paso_rolling] if es_datetime_valido else np.arange(len(r_var95))[::paso_rolling]
+            ax3.plot(idx_r, r_var95.iloc[::paso_rolling] * 100,
+                     color='#BA7517', linewidth=0.6, label=f'VaR 95% ({rolling_window}v)', rasterized=True)
+            ax3.plot(idx_r, r_var99.iloc[::paso_rolling] * 100,
+                     color='#E24B4A', linewidth=0.6, label=f'VaR 99% ({rolling_window}v)', rasterized=True)
+            ax3.axhline(np.percentile(r, 5) * 100, color='#BA7517', linewidth=0.8, linestyle='--', alpha=0.5)
+            ax3.axhline(np.percentile(r, 1) * 100, color='#E24B4A', linewidth=0.8, linestyle='--', alpha=0.5)
+            ax3.fill_between(idx_r, r_var95.iloc[::paso_rolling] * 100, alpha=0.08, color='#BA7517')
+            ax3.set_title(f"Rolling VaR (ventana {rolling_window} velas)", color='white', fontsize=10, pad=6)
+        else:
+            ax3.text(0.5, 0.5, "Datos insuficientes para Rolling VaR",
+                     ha='center', va='center', fontsize=10, color='#888780', transform=ax3.transAxes)
+        ax3.set_xlabel('Tiempo' if es_datetime_valido else 'Nº de vela', color='#888780', fontsize=7)
+        ax3.set_ylabel('Pérdida %', color='#888780', fontsize=7)
+        ax3.tick_params(colors='#888780', labelsize=6)
+        ax3.grid(True, alpha=0.15, color='#444')
+        ax3.legend(facecolor='#222', labelcolor='white', fontsize=6, loc='lower left')
+        for spine in ax3.spines.values(): spine.set_edgecolor('#333')
+
         pdf.savefig(fig, facecolor=fig.get_facecolor(), dpi=150)
         plt.close()
-        print(f"Generado página {PRIMERA_PAG_NO_METRICAS + 4}/{TOTAL_PAGINAS} — Análisis de Riesgos VaR...")
+        print(f"Generado página {PRIMERA_PAG_NO_METRICAS + 4}/{TOTAL_PAGINAS} — Riesgo Intradiario + Rolling VaR...")
 
     except Exception as e:
         print(f"ERROR EN PÁGINA 6: {e}")
         plt.close()
 
 # endregion
-# region ── PÁGINA 7 — Boxplot por Hora + Leverage Effect ──────────────────
+# region ── PÁGINA 7 — Boxplot + Retorno Esperado por Hora ──────────────────
     if 'vol_por_hora' not in locals():
         vol_por_hora = pd.Series(dtype=float)
     tiene_datos_hora = len(vol_por_hora) > 0
@@ -1450,11 +1662,13 @@ with PdfPages(OUTPUT_PDF) as pdf:
         fig.patch.set_facecolor('#0f0f0f')
 
         if tiene_datos_hora:
-            ax1 = fig.add_subplot(111)
+            gs = gridspec.GridSpec(2, 1, hspace=0.40, height_ratios=[1.5, 1])
+
+            # ── (0) Boxplot: Desviación Estándar por Hora ──
+            ax1 = fig.add_subplot(gs[0])
             ax1.set_facecolor('#111111')
             for spine in ax1.spines.values(): spine.set_edgecolor('#333')
 
-            # Desviación estándar de retornos por hora calendario (fecha + hora_utc)
             hourly_vol = df.groupby([df.index.normalize(), 'hora_utc'])['retorno'].std().dropna() * 100
 
             bxp_stats = []
@@ -1470,12 +1684,10 @@ with PdfPages(OUTPUT_PDF) as pdf:
                 if n > 0:
                     q1, q2, q3 = np.percentile(vals, [25, 50, 75])
                     iqr = q3 - q1
-                    # Bigotes adaptativos: 3×IQR si datos densos (>500), 1.5×IQR si pocos
                     umbral_iqr = 3.0 if n > 500 else 1.5
                     lower, upper = q1 - umbral_iqr*iqr, q3 + umbral_iqr*iqr
                     whislo = np.min(vals[vals >= lower])
                     whishi = np.max(vals[vals <= upper])
-                    # Outliers: se omiten si hay +1000 muestras/hora, máx 30 si pocos
                     if n > 1000:
                         fliers = np.array([])
                     else:
@@ -1499,21 +1711,20 @@ with PdfPages(OUTPUT_PDF) as pdf:
                          medianprops=dict(color='#E24B4A', linewidth=1.5),
                          flierprops=dict(marker='o', markerfacecolor='#E24B4A', markersize=3, alpha=0.4))
 
-            # Marcador de media (diamante rojo)
             for i, mv in enumerate(hourly_means):
                 ax1.plot(i, mv, 'D', color='#E24B4A', markersize=5, zorder=5, alpha=0.9)
 
-            # Línea horizontal: volatilidad promedio total
             total_avg_vol = hourly_vol.mean()
             ax1.axhline(total_avg_vol, color='#BA7517', linewidth=1.2, linestyle='--',
                         alpha=0.8, label=f'Vol. media total: {total_avg_vol:.4f}%')
-            # Marcador naranja en el eje Y
             ax1.plot(0, total_avg_vol, '>', color='#BA7517',
                      transform=ax1.get_yaxis_transform(), markersize=6, clip_on=False)
 
-            # Líneas verticales de sesiones
-            for hora, nombre, color in [(0, 'Asia', '#888888'), (8, 'Londres', '#BA7517'), (14, 'NY', '#1D9E75')]:
+            y_top = ax1.get_ylim()[1]
+            for hora, nombre, color in [(0, 'Tokio', '#E24B4A'), (8, 'Londres', '#58a6ff'), (13, 'NY', '#d29922')]:
                 ax1.axvline(hora, color=color, linewidth=1, linestyle=':', alpha=0.5)
+                ax1.text(hora + 0.3, y_top * 0.97, nombre, fontsize=6, color=color,
+                         ha='left', va='top', alpha=0.8)
 
             ax1.set_title(f"{CONFIG['nombre']} — Desviación Estándar de Retornos por Hora UTC ({CONFIG['tf']})",
                           color='white', fontsize=11)
@@ -1533,6 +1744,35 @@ with PdfPages(OUTPUT_PDF) as pdf:
                 Line2D([0], [0], color='#BA7517', linewidth=1.2, linestyle='--', label=f'Vol. media total: {total_avg_vol:.4f}%'),
             ]
             ax1.legend(handles=legend_elements, facecolor='#222', labelcolor='white', fontsize=8, loc='upper right')
+
+            # ── (1) Perfil Horario de Retorno Esperado ──
+            ax2 = fig.add_subplot(gs[1])
+            ax2.set_facecolor('#111111')
+            ret_por_hora = df.groupby('hora_utc')['retorno'].mean() * 100
+            vals = ret_por_hora.reindex(range(24), fill_value=0).values
+            cols = ['#1D9E75' if v >= 0 else '#E24B4A' for v in vals]
+            ax2.bar(range(24), vals, color=cols, alpha=0.7, width=0.8)
+            ax2.axhline(0, color='#888780', linewidth=0.5, linestyle='--')
+            ax2.set_title(f"{CONFIG['nombre']} — Retorno Esperado por Hora (%)",
+                          color='white', fontsize=11, pad=6)
+            ax2.set_xlabel('Hora UTC', color='#888780', fontsize=8)
+            ax2.set_ylabel('Retorno %', color='#888780', fontsize=8)
+            ax2.set_xticks(range(24))
+            ax2.set_xticklabels([str(h) for h in range(24)], fontsize=6.5)
+            ax2.tick_params(colors='#888780', labelsize=7)
+            ax2.set_xlim(-0.5, 23.5)
+            ax2.grid(True, axis='y', alpha=0.15, color='#444')
+            y_top = ax2.get_ylim()[1]
+            for hora, nombre, color in [(0, 'Tokio', '#E24B4A'), (8, 'Londres', '#58a6ff'), (13, 'NY', '#d29922')]:
+                ax2.axvline(hora, color=color, linewidth=0.8, linestyle='--', alpha=0.6)
+                ax2.text(hora + 0.3, y_top * 0.95, nombre, fontsize=6, color=color,
+                         ha='left', va='top', alpha=0.8)
+            for h in range(24):
+                if abs(vals[h]) > 0.001:
+                    ax2.text(h, vals[h], f'{vals[h]:.3f}', ha='center',
+                             va='bottom' if vals[h] > 0 else 'top', fontsize=6, color='white')
+            for spine in ax2.spines.values(): spine.set_edgecolor('#333')
+
         else:
             ax = fig.add_subplot(111)
             ax.axis('off')
@@ -1546,7 +1786,7 @@ with PdfPages(OUTPUT_PDF) as pdf:
 
         pdf.savefig(fig, facecolor=fig.get_facecolor(), dpi=150)
         plt.close()
-        print(f"Generado página {PRIMERA_PAG_NO_METRICAS + 5}/{TOTAL_PAGINAS} — Volatilidad Intradía...")
+        print(f"Generado página {PRIMERA_PAG_NO_METRICAS + 5}/{TOTAL_PAGINAS} — Boxplot + Retorno Esperado por Hora...")
 
     except Exception as e:
         print(f"ERROR EN PÁGINA 7: {e}")
@@ -1564,11 +1804,19 @@ with PdfPages(OUTPUT_PDF) as pdf:
             ax.set_facecolor('#111111')
             mask = np.zeros_like(corr_24, dtype=bool)
             mask[np.triu_indices_from(mask, k=1)] = True
-            sns.heatmap(corr_24, mask=mask, annot=True, fmt='.2f', cmap='coolwarm',
+            sns.heatmap(corr_24, mask=mask, annot=False, cmap='coolwarm',
                         center=0, vmin=-1, vmax=1, square=True, ax=ax,
                         linewidths=0.3, linecolor='#333',
-                        cbar_kws={'label': 'Correlación de Pearson', 'shrink': 0.8},
-                        annot_kws={'fontsize': 6})
+                        cbar_kws={'label': 'Correlación de Pearson', 'shrink': 0.8})
+            for i in range(corr_24.shape[0]):
+                for j in range(corr_24.shape[1]):
+                    if mask[i, j]:
+                        continue
+                    val = corr_24.iloc[i, j]
+                    color = 'white' if abs(val) >= 0.5 else '#888780'
+                    ax.text(j + 0.5, i + 0.5, f'{val:.2f}',
+                            ha='center', va='center', fontsize=6, color=color,
+                            fontweight='bold' if abs(val) >= 0.5 else 'normal')
             ax.set_title(f"{CONFIG['nombre']} — Matriz de Correlación Intra-diaria (Spearman, {CONFIG['tf']})",
                          color='white', fontsize=12, pad=15)
             ax.set_xlabel('Hora UTC', color='#888780')
@@ -1578,6 +1826,9 @@ with PdfPages(OUTPUT_PDF) as pdf:
             cbar = ax.collections[0].colorbar
             cbar.ax.yaxis.label.set_color('#888780')
             cbar.ax.tick_params(colors='#888780')
+            vmin, vmax = cbar.mappable.get_clim()
+            cbar.set_ticks([vmin, (vmin+vmax)/2, vmax])
+            cbar.ax.yaxis.set_major_formatter(mticker.FormatStrFormatter('%.2f'))
         else:
             ax = fig.add_subplot(111)
             ax.axis('off')
@@ -1594,90 +1845,101 @@ with PdfPages(OUTPUT_PDF) as pdf:
         plt.close()
 
 # endregion
-# region ── PÁGINA 9 — Heatmap Semanal (Hour × DayOfWeek) ──────────────────
+# region ── PÁGINA 9 — Heatmaps Semanal + Mensual ──
     try:
         fig = plt.figure(figsize=(11.69, 8.27))
         fig.patch.set_facecolor('#0f0f0f')
-        tiene_week = 'pivot_week' in locals() and not pivot_week.empty and pivot_week.shape[0] >= 3
 
-        if tiene_week:
-            ax = fig.add_subplot(111)
-            ax.set_facecolor('#111111')
-            dias_labels = ['Lun', 'Mar', 'Mié', 'Jue', 'Vie']
-            pivot_plot = pivot_week.copy()
-            pivot_plot.index = dias_labels[:len(pivot_plot)]
-            sns.heatmap(pivot_plot, annot=True, fmt='.3f', cmap='YlOrRd', ax=ax,
-                        linewidths=0.5, linecolor='#333', square=False,
-                        cbar_kws={'label': 'Volatilidad (%)', 'shrink': 0.8},
-                        annot_kws={'fontsize': 7})
-            ax.set_title(f"{CONFIG['nombre']} — Estacionalidad Semanal: Volatilidad por Hora y Día ({CONFIG['tf']})",
-                         color='white', fontsize=12, pad=15)
-            ax.set_xlabel('Hora UTC', color='#888780')
-            ax.set_ylabel('Día de la semana', color='#888780')
-            ax.tick_params(colors='#888780', labelsize=9)
-            for spine in ax.spines.values(): spine.set_edgecolor('#333')
-            cbar = ax.collections[0].colorbar
-            cbar.ax.yaxis.label.set_color('#888780')
-            cbar.ax.tick_params(colors='#888780')
+        tiene_week = 'pivot_week' in locals() and not pivot_week.empty and pivot_week.shape[0] >= 3
+        tiene_mes  = 'pivot_month' in locals() and not pivot_month.empty and pivot_month.shape[0] >= 3
+
+        if tiene_week or tiene_mes:
+            gs = gridspec.GridSpec(2, 1, hspace=0.40, height_ratios=[1, 1])
+
+            # ── (0) Heatmap Semanal ──
+            ax1 = fig.add_subplot(gs[0])
+            ax1.set_facecolor('#111111')
+            if tiene_week:
+                dias_labels = ['Lun', 'Mar', 'Mié', 'Jue', 'Vie', 'Sáb', 'Dom']
+                pw = pivot_week.copy()
+                pw.index = dias_labels[:len(pw)]
+                sns.heatmap(pw, annot=False, cmap='YlOrRd', ax=ax1,
+                            linewidths=0.5, linecolor='#333', square=False,
+                            cbar_kws={'label': 'Volatilidad (%)', 'shrink': 0.8})
+                umbral_week = pw.stack().quantile(0.80)
+                for i in range(pw.shape[0]):
+                    for j in range(pw.shape[1]):
+                        val = pw.iloc[i, j]
+                        color = 'white' if val >= umbral_week else '#888780'
+                        ax1.text(j + 0.5, i + 0.5, f'{val:.3f}',
+                                ha='center', va='center', fontsize=7, color=color,
+                                fontweight='bold' if val >= umbral_week else 'normal')
+                ax1.set_title(f"{CONFIG['nombre']} — Estacionalidad Semanal: Volatilidad por Hora y Día ({CONFIG['tf']})",
+                              color='white', fontsize=12, pad=15)
+                ax1.set_xlabel('Hora UTC', color='#888780')
+                ax1.set_ylabel('Día de la semana', color='#888780')
+                ax1.tick_params(colors='#888780', labelsize=9)
+                cbar1 = ax1.collections[0].colorbar
+                cbar1.ax.yaxis.label.set_color('#888780')
+                cbar1.ax.tick_params(colors='#888780')
+                vmin1, vmax1 = cbar1.mappable.get_clim()
+                cbar1.set_ticks([vmin1, (vmin1+vmax1)/2, vmax1])
+                cbar1.ax.yaxis.set_major_formatter(mticker.FormatStrFormatter('%.2f'))
+            else:
+                ax1.text(0.5, 0.5, "No disponible", ha='center', va='center', fontsize=11, color='#888780', transform=ax1.transAxes)
+            for spine in ax1.spines.values(): spine.set_edgecolor('#333')
+
+            # ── (1) Heatmap Mensual ──
+            ax2 = fig.add_subplot(gs[1])
+            ax2.set_facecolor('#111111')
+            if tiene_mes:
+                mes_labels = ['Ene','Feb','Mar','Abr','May','Jun',
+                              'Jul','Ago','Sep','Oct','Nov','Dic']
+                pm = pivot_month.copy()
+                pm.index = mes_labels[:len(pm)]
+                sns.heatmap(pm, annot=False, cmap='YlOrRd', ax=ax2,
+                            linewidths=0.5, linecolor='#333', square=False,
+                            cbar_kws={'label': 'Volatilidad (%)', 'shrink': 0.8})
+                umbral_mes = pm.stack().quantile(0.80)
+                for i in range(pm.shape[0]):
+                    for j in range(pm.shape[1]):
+                        val = pm.iloc[i, j]
+                        color = 'white' if val >= umbral_mes else '#888780'
+                        ax2.text(j + 0.5, i + 0.5, f'{val:.3f}',
+                                ha='center', va='center', fontsize=6, color=color,
+                                fontweight='bold' if val >= umbral_mes else 'normal')
+                ax2.set_title(f"{CONFIG['nombre']} — Estacionalidad Mensual: Volatilidad por Hora y Mes ({CONFIG['tf']})",
+                              color='white', fontsize=12, pad=15)
+                ax2.set_xlabel('Hora UTC', color='#888780')
+                ax2.set_ylabel('Mes', color='#888780')
+                ax2.tick_params(colors='#888780', labelsize=9)
+                cbar2 = ax2.collections[0].colorbar
+                cbar2.ax.yaxis.label.set_color('#888780')
+                cbar2.ax.tick_params(colors='#888780')
+                vmin2, vmax2 = cbar2.mappable.get_clim()
+                cbar2.set_ticks([vmin2, (vmin2+vmax2)/2, vmax2])
+                cbar2.ax.yaxis.set_major_formatter(mticker.FormatStrFormatter('%.2f'))
+            else:
+                ax2.text(0.5, 0.5, "No disponible", ha='center', va='center', fontsize=11, color='#888780', transform=ax2.transAxes)
+            for spine in ax2.spines.values(): spine.set_edgecolor('#333')
+
         else:
             ax = fig.add_subplot(111)
             ax.axis('off')
             ax.set_facecolor('#111111')
-            ax.text(0.5, 0.5, "Heatmap semanal no disponible.",
+            ax.text(0.5, 0.5, "Heatmaps no disponibles.\nTF diario o sin datos horarios.",
                     ha='center', va='center', fontsize=12, color='#888780', transform=ax.transAxes)
 
         pdf.savefig(fig, facecolor=fig.get_facecolor(), dpi=150)
         plt.close()
-        print(f"Generado página {PRIMERA_PAG_NO_METRICAS + 7}/{TOTAL_PAGINAS} — Estacionalidad Semanal...")
+        print(f"Generado página {PRIMERA_PAG_NO_METRICAS + 7}/{TOTAL_PAGINAS} — Heatmaps Semanal + Mensual...")
 
     except Exception as e:
         print(f"ERROR EN PÁGINA 9: {e}")
         plt.close()
 
 # endregion
-# region ── PÁGINA 10 — Heatmap Mensual (Hour × Mes) ───────────────────────
-    try:
-        fig = plt.figure(figsize=(11.69, 8.27))
-        fig.patch.set_facecolor('#0f0f0f')
-        tiene_mes = 'pivot_month' in locals() and not pivot_month.empty and pivot_month.shape[0] >= 3
-
-        if tiene_mes:
-            ax = fig.add_subplot(111)
-            ax.set_facecolor('#111111')
-            mes_labels = ['Ene','Feb','Mar','Abr','May','Jun',
-                          'Jul','Ago','Sep','Oct','Nov','Dic']
-            pivot_plot = pivot_month.copy()
-            pivot_plot.index = mes_labels[:len(pivot_plot)]
-            sns.heatmap(pivot_plot, annot=True, fmt='.3f', cmap='YlOrRd', ax=ax,
-                        linewidths=0.5, linecolor='#333', square=False,
-                        cbar_kws={'label': 'Volatilidad (%)', 'shrink': 0.8},
-                        annot_kws={'fontsize': 6})
-            ax.set_title(f"{CONFIG['nombre']} — Estacionalidad Mensual: Volatilidad por Hora y Mes ({CONFIG['tf']})",
-                         color='white', fontsize=12, pad=15)
-            ax.set_xlabel('Hora UTC', color='#888780')
-            ax.set_ylabel('Mes', color='#888780')
-            ax.tick_params(colors='#888780', labelsize=9)
-            for spine in ax.spines.values(): spine.set_edgecolor('#333')
-            cbar = ax.collections[0].colorbar
-            cbar.ax.yaxis.label.set_color('#888780')
-            cbar.ax.tick_params(colors='#888780')
-        else:
-            ax = fig.add_subplot(111)
-            ax.axis('off')
-            ax.set_facecolor('#111111')
-            ax.text(0.5, 0.5, "Heatmap mensual no disponible.",
-                    ha='center', va='center', fontsize=12, color='#888780', transform=ax.transAxes)
-
-        pdf.savefig(fig, facecolor=fig.get_facecolor(), dpi=150)
-        plt.close()
-        print(f"Generado página {PRIMERA_PAG_NO_METRICAS + 8}/{TOTAL_PAGINAS} — Estacionalidad Mensual...")
-
-    except Exception as e:
-        print(f"ERROR EN PÁGINA 10: {e}")
-        plt.close()
-
-# endregion
-# region ── PÁGINA 11 — Correlograma (ACF/PACF) ────────
+# region ── PÁGINA 10 — Correlograma (ACF/PACF) ────────
     fig = plt.figure(figsize=(8.27, 11.69))
     gs = gridspec.GridSpec(4, 2, height_ratios=[1, 1, 1, 1])
 
@@ -1730,7 +1992,7 @@ with PdfPages(OUTPUT_PDF) as pdf:
     plt.tight_layout(pad=3.0)
     pdf.savefig(fig)
     plt.close(fig)
-print(f"Generado página {PRIMERA_PAG_NO_METRICAS + 9}/{TOTAL_PAGINAS} — Análisis de Dependencia(ACF/PACF)")
+print(f"Generado página {PRIMERA_PAG_NO_METRICAS + 8}/{TOTAL_PAGINAS} — Análisis de Dependencia(ACF/PACF)")
 # endregion
 # endregion
 # ── FINALIZACIÓN ──────────────────────────────────────────────────────────────
