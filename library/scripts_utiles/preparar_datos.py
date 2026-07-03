@@ -15,31 +15,39 @@ sys.stdout.reconfigure(encoding='utf-8')
 # ── CONFIG ──────────────────────────────────────────
 QUESTDB_HOST      = 'localhost'
 QUESTDB_HTTP_PORT = 19000
+CSV_INPUT = os.environ.get('CSV_INPUT', '')
 
-# ── 1. FILE DIALOG ──────────────────────────────────
-try:
-    root = tk.Tk()
-    root.withdraw()
-    CSV_INPUT = filedialog.askopenfilename(title="Selecciona el archivo CSV", filetypes=[("CSV", "*.csv")])
-    root.destroy()
-except Exception:
-    CSV_INPUT = None
+# ── 1. FILE DIALOG (skip if CSV_INPUT env is set) ──
+if not CSV_INPUT:
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        CSV_INPUT = filedialog.askopenfilename(title="Selecciona el archivo CSV", filetypes=[("CSV", "*.csv")])
+        root.destroy()
+    except Exception:
+        CSV_INPUT = None
 if not CSV_INPUT:
     CSV_INPUT = r"D:\DATOS\Activos\XAUUSD_H1_202003130100_202506122200.csv"
     print(f"⚠️  Usando ruta por defecto: {CSV_INPUT}")
 
-# ── 2. INTERACTIVE CONFIG WINDOW ────────────────────
-SEL_NOMBRE  = ['']
-SEL_TIPO    = [0]  # 0=Futuro, 1=Stock, 2=Crypto
-SEL_TF      = [6]  # index in TF_LABELS (default = 1h)
-TF_LABELS   = ['30s','1m','3m','5m','15m','30m','1h','2h','4h','1d','ticks','rango','Custom']
-TIPO_LABELS = ['Futuro/Cfd', 'Forex', 'Stock', 'Crypto']
-CANCELADO   = [False]
-TF_CUSTOM_STR = ['']  # custom timeframe string (ej. '3m', '10m', '30s')
+# ── 2. INTERACTIVE CONFIG WINDOW (skip if env vars are set) ──
+CONFIG_SKIP = os.environ.get('CONFIG_SKIP', '')
+if CONFIG_SKIP:
+    NOMBRE_ACTIVO = os.environ.get('CONFIG_NOMBRE', 'xauusd')
+    TIMEFRAME     = os.environ.get('CONFIG_TF', '1h')
+    TIPO_ACTIVO   = os.environ.get('CONFIG_ACTIVO', 'FUTURO')
+else:
+    SEL_NOMBRE  = ['']
+    SEL_TIPO    = [0]  # 0=Futuro, 1=Stock, 2=Crypto
+    SEL_TF      = [6]  # index in TF_LABELS (default = 1h)
+    TF_LABELS   = ['30s','1m','3m','5m','15m','30m','1h','2h','4h','1d','ticks','rango','Custom']
+    TIPO_LABELS = ['Futuro/Cfd', 'Forex', 'Stock', 'Crypto']
+    CANCELADO   = [False]
+    TF_CUSTOM_STR = ['']  # custom timeframe string (ej. '3m', '10m', '30s')
 
-def ventana_config():
-    ctk.set_appearance_mode("Light")
-    ctk.set_default_color_theme("blue")
+    def ventana_config():
+        ctk.set_appearance_mode("Light")
+        ctk.set_default_color_theme("blue")
 
     root = ctk.CTk()
     root.title("☁  CONFIGURADOR DE ARCHIVO  ☁")
@@ -223,19 +231,19 @@ def ventana_config():
     root.grab_set()
     root.mainloop()
 
-ventana_config()
+    ventana_config()
 
-if CANCELADO[0]:
-    print("⚠️  Operación cancelada por el usuario.")
-    sys.exit(0)
+    if CANCELADO[0]:
+        print("⚠️  Operación cancelada por el usuario.")
+        sys.exit(0)
 
-NOMBRE_ACTIVO = SEL_NOMBRE[0]
-_mapa_tipo = {'Futuro/Cfd': 'FUTURO', 'Forex': 'FOREX', 'Stock': 'STOCK', 'Crypto': 'CRYPTO'}
-TIPO_ACTIVO   = _mapa_tipo[TIPO_LABELS[SEL_TIPO[0]]]
-if SEL_TF[0] == 12 and TF_CUSTOM_STR[0].strip():
-    TIMEFRAME = TF_CUSTOM_STR[0].strip().lower()
-else:
-    TIMEFRAME = TF_LABELS[SEL_TF[0]]
+    NOMBRE_ACTIVO = SEL_NOMBRE[0]
+    _mapa_tipo = {'Futuro/Cfd': 'FUTURO', 'Forex': 'FOREX', 'Stock': 'STOCK', 'Crypto': 'CRYPTO'}
+    TIPO_ACTIVO   = _mapa_tipo[TIPO_LABELS[SEL_TIPO[0]]]
+    if SEL_TF[0] == 12 and TF_CUSTOM_STR[0].strip():
+        TIMEFRAME = TF_CUSTOM_STR[0].strip().lower()
+    else:
+        TIMEFRAME = TF_LABELS[SEL_TF[0]]
 
 # ── 3. SESSION CONFIG ───────────────────────────────
 CONFIG_PATH = r"D:\DATOS\Activos\sesion_config.json"

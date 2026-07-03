@@ -155,7 +155,43 @@ print("\n[4/8] Reindexando a rango temporal completo...")
 ts_min, ts_max = df.index.min(), df.index.max()
 dias_totales = (ts_max - ts_min).days
 print(f"      Rango timestamps: {ts_min} → {ts_max} ({dias_totales} días)")
-idx_completo = pd.date_range(start=ts_min, end=ts_max, freq=FRECUENCIA_PD)
+_es_diario = bool(_re.match(r'\d+[dD]', FRECUENCIA_PD))
+if _es_diario:
+    idx_completo = pd.bdate_range(start=ts_min, end=ts_max)
+else:
+    # Intradiario: detectar patrón real de días y horas activas
+    df_orig = df.copy()
+    df_orig['_dow'] = df_orig.index.dayofweek
+    df_orig['_time'] = df_orig.index.time
+
+    # Días de la semana activos (cualquier día con al menos 3 observaciones)
+    obs_por_dow = df_orig.groupby('_dow').size()
+    min_obs = max(3, len(df_orig) * 0.001)
+    dow_activos = sorted(obs_por_dow[obs_por_dow >= min_obs].index)
+
+    # Horas activas (>80% de los días con datos)
+    horas_por_dia = df_orig.groupby(df_orig.index.date)['_time'].apply(set)
+    if len(horas_por_dia) >= 3:
+        todas_las_horas = set().union(*horas_por_dia)
+        recuento = {h: sum(1 for s in horas_por_dia if h in s) for h in todas_las_horas}
+        umbral = len(horas_por_dia) * 0.8
+        horas_activas = sorted([h for h, c in recuento.items() if c >= umbral])
+    else:
+        horas_activas = sorted(set().union(*horas_por_dia)) if horas_por_dia else []
+
+    if horas_activas and dow_activos:
+        # Todos los días del rango, filtrados por días activos
+        todos_dias = pd.date_range(start=ts_min, end=ts_max, freq='D')
+        dias_filtro = todos_dias[todos_dias.dayofweek.isin(dow_activos)]
+        idx_naive = pd.DatetimeIndex([
+            pd.Timestamp.combine(d.date(), h) for d in dias_filtro for h in horas_activas
+        ]).sort_values()
+        if df.index.tz is not None:
+            idx_completo = idx_naive.tz_localize(df.index.tz)
+        else:
+            idx_completo = idx_naive
+    else:
+        idx_completo = pd.date_range(start=ts_min, end=ts_max, freq=FRECUENCIA_PD)
 huecos = len(idx_completo) - len(df)
 print(f"      Huecos temporales detectados: {huecos} velas faltantes")
 df = df.reindex(idx_completo)
