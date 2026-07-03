@@ -1,31 +1,45 @@
-import os, json, re
+import os, json
 import pandas as pd
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                              QLabel, QLineEdit, QFrame, QTableWidget, QTableWidgetItem,
                              QHeaderView, QMessageBox, QAbstractItemView, QSplitter,
-                             QComboBox, QStackedWidget)
+                              QComboBox, QStackedWidget, QProgressBar, QSizePolicy)
 from PyQt6.QtCore import Qt, pyqtSignal
 from gui.widgets.file_explorer import FileExplorer
 from gui.widgets.console_widget import ConsoleWidget
 
-BASE_DATA = r"D:\DATOS\Activos"
-LIMPIADOS_DIR = os.path.join(BASE_DATA, "Limpiados")
-SCRIPTS_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "library", "scripts_utiles")
+from core.config import BASE_DATA, LIMPIADOS_DIR, SCRIPTS_DIR, TF_PATTERN
 
 STYLE_LIMPIADOS = """
 QWidget { background-color: #141e30; }
 QPushButton {
     background-color: #2a4a6a; color: #4fc3f7; border: none;
-    padding: 8px 18px; border-radius: 4px; font-size: 12px; font-weight: bold;
+    padding: 6px 8px; border-radius: 4px; font-size: 12px; font-weight: bold;
 }
 QPushButton:hover { background-color: #3a5a8a; }
+QPushButton:pressed { padding-top: 10px; padding-bottom: 6px; }
 QPushButton:disabled { background-color: #1a2a45; color: #3a5a7a; }
 QPushButton#danger { background-color: #3a1a1a; color: #e74c3c; }
 QPushButton#danger:hover { background-color: #4a2525; }
+QPushButton#danger:pressed { padding-top: 10px; padding-bottom: 6px; }
 QPushButton#analyze { background-color: #0f2a1a; color: #2ecc71; }
 QPushButton#analyze:hover { background-color: #1a3a2a; }
+QPushButton#analyze:pressed { padding-top: 10px; padding-bottom: 6px; }
 QPushButton#mode { background-color: #1a2a45; color: #7aaccc; }
 QPushButton#mode:hover { background-color: #2a3a55; }
+QPushButton#mode:pressed { padding-top: 10px; padding-bottom: 6px; }
+QProgressBar {
+    background-color: #1a2a45; border: none;
+    border-radius: 7px; height: 16px; max-width: 120px;
+}
+QProgressBar::chunk {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                                stop:0 rgba(255,255,255,0.30),
+                                stop:0.4 #6dd5fa,
+                                stop:0.7 #4fc3f7,
+                                stop:1 rgba(0,0,0,0.2));
+    border-radius: 6px;
+}
 QTableWidget {
     background-color: #0d1424; color: #aabbcc; border: 1px solid #253a60;
     gridline-color: #1a2a45; font-size: 11px;
@@ -36,14 +50,17 @@ QHeaderView::section {
     padding: 6px 8px; font-weight: bold; font-size: 11px;
 }
 QComboBox {
-    background-color: #1a2a45; color: #c8d6e5; border: 1px solid #253a60;
+    background-color: #1a2a45; color: #c8d6e5; border: none;
     padding: 6px 10px; border-radius: 4px; font-size: 12px; min-width: 140px;
 }
-QComboBox::drop-down { border: none; background: #253a60; width: 22px; }
+QComboBox::drop-down { border: none; background: transparent; width: 22px; }
+QComboBox::down-arrow { border: none; }
+QComboBox QAbstractItemView {
+    background-color: #1a2a45; color: #c8d6e5; selection-background-color: #2a4a6a;
+    border: 1px solid #253a60; outline: none;
+}
 QFrame#sep { background-color: #253a60; max-height: 1px; }
 """
-
-TF_PATTERN = re.compile(r'_(\d+[a-z]+)_limpiado|_(\d+[a-z]+)_limpio')
 
 class TabLimpiados(QWidget):
     analysis_completed = pyqtSignal(str, str, str, str)
@@ -150,6 +167,7 @@ class TabLimpiados(QWidget):
 
         self.console = ConsoleWidget()
         self.console.finished.connect(self._on_console_finished)
+        self.console.progress.connect(self._on_progress)
         splitter.addWidget(self.console)
 
         splitter.setSizes([250, 300, 300])
@@ -158,25 +176,32 @@ class TabLimpiados(QWidget):
         # ── Analyze buttons ──
         btn_row = QHBoxLayout()
         btn_row.setSpacing(8)
-        self.rf_input = QLineEdit()
-        self.rf_input.setPlaceholderText("Rf %")
-        self.rf_input.setText("4.5")
-        self.rf_input.setToolTip("Tasa libre de riesgo anual (%)")
-        self.rf_input.setMaximumWidth(55)
-        btn_row.addWidget(QLabel("Rf:"))
-        btn_row.addWidget(self.rf_input)
-        self.btn_analyze = QPushButton(" Analizar")
+        self.btn_analyze = QPushButton("Analizar")
         self.btn_analyze.setObjectName("analyze")
         self.btn_analyze.clicked.connect(self._run_analysis)
         self.btn_analyze.setEnabled(False)
         btn_row.addWidget(self.btn_analyze)
-        self.btn_reanalyze = QPushButton(" Re-analizar")
+        self.btn_reanalyze = QPushButton("Re-analizar")
         self.btn_reanalyze.setObjectName("danger")
         self.btn_reanalyze.clicked.connect(self._reanalyze)
         self.btn_reanalyze.setEnabled(False)
         self.btn_reanalyze.setVisible(False)
         btn_row.addWidget(self.btn_reanalyze)
-        btn_row.addStretch()
+        self.rf_input = QLineEdit()
+        self.rf_input.setPlaceholderText("Rf %")
+        self.rf_input.setText("0")
+        self.rf_input.setToolTip("Tasa libre de riesgo anual (%)")
+        self.rf_input.setMaximumWidth(55)
+        lbl_rf = QLabel("Rf:")
+        lbl_rf.setFixedWidth(16)
+        btn_row.addWidget(lbl_rf)
+        btn_row.addWidget(self.rf_input)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setToolTip("Progreso del análisis")
+        self.progress.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        btn_row.addWidget(self.progress)
         layout.addLayout(btn_row)
 
         # Initial scan for table mode
@@ -412,6 +437,7 @@ class TabLimpiados(QWidget):
         self.btn_delete.setEnabled(False)
         self.btn_reanalyze.setVisible(False)
         self.btn_reanalyze.setEnabled(False)
+        self.progress.setValue(0)
 
         # Auto-save .meta.json for legacy files
         meta_path = self._selected_path + '.meta.json'
@@ -472,6 +498,7 @@ class TabLimpiados(QWidget):
         self._run_analysis()
 
     def _on_console_finished(self, exit_code):
+        self.progress.setValue(100)
         self.btn_analyze.setEnabled(True)
         self.btn_preview.setEnabled(True)
         self.btn_delete.setEnabled(True)
@@ -485,8 +512,9 @@ class TabLimpiados(QWidget):
                 with open(self._pdf_path_file) as f:
                     data = json.load(f)
                     pdf_path = data.get('pdf_path')
-            except Exception:
-                pass
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
 
         metrics_path = self._metrics_path if os.path.exists(self._metrics_path) else None
 
@@ -503,8 +531,9 @@ class TabLimpiados(QWidget):
                 self._cached_metrics = metrics_cache
                 self.btn_reanalyze.setVisible(True)
                 self.btn_reanalyze.setEnabled(True)
-            except Exception:
-                pass
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
 
         self.analysis_completed.emit(
             pdf_path or '',
@@ -512,3 +541,6 @@ class TabLimpiados(QWidget):
             self._selected_nombre or '',
             self._selected_tf or ''
         )
+
+    def _on_progress(self, pct):
+        self.progress.setValue(pct)

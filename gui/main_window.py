@@ -14,6 +14,7 @@ QTabBar::tab { background-color: #1a2a45; color: #5a7a9a; padding: 12px 30px;
               border: none; border-right: 1px solid #253a60; font-size: 12px; }
 QTabBar::tab:selected { background-color: #141e30; color: #4fc3f7; font-weight: bold; }
 QTabBar::tab:hover:!selected { background-color: #1e3050; color: #7aaccc; }
+QTabBar::tab:pressed { background-color: #0d1a30; }
 QScrollBar:vertical { background: #1a2a45; width: 8px; }
 QScrollBar::handle:vertical { background: #2a4a6a; border-radius: 4px; min-height: 30px; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }

@@ -68,8 +68,9 @@ class FileExplorer(QWidget):
                 background-color: #2a4a6a; color: #4fc3f7; border: none;
                 border-radius: 4px; font-weight: bold; font-size: 13px;
             }
-            QPushButton:hover, QToolButton:hover { background-color: #3a5a8a; }
-            QPushButton:disabled, QToolButton:disabled { background-color: #1a2a45; color: #3a5a7a; }
+QPushButton:hover, QToolButton:hover { background-color: #3a5a8a; }
+QPushButton:pressed, QToolButton:pressed { padding-top: 10px; padding-bottom: 6px; }
+QPushButton:disabled, QToolButton:disabled { background-color: #1a2a45; color: #3a5a7a; }
         """)
 
         layout = QVBoxLayout(self)

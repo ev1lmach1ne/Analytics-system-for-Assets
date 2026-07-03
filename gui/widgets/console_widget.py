@@ -26,6 +26,9 @@ _ANSI_RE = re.compile(r'\033\[([\d;]+)m')
 
 class ConsoleWidget(QWidget):
     finished = pyqtSignal(int)
+    progress = pyqtSignal(int)
+
+    _PROGRESS_RE = re.compile(r'\[(\d+)/(\d+)\]')
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -121,6 +124,10 @@ class ConsoleWidget(QWidget):
         text = QByteArray(data).data().decode('utf-8', errors='replace')
         self._buffer += text
         self._append_ansi(text)
+        m = self._PROGRESS_RE.search(text)
+        if m:
+            current, total = int(m.group(1)), int(m.group(2))
+            self.progress.emit(int(current / total * 100))
 
     def _on_finished(self, exit_code, exit_status):
         self.finished.emit(exit_code)

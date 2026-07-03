@@ -8,8 +8,12 @@ from matplotlib.lines import Line2D
 from matplotlib.collections import LineCollection
 from statsmodels.tsa.stattools import acf, pacf
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
-from scipy import stats
 import os
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+from core.config import CONFIG_PATH, INFORMES_DIR
+from scipy import stats
+from statsmodels.tsa.stattools import adfuller, kpss
 import json
 import subprocess
 import re
@@ -334,7 +338,7 @@ if __name__ == "__main__":
     if 'GUI_METRICS_OUTPUT' in os.environ:
         OUTPUT_DIR = os.path.dirname(os.environ['GUI_METRICS_OUTPUT'])
     else:
-        OUTPUT_DIR = r"D:\DATOS\Activos\Limpiados\Informes"
+        OUTPUT_DIR = INFORMES_DIR
 
     OUTPUT_PDF = os.path.join(
         OUTPUT_DIR, nombre_activo,
@@ -602,6 +606,11 @@ if __name__ == "__main__":
         dias_ano_regimen = 365 if CONFIG['activo'] == 'CRYPTO' else 252
         ret_anual  = np.exp(media_log_diaria_real * dias_ano_regimen) - 1
         
+        rf_anual   = CONFIG.get('rf_rate', 0.0) / 100.0
+        if rf_anual > 0:
+            print(f"      Rf rate: {rf_anual:.4%} (configurado)")
+        else:
+            print(f"      Rf rate: 0.00% (sin tasa libre de riesgo)")
         sharpe     = (ret_anual - rf_anual) / vol_anual if (vol_anual is not None and vol_anual != 0 and vol_anual != 0.0) else 0
         calmar_disponible = True
     else:
@@ -709,9 +718,6 @@ if __name__ == "__main__":
     def fmt_num(valor, decimales=4):
         return f"{valor:.{decimales}f}" if valor is not None else "N/A (TICKS)"
 
-    rf_anual = CONFIG.get('rf_rate', 0.0) / 100.0
-    if rf_anual > 0:
-        print(f"      Rf rate: {rf_anual:.4%} (configurado)")
     tf_actual = CONFIG['tf']
     
     # endregion
@@ -1178,6 +1184,168 @@ if __name__ == "__main__":
     print()
     print(f"\n{'═'*70}\n")
     
+    # endregion
+    # region ── 16. ESTIMADORES DE VOLATILIDAD OHLC ────────────────────────────────────
+    df_ohlc = df[['open', 'high', 'low', 'close']].replace(0, np.nan).dropna()
+
+    log_hl = np.log(df_ohlc['high'] / df_ohlc['low'])
+    log_co = np.log(df_ohlc['close'] / df_ohlc['open'])
+    log_oc_prev = np.log(df_ohlc['open'] / df_ohlc['close'].shift(1))
+    log_ho = np.log(df_ohlc['high'] / df_ohlc['open'])
+    log_lo = np.log(df_ohlc['low'] / df_ohlc['open'])
+
+    factor_park = 1 / (4 * np.log(2))
+    parkinson_var = factor_park * (log_hl ** 2)
+    parkinson_vol_periodo = np.sqrt(parkinson_var.mean())
+
+    gk_var = 0.5 * (log_hl ** 2) - (2 * np.log(2) - 1) * (log_co ** 2)
+    gk_var = gk_var.clip(lower=0)
+    gk_vol_periodo = np.sqrt(gk_var.mean())
+
+    rs_var = log_ho * (log_ho - log_co) + log_lo * (log_lo - log_co)
+    rs_var = rs_var.clip(lower=0)
+    rs_vol_periodo = np.sqrt(rs_var.mean())
+
+    ctc_vol_periodo = r.std()
+
+    if velas_por_anio is not None:
+        try:
+            factor_anual_ohlc = get_factores(CONFIG['activo'], CONFIG['tf'])['anual']
+        except (ValueError, KeyError, TypeError):
+            factor_anual_ohlc = velas_por_anio
+        parkinson_vol_anual = parkinson_vol_periodo * np.sqrt(factor_anual_ohlc)
+        gk_vol_anual       = gk_vol_periodo * np.sqrt(factor_anual_ohlc)
+        rs_vol_anual        = rs_vol_periodo * np.sqrt(factor_anual_ohlc)
+        ctc_vol_anual        = ctc_vol_periodo * np.sqrt(factor_anual_ohlc)
+    else:
+        parkinson_vol_anual = gk_vol_anual = rs_vol_anual = ctc_vol_anual = None
+
+    eficiencia_parkinson = (ctc_vol_periodo / parkinson_vol_periodo) ** 2 if parkinson_vol_periodo > 0 else None
+    eficiencia_gk        = (ctc_vol_periodo / gk_vol_periodo) ** 2 if gk_vol_periodo > 0 else None
+    eficiencia_rs         = (ctc_vol_periodo / rs_vol_periodo) ** 2 if rs_vol_periodo > 0 else None
+    # endregion
+
+    # region ── 17. TESTS DE ESTACIONARIEDAD (ADF / KPSS) ──────────────────────────────
+    MAX_OBS_STATIONARITY = 20000
+    precio_test = df_ohlc['close']
+    if len(precio_test) > MAX_OBS_STATIONARITY:
+        paso_stat = len(precio_test) // MAX_OBS_STATIONARITY
+        precio_test_sample = precio_test.iloc[::paso_stat]
+        r_test_sample       = r.iloc[::paso_stat] if len(r) > MAX_OBS_STATIONARITY else r
+    else:
+        precio_test_sample = precio_test
+        r_test_sample       = r
+
+    try:
+        adf_precio_stat, adf_precio_p, *_ = adfuller(precio_test_sample, autolag='AIC')
+    except Exception:
+        adf_precio_stat, adf_precio_p = np.nan, np.nan
+
+    try:
+        adf_ret_stat, adf_ret_p, *_ = adfuller(r_test_sample, autolag='AIC')
+    except Exception:
+        adf_ret_stat, adf_ret_p = np.nan, np.nan
+
+    try:
+        with np.errstate(all='ignore'):
+            kpss_precio_stat, kpss_precio_p, *_ = kpss(precio_test_sample, regression='c', nlags='auto')
+    except Exception:
+        kpss_precio_stat, kpss_precio_p = np.nan, np.nan
+
+    try:
+        with np.errstate(all='ignore'):
+            kpss_ret_stat, kpss_ret_p, *_ = kpss(r_test_sample, regression='c', nlags='auto')
+    except Exception:
+        kpss_ret_stat, kpss_ret_p = np.nan, np.nan
+
+    def diagnostico_estacionariedad(adf_p, kpss_p):
+        if np.isnan(adf_p) or np.isnan(kpss_p):
+            return "N/A"
+        adf_estacionaria  = adf_p < 0.05
+        kpss_estacionaria = kpss_p > 0.05
+        if adf_estacionaria and kpss_estacionaria:
+            return "ESTACIONARIA (consenso)"
+        elif not adf_estacionaria and not kpss_estacionaria:
+            return "NO ESTACIONARIA (consenso)"
+        else:
+            return "AMBIGUA (tests discrepan)"
+
+    veredicto_precio   = diagnostico_estacionariedad(adf_precio_p, kpss_precio_p)
+    veredicto_retornos = diagnostico_estacionariedad(adf_ret_p, kpss_ret_p)
+    # endregion
+
+    # region ── 18. VIDA MEDIA DE REVERSIÓN (HALF-LIFE OU) ────────────────────────────
+    precio_log = np.log(df_ohlc['close'])
+    delta_p    = precio_log.diff().dropna()
+    p_lag      = precio_log.shift(1).dropna()
+
+    idx_comun   = delta_p.index.intersection(p_lag.index)
+    delta_p_hl  = delta_p.loc[idx_comun].values
+    p_lag_hl    = p_lag.loc[idx_comun].values
+
+    try:
+        p_lag_mean   = p_lag_hl.mean()
+        cov_hl       = np.mean((p_lag_hl - p_lag_mean) * (delta_p_hl - delta_p_hl.mean()))
+        var_hl       = np.var(p_lag_hl)
+        beta_hl      = cov_hl / var_hl if var_hl != 0 else 0.0
+
+        if -1 < beta_hl < 0:
+            half_life_velas = -np.log(2) / np.log(1 + beta_hl)
+        else:
+            half_life_velas = None
+
+        if half_life_velas is not None and velas_por_dia is not None and velas_por_dia > 0:
+            half_life_dias = half_life_velas / velas_por_dia
+        else:
+            half_life_dias = None
+    except Exception:
+        beta_hl = None
+        half_life_velas = None
+        half_life_dias = None
+    # endregion
+
+    _mostrar_categoria('11. Estimadores de Volatilidad OHLC', {
+        'Contexto': "Parkinson / Garman-Klass / Rogers-Satchell vs Close-to-Close",
+        'Vol. Close-to-Close (anual)': fmt_pct(ctc_vol_anual) if ctc_vol_anual is not None else "N/A",
+        'Vol. Parkinson (anual)': fmt_pct(parkinson_vol_anual) if parkinson_vol_anual is not None else "N/A",
+        'Vol. Garman-Klass (anual)': fmt_pct(gk_vol_anual) if gk_vol_anual is not None else "N/A",
+        'Vol. Rogers-Satchell (anual)': fmt_pct(rs_vol_anual) if rs_vol_anual is not None else "N/A",
+        ' ': '',
+        'Eficiencia Parkinson vs CtC': f"{eficiencia_parkinson:.2f}x" if eficiencia_parkinson else "N/A",
+        'Eficiencia Garman-Klass vs CtC': f"{eficiencia_gk:.2f}x" if eficiencia_gk else "N/A",
+        'Eficiencia Rogers-Satchell vs CtC': f"{eficiencia_rs:.2f}x" if eficiencia_rs else "N/A",
+        'Estimador recomendado': "Rogers-Satchell (robusto a drift)" if rs_vol_periodo > 0 else "N/A"
+    })
+
+    _mostrar_categoria('12. Test de Estacionariedad (ADF / KPSS)', {
+        'Contexto': "ADF: H0=raiz unitaria | KPSS: H0=estacionaria",
+        'ADF stat (Precio)': f"{adf_precio_stat:.4f}" if not np.isnan(adf_precio_stat) else "N/A",
+        'ADF p-valor (Precio)': f"{adf_precio_p:.4f}" if not np.isnan(adf_precio_p) else "N/A",
+        'KPSS stat (Precio)': f"{kpss_precio_stat:.4f}" if not np.isnan(kpss_precio_stat) else "N/A",
+        'KPSS p-valor (Precio)': f"{kpss_precio_p:.4f}" if not np.isnan(kpss_precio_p) else "N/A",
+        'Veredicto (Precio)': veredicto_precio,
+        ' ': '',
+        'ADF stat (Retornos)': f"{adf_ret_stat:.4f}" if not np.isnan(adf_ret_stat) else "N/A",
+        'ADF p-valor (Retornos)': f"{adf_ret_p:.4f}" if not np.isnan(adf_ret_p) else "N/A",
+        'KPSS stat (Retornos)': f"{kpss_ret_stat:.4f}" if not np.isnan(kpss_ret_stat) else "N/A",
+        'KPSS p-valor (Retornos)': f"{kpss_ret_p:.4f}" if not np.isnan(kpss_ret_p) else "N/A",
+        'Veredicto (Retornos)': veredicto_retornos
+    })
+
+    _mostrar_categoria('13. Vida Media de Reversión (Half-Life OU)', {
+        'Contexto': "Modelo Ornstein-Uhlenbeck discreto sobre log(precio)",
+        'Beta (velocidad de reversión)': f"{beta_hl:.6f}" if beta_hl is not None else "N/A",
+        'Half-Life (velas)': f"{half_life_velas:.1f}" if half_life_velas is not None else "N/A (no reversiva)",
+        'Half-Life (días)': f"{half_life_dias:.2f}" if half_life_dias is not None else "N/A",
+        'Interpretación': (
+            "Serie mean-reverting: usese holding ≈ half-life" if half_life_velas is not None and half_life_velas > 0
+            else "Sin reversión detectada (random walk / tendencia)"
+        )
+    })
+
+    print()
+    print(f"\n{'═'*70}\n")
+
     # endregion
     # region ── 10. PREPARACIÓN PREVIA PDF ──────────────────────────────────────────
     # Preparación máscaras de regimen

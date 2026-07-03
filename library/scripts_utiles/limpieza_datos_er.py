@@ -9,6 +9,8 @@ warnings.filterwarnings('ignore')
 from numba import njit
 import sys
 sys.stdout.reconfigure(encoding='utf-8')
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+from core.config import CONFIG_PATH, LIMPIADOS_DIR
 
 
 # ----------COLORES-----------
@@ -17,7 +19,6 @@ NEON  = "\033[1;95m"  # Rosa brillante / negrita
 RESET = "\033[0m"
 # ----------------------------
 # ── CONFIGURACIÓN — solo cambia esto ─────────────────────
-CONFIG_PATH = r"D:\DATOS\Activos\sesion_config.json"
 if os.path.exists(CONFIG_PATH):
     with open(CONFIG_PATH) as f:
         sesion = json.load(f)
@@ -46,7 +47,7 @@ else:
     FRECUENCIA_PD = _tf
 print(f"      Frecuencia pandas: {FRECUENCIA_PD}")
 
-OUTPUT_DIR  = r"D:\DATOS\Activos\Limpiados"
+OUTPUT_DIR  = LIMPIADOS_DIR
 nombre_activo = TABLA.split('_')[0]
 OUTPUT = os.path.join(OUTPUT_DIR, nombre_activo, f"{nombre_activo}_{FRECUENCIA}_limpiado.csv")
 os.makedirs(os.path.dirname(OUTPUT), exist_ok=True)

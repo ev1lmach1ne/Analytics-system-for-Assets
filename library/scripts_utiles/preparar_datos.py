@@ -8,6 +8,8 @@ import csv
 import sys
 import tkinter as tk
 from tkinter import filedialog
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+from core.config import CONFIG_PATH
 import customtkinter as ctk
 import re
 sys.stdout.reconfigure(encoding='utf-8')
@@ -246,7 +248,6 @@ else:
         TIMEFRAME = TF_LABELS[SEL_TF[0]]
 
 # ── 3. SESSION CONFIG ───────────────────────────────
-CONFIG_PATH = r"D:\DATOS\Activos\sesion_config.json"
 os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
 with open(CONFIG_PATH, 'w') as f:
     json.dump({'nombre': NOMBRE_ACTIVO, 'tf': TIMEFRAME, 'activo': TIPO_ACTIVO}, f)

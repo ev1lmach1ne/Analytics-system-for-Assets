@@ -5,14 +5,7 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
 from PyQt6.QtCore import Qt, pyqtSignal
 from gui.widgets.file_explorer import FileExplorer
 from gui.widgets.console_widget import ConsoleWidget
-
-BASE_DATA = r"D:\DATOS\Activos"
-LIMPIADOS_DIR = os.path.join(BASE_DATA, "Limpiados")
-
-TF_LABELS   = ['30s','1m','3m','5m','15m','30m','1h','2h','4h','1d']
-TIPO_LABELS = ['Futuro/Cfd', 'Forex', 'Stock', 'Crypto']
-TIPO_MAP    = {'Futuro/Cfd': 'FUTURO', 'Forex': 'FOREX',
-               'Stock': 'STOCK', 'Crypto': 'CRYPTO'}
+from core.config import BASE_DATA, LIMPIADOS_DIR, TF_LABELS, TIPO_LABELS, TIPO_MAP, SCRIPTS_DIR
 
 STYLE_IMPORT = """
 QWidget { background-color: #141e30; }
@@ -21,18 +14,26 @@ QPushButton {
     padding: 8px 18px; border-radius: 4px; font-size: 12px; font-weight: bold;
 }
 QPushButton:hover { background-color: #3a5a8a; }
+QPushButton:pressed { padding-top: 10px; padding-bottom: 6px; }
 QPushButton:disabled { background-color: #1a2a45; color: #3a5a7a; }
 QPushButton#danger { background-color: #3a1a1a; color: #e74c3c; }
 QPushButton#danger:hover { background-color: #4a2525; }
+QPushButton#danger:pressed { padding-top: 10px; padding-bottom: 6px; }
 QPushButton#success { background-color: #0f2a1a; color: #2ecc71; }
 QPushButton#success:hover { background-color: #1a3a2a; }
+QPushButton#success:pressed { padding-top: 10px; padding-bottom: 6px; }
 QLabel#path { color: #3a5a7a; font-size: 10px; padding: 2px 0; }
 QLabel#title { color: #4fc3f7; font-size: 13px; font-weight: bold; }
 QLineEdit, QComboBox {
-    background-color: #1a2a45; color: #c8d6e5; border: 1px solid #253a60;
+    background-color: #1a2a45; color: #c8d6e5; border: none;
     padding: 6px 10px; border-radius: 4px; font-size: 11px; min-width: 90px;
 }
-QComboBox::drop-down { border: none; background: #253a60; width: 20px; }
+QComboBox::drop-down { border: none; background: transparent; width: 20px; }
+QComboBox::down-arrow { border: none; }
+QComboBox QAbstractItemView {
+    background-color: #1a2a45; color: #c8d6e5; selection-background-color: #2a4a6a;
+    border: 1px solid #253a60; outline: none;
+}
 QFrame#sep { background-color: #253a60; max-height: 1px; }
 """
 
@@ -82,7 +83,7 @@ class TabImportar(QWidget):
 
         self.rf_input = QLineEdit()
         self.rf_input.setPlaceholderText("4.5")
-        self.rf_input.setText("4.5")
+        self.rf_input.setText("0")
         self.rf_input.setToolTip("Tasa libre de riesgo anual (%)")
         self.rf_input.setMaximumWidth(55)
         toolbar.addWidget(QLabel("Rf(%):"))

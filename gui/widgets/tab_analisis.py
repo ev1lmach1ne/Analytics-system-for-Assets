@@ -13,17 +13,20 @@ QPushButton {
     padding: 8px 18px; border-radius: 4px; font-size: 12px; font-weight: bold;
 }
 QPushButton:hover { background-color: #3a5a8a; }
+QPushButton:pressed { padding-top: 10px; padding-bottom: 6px; }
 QPushButton:disabled { background-color: #1a2a45; color: #3a5a7a; }
 QPushButton#export { background-color: #0f2a1a; color: #2ecc71; }
 QPushButton#export:hover { background-color: #1a3a2a; }
+QPushButton#export:pressed { padding-top: 10px; padding-bottom: 6px; }
 QComboBox {
-    background-color: #1a2a45; color: #c8d6e5; border: 1px solid #253a60;
+    background-color: #1a2a45; color: #c8d6e5; border: none;
     padding: 6px 10px; border-radius: 4px; font-size: 12px; min-width: 140px;
 }
-QComboBox::drop-down { border: none; background: #253a60; width: 22px; }
+QComboBox::drop-down { border: none; background: transparent; width: 22px; }
+QComboBox::down-arrow { border: none; }
 QComboBox QAbstractItemView {
     background-color: #1a2a45; color: #c8d6e5; selection-background-color: #2a4a6a;
-    border: 1px solid #253a60;
+    border: 1px solid #253a60; outline: none;
 }
 QProgressBar {
     background-color: #1a2a45; border: none;
@@ -242,6 +245,7 @@ class TabAnalisis(QWidget):
         self.setStyleSheet(STYLE_ANALISIS)
         self._pdf_path = None
         self._metrics_path = None
+        self._all_metrics = None
         self._ticker = ''
         self._tf = ''
 
@@ -262,10 +266,18 @@ class TabAnalisis(QWidget):
 
         toolbar.addStretch()
 
+        lbl_horizon = QLabel("Ventana")
+        lbl_horizon.setStyleSheet("color: #aabbcc; font-size: 11px; font-weight: bold; padding-right: 4px;")
+        toolbar.addWidget(lbl_horizon)
+
         self.horizon = QComboBox()
         self.horizon.addItems(["General", "Scalping", "Daytrading", "Swingtrading", "Position"])
         self.horizon.setToolTip("Horizonte de analisis")
         toolbar.addWidget(self.horizon)
+
+        self.btn_apply = QPushButton("Aplicar")
+        self.btn_apply.clicked.connect(self._render_metrics)
+        toolbar.addWidget(self.btn_apply)
 
         self.btn_export = QPushButton(" Exportar PDF")
         self.btn_export.setObjectName("export")
@@ -317,24 +329,32 @@ class TabAnalisis(QWidget):
         self.btn_export.setEnabled(self._pdf_path is not None)
         self._update_horizon_items(tf)
 
+        try:
+            if self._metrics_path:
+                with open(self._metrics_path, 'r', encoding='utf-8') as f:
+                    self._all_metrics = json.load(f)
+        except Exception:
+            self._all_metrics = None
+
         self._render_metrics()
         if self._pdf_path:
             self.graphs_viewer.load(self._pdf_path)
             self.inner_tabs.setCurrentIndex(0)
 
     def _render_metrics(self):
-        if not self._metrics_path:
+        if not self._all_metrics:
             self.metrics_scroll.clear()
             self.lbl_period.setText("")
             return
 
-        try:
-            with open(self._metrics_path, 'r', encoding='utf-8') as f:
-                metricas = json.load(f)
-        except Exception:
-            self.metrics_scroll.clear()
-            self.lbl_period.setText("")
-            return
+        horizon = self.horizon.currentText() if self.horizon else 'General'
+        metricas = dict(self._all_metrics)
+
+        if horizon not in ('General', 'Scalping', 'Daytrading'):
+            for key in ('11. Estimadores de Volatilidad OHLC',
+                        '12. Test de Estacionariedad (ADF / KPSS)',
+                        '13. Vida Media de Reversión (Half-Life OU)'):
+                metricas.pop(key, None)
 
         period = self.metrics_scroll.populate(metricas)
         if period:

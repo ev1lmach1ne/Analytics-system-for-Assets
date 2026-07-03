@@ -8,14 +8,14 @@ LIMPIADOS_DIR = r"D:\DATOS\Activos\Limpiados"
 STYLE_SELECTOR = """
 QWidget { background-color: transparent; }
 QComboBox {
-    background-color: #1a2a45; color: #c8d6e5; border: 1px solid #253a60;
+    background-color: #1a2a45; color: #c8d6e5; border: none;
     padding: 6px 10px; border-radius: 4px; font-size: 12px; min-width: 220px;
 }
-QComboBox:focus { border-color: #4fc3f7; }
-QComboBox::drop-down { border: none; background: #253a60; width: 22px; }
+QComboBox::drop-down { border: none; background: transparent; width: 22px; }
+QComboBox::down-arrow { border: none; }
 QComboBox QAbstractItemView {
     background-color: #1a2a45; color: #c8d6e5; selection-background-color: #2a4a6a;
-    border: 1px solid #253a60;
+    border: 1px solid #253a60; outline: none;
 }
 QPushButton {
     background-color: #2a4a6a; color: #4fc3f7; border: none;
