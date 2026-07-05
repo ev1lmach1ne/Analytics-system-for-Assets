@@ -9,3 +9,8 @@ plotly
 sqlalchemy
 psycopg2-binary
 requests
+statsmodels
+seaborn
+python-dotenv
+PyQt6
+customtkinter

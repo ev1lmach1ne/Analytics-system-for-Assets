@@ -1,15 +1,8 @@
 import psycopg2
 import pandas as pd
-
-# ── CONFIGURACIÓN DE CONEXIÓN ─────────────────────────────
-# Solo tienes que cambiar esto si cambias de servidor o puerto
-DB_CONFIG = {
-    'host':     'localhost',
-    'port':     18812,        # puerto PostgreSQL wire de QuestDB
-    'database': 'qdb',
-    'user':     'admin',
-    'password': 'quest'
-}
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from core.config import DB_CONFIG
 
 # ── FUNCIÓN DE DESCARGA ───────────────────────────────────
 def get_data(tabla, fecha_inicio, fecha_fin):

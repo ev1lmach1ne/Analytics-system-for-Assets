@@ -2,694 +2,1097 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
+import matplotlib.ticker as mticker
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.lines import Line2D
 from matplotlib.collections import LineCollection
 from statsmodels.tsa.stattools import acf, pacf
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
-from scipy import stats
 import os
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+from core.config import CONFIG_PATH, INFORMES_DIR, LIMPIADOS_DIR, BASE_DATA
+from scipy import stats
+from statsmodels.tsa.stattools import adfuller, kpss
+import json
 import subprocess
 import re
+import math
+import sys
 import seaborn as sns
+from matplotlib.widgets import SpanSelector
+from matplotlib.dates import num2date, date2num
+from matplotlib.widgets import RangeSlider, TextBox, Button
 
 # region ── 1. CONFIGURACIÓN — solo cambiar estos valores ────────────────────────────
+# ── CONFIG por defecto a nivel módulo (usado cuando se importa) ──
 CONFIG = {
-    'activo':     'CRYPTO',
-    'nombre':     'BTC/USDT',
-    'tf':         '1h', 
-    'input_path': r"A:\Data\btc_1h_limpio.csv"
+    'activo':     'FUTURO',
+    'nombre':     'xauusd',
+    'tf':         '1h',
+        'input_path': os.path.join(LIMPIADOS_DIR, "xauusd", "xauusd_1h_limpiado.csv"),
+    'interactive': False,
 }
 
-FACTORES = {
-    'CRYPTO': {
-        # ... CRYPTO (24/7) 
-        '1min':  {'anual': 525600, 'trimestral': 129600, 'mensual': 43200, 'semanal': 10080, 'dia': 1440, 'horaria': 60},
-        '5min':  {'anual': 105120, 'trimestral': 25920,  'mensual': 8640,  'semanal': 2016,  'dia': 288,  'horaria': 12},
-        '15min': {'anual': 35040,  'trimestral': 8640,   'mensual': 2880,  'semanal': 672,   'dia': 96,   'horaria': 4},
-        '30min': {'anual': 17520,  'trimestral': 4320,   'mensual': 1440,  'semanal': 336,   'dia': 48,   'horaria': 2},
-        '1h':    {'anual': 8760,   'trimestral': 2160,   'mensual': 720,   'semanal': 168,   'dia': 24,   'horaria': 1},
-        '4h':    {'anual': 2190,   'trimestral': 540,    'mensual': 180,   'semanal': 42,    'dia': 6,    'horaria': 0.25}, # Nota: 0.25 significa que 1 barra de 4h son 4 horas (1/4 de barra por hora)
-        '1d':    {'anual': 365,    'trimestral': 90,     'mensual': 30,    'semanal': 7,     'dia': 1,    'horaria': 0.0416} # 1/24 de barra por hora
-    },
-    'FUTURO': {
-        # 1 día = 1440 min
-        '1min':  {'anual': 362880, 'trimestral': 90720, 'mensual': 30240, 'semanal': 7056, 'dia': 1440, 'horaria': 60},
-        '5min':  {'anual': 72576,  'trimestral': 18144, 'mensual': 6048,  'semanal': 1411, 'dia': 288,  'horaria': 12},
-        '15min': {'anual': 24192,  'trimestral': 6048,  'mensual': 2016,  'semanal': 470,  'dia': 96,   'horaria': 4},
-        '30min': {'anual': 12096,  'trimestral': 3024,  'mensual': 1008,  'semanal': 235,  'dia': 48,   'horaria': 2},
-        '1h':    {'anual': 6048,   'trimestral': 1512,  'mensual': 504,   'semanal': 118,  'dia': 24,   'horaria': 1},
-        '4h':    {'anual': 1512,   'trimestral': 378,   'mensual': 126,   'semanal': 29,   'dia': 6,    'horaria': 0.25},
-    },
-    'STOCK': {
-        # 1 día = 390 min (Sesión 6.5h)
-        '1min':  {'anual': 98280,  'trimestral': 24570, 'mensual': 8190,  'semanal': 1950, 'dia': 390,  'horaria': 60},
-        '5min':  {'anual': 19656,  'trimestral': 4914,  'mensual': 1638,  'semanal': 390,  'dia': 78,   'horaria': 12},
-        '15min': {'anual': 6552,   'trimestral': 1638,  'mensual': 546,   'semanal': 130,  'dia': 26,   'horaria': 4},
-        '30min': {'anual': 3276,   'trimestral': 819,   'mensual': 273,   'semanal': 65,   'dia': 13,   'horaria': 2},
-        '1h':    {'anual': 1638,   'trimestral': 409,   'mensual': 136,   'semanal': 32.5, 'dia': 6.5,  'horaria': 1},
-        '4h':    {'anual': 409,    'trimestral': 102,   'mensual': 34,    'semanal': 8,    'dia': 1.6,  'horaria': 0.25},
+def get_factores(tipo_activo, tf):
+    minutos_dia = {'CRYPTO': 1440, 'FUTURO': 1440, 'STOCK': 390}.get(tipo_activo, 1440)
+    dias_ano = {'CRYPTO': 365, 'FUTURO': 252, 'STOCK': 252}.get(tipo_activo, 252)
+    tf = tf.lower()
+    if tf.endswith('d'):      vd = 1
+    elif tf.endswith('w'):    vd = 1/5
+    elif tf.endswith('h'):    vd = minutos_dia / (float(tf.replace('h','')) * 60)
+    elif tf.endswith('min'):  vd = minutos_dia / float(tf.replace('min',''))
+    elif tf.endswith('m'):    vd = minutos_dia / float(tf.replace('m',''))
+    elif tf.endswith('s'):    vd = minutos_dia * 60 / float(tf.replace('s',''))
+    elif tf.endswith('sec'):  vd = minutos_dia * 60 / float(tf.replace('sec',''))
+    else:                     raise ValueError(f"TF no reconocido: {tf}")
+    return {'dia': vd, 'semanal': vd*5, 'mensual': vd*21,
+            'trimestral': vd*63, 'anual': vd*dias_ano}
+
+# endregion
+
+# ── CONFIG por defecto (solo si no fue pre-establecido por core/analizador.py) ──
+if '_CONFIG_READY' not in dir():
+    CONFIG = {
+        'activo':     'FUTURO',
+        'nombre':     'xauusd',
+        'tf':         '1h',
+    'input_path': os.path.join(LIMPIADOS_DIR, "xauusd", "xauusd_1h_limpiado.csv"),
+        'interactive': False,
     }
-}
 
+# region ── 1b. SELECTOR INTERACTIVO DE RANGO ────────────────────────────────────────
+def seleccionar_rango_interactivo(df):
+    if not CONFIG.get('interactive', False) or not isinstance(df.index, pd.DatetimeIndex):
+        return None, None
+
+    max_puntos = 50000
+    step = max(1, len(df) // max_puntos)
+    df_plot = df.iloc[::step]
+
+    fig, ax = plt.subplots(figsize=(16, 7))
+    fig.patch.set_facecolor('#0d1117')
+    ax.set_facecolor('#0d1117')
+
+    ax.fill_between(df_plot.index, df_plot['close'], alpha=0.25, color='#00d4aa', zorder=1)
+    ax.plot(df_plot.index, df_plot['close'], color='#00d4aa', linewidth=1.2, zorder=2)
+
+    ax.set_title("Selecciona el rango con el slider — Aceptar para confirmar",
+                 color='#e6edf3', fontsize=11, fontweight='bold')
+    ax.set_xlabel('Fecha', color='#8b949e')
+    ax.set_ylabel('Precio', color='#8b949e')
+    ax.tick_params(colors='#8b949e')
+    ax.grid(True, alpha=0.12, color='#30363d')
+    for spine in ax.spines.values():
+        spine.set_edgecolor('#21262d')
+
+    idx_min = df_plot.index.min()
+    idx_max = df_plot.index.max()
+    x_min_num = date2num(idx_min)
+    x_max_num = date2num(idx_max)
+    tz = df_plot.index.tz
+    ax.set_xlim(idx_min, idx_max)
+    fig.subplots_adjust(bottom=0.09)
+    pos = ax.get_position()
+
+    highlight = [ax.axvspan(idx_min, idx_max, alpha=0.12, facecolor='#00d4aa', zorder=0)]
+
+    ax.text(0.01, 0.99, f"Velas totales: {len(df):,}",
+            transform=ax.transAxes, ha='left', va='top',
+            fontsize=9, color='#8b949e',
+            bbox=dict(facecolor='#0d1117', alpha=0.7, edgecolor='#30363d', linewidth=0.5))
+
+    ax_slider = fig.add_axes([pos.x0, 0.04, pos.width, 0.030])
+    ax_slider.set_facecolor('#21262d')
+    slider = RangeSlider(ax_slider, '', x_min_num, x_max_num,
+                         valinit=(x_min_num, x_max_num), valfmt='')
+
+    bx0 = pos.x0
+    bw = pos.width
+    ax_reset   = fig.add_axes([bx0, 0.01, 0.07, 0.028])
+    ax_manual  = fig.add_axes([bx0 + 0.08, 0.01, 0.09, 0.028])
+    ax_cancel  = fig.add_axes([bx0 + bw - 0.17, 0.01, 0.08, 0.028])
+    ax_accept  = fig.add_axes([bx0 + bw - 0.08, 0.01, 0.08, 0.028])
+
+    for bax in [ax_reset, ax_manual, ax_cancel, ax_accept]:
+        bax.set_facecolor('#21262d')
+
+    btn_reset  = Button(ax_reset, 'Reset', color='#21262d', hovercolor='#30363d')
+    btn_manual = Button(ax_manual, 'Manual', color='#21262d', hovercolor='#30363d')
+    btn_cancel = Button(ax_cancel, 'Cancelar', color='#21262d', hovercolor='#3d1a1a')
+    btn_accept = Button(ax_accept, 'Aceptar', color='#1D9E75', hovercolor='#15805e')
+
+    for btn in [btn_reset, btn_manual, btn_cancel, btn_accept]:
+        for t in btn.ax.texts:
+            t.set_fontsize(7.5)
+
+    btn_cancel.label.set_color('#f85149')
+    btn_accept.label.set_color('white')
+
+    fmt_dmy = '%d/%m/%Y'
+    mx0 = pos.x0
+    ax_start = fig.add_axes([mx0, 0.085, 0.15, 0.035])
+    ax_end   = fig.add_axes([mx0 + 0.20, 0.085, 0.15, 0.035])
+    ax_apply = fig.add_axes([mx0 + 0.38, 0.085, 0.07, 0.035])
+    for bax in [ax_start, ax_end, ax_apply]:
+        bax.set_facecolor('#21262d')
+        bax.set_visible(False)
+
+    start_box = TextBox(ax_start, 'Inicio:', initial=idx_min.strftime(fmt_dmy),
+                        color='#21262d', hovercolor='#30363d')
+    end_box   = TextBox(ax_end, 'Fin:', initial=idx_max.strftime(fmt_dmy),
+                        color='#21262d', hovercolor='#30363d')
+    btn_apply = Button(ax_apply, 'Ir', color='#1D9E75', hovercolor='#15805e')
+
+    for box in [start_box, end_box]:
+        box.label.set_color('#8b949e')
+        box.label.set_fontsize(7)
+        if hasattr(box, 'text_disp'):
+            box.text_disp.set_color('white')
+        for t in box.ax.texts:
+            t.set_fontsize(8)
+
+    btn_apply.label.set_color('white')
+    for t in btn_apply.ax.texts:
+        t.set_fontsize(8)
+
+    for box in [start_box, end_box]:
+        box.on_submit(lambda _: on_apply(None))
+
+    manual_visible = False
+    accion = 'ninguna'
+
+    def actualizar_todo(vmin_num, vmax_num):
+        nonlocal accion
+        dmin = pd.Timestamp(num2date(vmin_num).replace(tzinfo=None)).tz_localize(tz)
+        dmax = pd.Timestamp(num2date(vmax_num).replace(tzinfo=None)).tz_localize(tz)
+        highlight[0].remove()
+        highlight[0] = ax.axvspan(dmin, dmax, alpha=0.12, facecolor='#00d4aa', zorder=0)
+        ax.set_title(f"Rango: {dmin:%d %b %Y, %H:%M}  →  {dmax:%d %b %Y, %H:%M}",
+                     color='#ff9900', fontsize=11, fontweight='bold')
+        if manual_visible:
+            start_box.set_val(dmin.strftime(fmt_dmy))
+            end_box.set_val(dmax.strftime(fmt_dmy))
+        fig.canvas.draw_idle()
+
+    def sincronizar_slider(dmin, dmax):
+        dmin_num = date2num(dmin)
+        dmax_num = date2num(dmax)
+        slider.set_val((dmin_num, dmax_num))
+        actualizar_todo(dmin_num, dmax_num)
+
+    def on_slider(val):
+        vmin, vmax = slider.val
+        actualizar_todo(vmin, vmax)
+
+    def on_manual_toggle(event):
+        nonlocal manual_visible
+        manual_visible = not manual_visible
+        for bax in [ax_start, ax_end, ax_apply]:
+            bax.set_visible(manual_visible)
+        fig.subplots_adjust(bottom=0.14 if manual_visible else 0.09)
+        fig.canvas.draw_idle()
+
+    def on_apply(event):
+        try:
+            texto_inicio = start_box.text.strip()
+            texto_fin = end_box.text.strip()
+            dmin = pd.to_datetime(texto_inicio, format=fmt_dmy)
+            dmax = pd.to_datetime(texto_fin, format=fmt_dmy)
+            if tz is not None:
+                dmin = dmin.tz_localize(tz) if dmin.tz is None else dmin
+                dmax = dmax.tz_localize(tz) if dmax.tz is None else dmax
+            sincronizar_slider(dmin, dmax)
+        except Exception as e:
+            print(f"      ⚠️ Error al aplicar fecha manual: {e}")
+
+    def on_reset(event):
+        sincronizar_slider(idx_min, idx_max)
+
+    def on_accept(event):
+        nonlocal accion
+        accion = 'aceptar'
+        plt.close(fig)
+
+    def on_cancel(event):
+        nonlocal accion
+        accion = 'cancelar'
+        plt.close(fig)
+
+    def on_key(event):
+        if event.key == 'escape':
+            nonlocal accion
+            accion = 'cancelar'
+            plt.close(fig)
+
+    def on_close(event):
+        nonlocal accion
+        if accion == 'ninguna':
+            accion = 'cancelar'
+
+    slider.on_changed(on_slider)
+    btn_reset.on_clicked(on_reset)
+    btn_manual.on_clicked(on_manual_toggle)
+    btn_accept.on_clicked(on_accept)
+    btn_cancel.on_clicked(on_cancel)
+    btn_apply.on_clicked(on_apply)
+    fig.canvas.mpl_connect('key_press_event', on_key)
+    fig.canvas.mpl_connect('close_event', on_close)
+
+    plt.show()
+
+    if accion == 'cancelar':
+        print("      ❌ Selección cancelada por el usuario.")
+        sys.exit(0)
+
+    vmin, vmax = slider.val
+    dmin = pd.Timestamp(num2date(vmin).replace(tzinfo=None)).tz_localize(df.index.tz)
+    dmax = pd.Timestamp(num2date(vmax).replace(tzinfo=None)).tz_localize(df.index.tz)
+
+    tolerancia = pd.Timedelta(seconds=1)
+    if abs(dmin - idx_min) > tolerancia or abs(dmax - idx_max) > tolerancia:
+        print(f"      Rango seleccionado: {dmin} → {dmax}")
+        return dmin, dmax
+
+    print("        Sin selección — usando dataset completo.")
+    return None, None
 # endregion
-# region ── 2. VALIDACIÓN ─────────────────────────────────────────────────────────────
-print(f"\n{'='*60}")
-print(f"ANÁLISIS DESCRIPTIVO — {CONFIG['nombre']} ({CONFIG['tf']})")
-print(f"{'='*60}")
-print("[1/5] Validando configuración...")
-OUTPUT_PDF = CONFIG['input_path'].replace('.csv', f"_informe_{CONFIG['activo']}_{CONFIG['tf']}.pdf")
-# endregion
-# region ── 3. CARGA ──────────────────────────────────────────────────────────────────
-print("[2/5] Cargando archivo CSV...")
-df = pd.read_csv(CONFIG['input_path'], parse_dates=['timestamp']).set_index('timestamp')
 
-# --- PARCHE DE SEGURIDAD PARA LAS FECHAS ---
-# Nos aseguramos de que el índice sea Datetime y no un objeto o texto
-df.index = pd.to_datetime(df.index, errors='coerce')
-df = df[df.index.notna()] 
-es_datetime_valido = isinstance(df.index, pd.DatetimeIndex)
+# ── Leer config desde archivo (si no fue pre-establecido por core/analizador.py) ──
+if '_CONFIG_READY' not in dir():
+    if os.path.exists(CONFIG_PATH):
+        with open(CONFIG_PATH) as f:
+            sesion = json.load(f)
 
+        # Preferir input_path explícito desde sesion_config.json (lo escribe la GUI)
+        if 'input_path' in sesion and sesion['input_path']:
+            input_clean = sesion['input_path']
+        else:
+            input_clean = os.path.join(
+                LIMPIADOS_DIR, sesion['nombre'],
+                f"{sesion['nombre']}_{sesion['tf']}_limpiado.csv"
+            )
 
-# ── DETECCIÓN Y COMPROBACIÓN TEMPORAL UNIFICADA ─────────────────────────────────────────────
-# [AÑADIDO] Sustituye la dependencia rígida de FACTORES (manual) por una
-# detección dinámica de la temporalidad real a partir de los timestamps del
-# propio archivo. Si el archivo no tiene timestamps fiables (p. ej. viene en
-# TICKS, volumen o rango en vez de tiempo fijo), las métricas que dependan del
-# tiempo se omiten mostrando un aviso explícito en vez de hacer fallar el script.
-velas_por_dia  = None
-velas_por_anio = None
-tipo_muestreo  = 'sin_tiempo'
+        CONFIG = {
+            'activo':     sesion.get('activo', 'FUTURO'),
+            'nombre':     sesion.get('nombre', 'xauusd'),
+            'tf':         sesion.get('tf', '1h'),
+            'input_path': input_clean,
+            'rf_rate':    sesion.get('rf_rate', 0.0),
+            'interactive': True,
+        }
 
-es_datetime_valido = isinstance(df.index, pd.DatetimeIndex) and df.index.is_monotonic_increasing
+        # Sobreescribir con .meta.json si existe junto al archivo de entrada
+        meta_path = input_clean + '.meta.json'
+        if os.path.exists(meta_path):
+            try:
+                with open(meta_path) as f:
+                    meta = json.load(f)
+                if 'nombre' in meta:
+                    CONFIG['nombre'] = meta['nombre']
+                if 'tf' in meta:
+                    CONFIG['tf'] = meta['tf']
+                if 'activo' in meta:
+                    CONFIG['activo'] = meta['activo']
+                if 'rf_rate' in meta:
+                    CONFIG['rf_rate'] = meta['rf_rate']
+                print(f"↳ Config desde .meta.json: {meta.get('nombre')} {meta.get('tf')}")
+            except Exception:
+                pass
 
-if es_datetime_valido and len(df) > 2:
-    diffs_seg = df.index.to_series().diff().dropna().dt.total_seconds()
-    diffs_seg = diffs_seg[diffs_seg > 0]  # descarta timestamps duplicados
+        print(f"↳ Config desde sesión: {CONFIG['nombre']} {CONFIG['tf']} → {input_clean}")
+    else:
+        print("↳ Usando config manual (sin sesion_config.json)")
 
-    if len(diffs_seg) > 0:
-        mediana_seg = diffs_seg.median()
-        cv = diffs_seg.std() / mediana_seg if mediana_seg > 0 else np.inf
-        # CV bajo  -> duración entre velas casi constante -> barras de tiempo fijo
-        # CV alto  -> duración muy irregular -> barras de evento (TICKS/volumen/rango)
-        tipo_muestreo = 'tiempo_fijo' if cv < 0.15 else 'evento'
+if __name__ == "__main__":
+    # region ── 2. VALIDACIÓN ─────────────────────────────────────────────────────────────
+    print(f"\n{'='*60}")
+    print(f"ANÁLISIS DESCRIPTIVO — {CONFIG['nombre']} ({CONFIG['tf']})")
+    print(f"{'='*60}")
+    print("[1/5] Validando configuración...")
+    # endregion
+    # region ── 3. CARGA ──────────────────────────────────────────────────────────────────
+    print("[2/5] Cargando archivo CSV...")
+    df = pd.read_csv(CONFIG['input_path'], parse_dates=['timestamp']).set_index('timestamp')
+    
+    # --- PARCHE DE SEGURIDAD PARA LAS FECHAS ---
+    # Nos aseguramos de que el índice sea Datetime y no un objeto o texto
+    df.index = pd.to_datetime(df.index, errors='coerce')
+    df = df[df.index.notna()] 
+    es_datetime_valido = isinstance(df.index, pd.DatetimeIndex)
+    
+    # Selector interactivo de rango
+    start_sel, end_sel = seleccionar_rango_interactivo(df)
+    if start_sel is not None:
+        print(f"      Filtrando al rango seleccionado...")
+        df = df.loc[start_sel:end_sel].copy()
+        es_datetime_valido = isinstance(df.index, pd.DatetimeIndex) and df.index.is_monotonic_increasing
+    
+    # ── NOMBRE DEL PDF SEGÚN EL RANGO REAL DE DATOS ──
+    nombre_activo = CONFIG['nombre'].replace('/', '_')
+    inicio = df.index.min().strftime('%Y-%m-%d')
+    fin = df.index.max().strftime('%Y-%m-%d')
 
-        rango_total_seg  = (df.index[-1] - df.index[0]).total_seconds()
-        rango_total_dias = rango_total_seg / 86400
+    # En modo GUI usar directorio temporal, en standalone usar ruta fija
+    if 'GUI_METRICS_OUTPUT' in os.environ:
+        OUTPUT_DIR = os.path.dirname(os.environ['GUI_METRICS_OUTPUT'])
+    else:
+        OUTPUT_DIR = INFORMES_DIR
 
-        if rango_total_dias > 0:
-            velas_por_dia  = len(df) / rango_total_dias
-            velas_por_anio = velas_por_dia * 365
-
-# endregion
-# region ── 4. INTEGRIDAD y DETECCIÓN DE DATOS y COLUMNAS ─────────────────────────────────────────────────────────────
-print("[3/5] Verificando integridad de datos...")
-if 'interpolado' not in df.columns: df['interpolado'] = 0
-if 'anomalia'    not in df.columns: df['anomalia']    = 0
-if 'ER'          not in df.columns: df['ER']          = 0.0
-
-# endregion
-# region ── 5. CÁLCULO DE RETORNOS ────────────────────────────────────────────────────
-print("[4/5] Calculando métricas estadísticas...")
-if 'retorno_log' in df.columns:
-    df['retorno'] = df['retorno_log']
-else:
+    OUTPUT_PDF = os.path.join(
+        OUTPUT_DIR, nombre_activo,
+        f"informe_{nombre_activo}_{CONFIG['tf']}_{inicio}_to_{fin}.pdf"
+    )
+    os.makedirs(os.path.dirname(OUTPUT_PDF), exist_ok=True)
+    
+    # ── DETECCIÓN Y COMPROBACIÓN TEMPORAL UNIFICADA ─────────────────────────────────────────────
+    # [AÑADIDO] Sustituye la dependencia rígida de FACTORES (manual) por una
+    # detección dinámica de la temporalidad real a partir de los timestamps del
+    # propio archivo. Si el archivo no tiene timestamps fiables (p. ej. viene en
+    # TICKS, volumen o rango en vez de tiempo fijo), las métricas que dependan del
+    # tiempo se omiten mostrando un aviso explícito en vez de hacer fallar el script.
+    velas_por_dia  = None
+    velas_por_anio = None
+    tipo_muestreo  = 'sin_tiempo'
+    
+    es_datetime_valido = isinstance(df.index, pd.DatetimeIndex) and df.index.is_monotonic_increasing
+    
+    if es_datetime_valido and len(df) > 2:
+        diffs_seg = df.index.to_series().diff().dropna().dt.total_seconds()
+        diffs_seg = diffs_seg[diffs_seg > 0]  # descarta timestamps duplicados
+    
+        if len(diffs_seg) > 0:
+            mediana_seg = diffs_seg.median()
+            cv = diffs_seg.std() / mediana_seg if mediana_seg > 0 else np.inf
+            # Si el TF está definido, calcular el gap esperado en segundos
+            _tf = CONFIG.get('tf', '')
+            _m = re.match(r'(\d+)([a-z]+)', _tf.lower().strip())
+            _mapa_unidad = {'s': 1, 'sec': 1, 'm': 60, 'min': 60, 'h': 3600, 'd': 86400, 'w': 604800}
+            esperado_seg = None
+            if _m:
+                num, unidad = int(_m.group(1)), _m.group(2)
+                if unidad in _mapa_unidad:
+                    esperado_seg = num * _mapa_unidad[unidad]
+            # Si la mediana coincide con el gap esperado (±20%), es tiempo fijo
+            coincide_frecuencia = (esperado_seg is not None and
+                                   0.8 * esperado_seg <= mediana_seg <= 1.2 * esperado_seg)
+            tipo_muestreo = 'tiempo_fijo' if (cv < 0.15 or coincide_frecuencia) else 'evento'
+    
+            rango_total_seg  = (df.index[-1] - df.index[0]).total_seconds()
+            rango_total_dias = rango_total_seg / 86400
+    
+            if rango_total_dias > 0:
+                velas_por_dia  = len(df) / rango_total_dias
+                velas_por_anio = velas_por_dia * 365
+    
+    # endregion
+    # region ── 4. INTEGRIDAD y DETECCIÓN DE DATOS y COLUMNAS ─────────────────────────────────────────────────────────────
+    print("[3/5] Verificando integridad de datos...")
+    if 'interpolado' not in df.columns: df['interpolado'] = 0
+    if 'anomalia'    not in df.columns: df['anomalia']    = 0
+    if 'ER'          not in df.columns: df['ER']          = 0.0
+    
+    # endregion
+    # region ── 5. CÁLCULO DE RETORNOS ────────────────────────────────────────────────────
+    print("[4/5] Calculando métricas estadísticas...")
     df['retorno'] = np.log(df['close'] / df['close'].shift(1))
-
-df = df.dropna(subset=['retorno'])
-r  = df['retorno']
-
-if es_datetime_valido:
-    mes_stats = df.groupby(df.index.month)['retorno'].sum() * 100
-    dia_stats = df.groupby(df.index.dayofweek)['retorno'].sum() * 100
-else:
-    mes_stats = pd.Series(dtype=float)
-    dia_stats = pd.Series(dtype=float)
-
-# endregion
-# region ── 6. AUDITORÍA DE CALIDAD Y CONTROL DE INTERPOLACIÓN ──────────────────────────
-# ==============================================================================
-# [CONFIGURACIÓN] Cambia el nombre si tu columna se llama diferente (ej. 'is_interpolated')
-col_flag = 'interpolado' 
-
-if col_flag in df.columns:
-    total_filas = len(df)
-    total_interpoladas = int(df[col_flag].sum())
-    total_originales = total_filas - total_interpoladas
+    df['retorno'] = df['retorno'].fillna(0)
+    r  = df['retorno']
     
-    # Calculamos la distancia real por calendario basada en tus fechas exactas
-    fecha_inicio = pd.to_datetime('2017-12-31 23:00:00+00:00')
-    fecha_fin = pd.to_datetime('2026-06-07 18:00:00+00:00')
-    horas_teoricas = int((fecha_fin - fecha_inicio).total_seconds() / 3600) + 1
-    
-    # Cálculos de control
-    filas_fantasma = horas_teoricas - total_filas
-    nulos_restantes = df['retorno_log'].isna().sum()
-
-    print(f"\n📊 [AUDITORÍA] DIAGNÓSTICO DE CONTROL DE CALIDAD:")
-    print(f"======================================================================")
-    print(f" • Horas teóricas por calendario:        {horas_teoricas} velas.")
-    print(f" • Filas físicas en tu archivo actual:   {total_filas} velas.")
-    print(f"   └── ⚠️ Huecos temporales ('Fantasma'): {filas_fantasma} horas que NO existen en el CSV.")
-    print(f"----------------------------------------------------------------------")
-    print(f" • Desglose de los datos de tu archivo:")
-    print(f"   ├── 🟢 Datos reales (Exchange):       {total_originales} ({total_originales/total_filas:.2%})")
-    print(f"   └── 🔵 Datos rellenados (Script):   {total_interpoladas} ({total_interpoladas/total_filas:.2%})")
-    print(f"----------------------------------------------------------------------")
-    print(f" • Celdas vacías (NaN) sin solucionar en 'retorno_log': {nulos_restantes}")
-    print(f"======================================================================\n")
-else:
-    print(f"⚠️ No se encontró la columna '{col_flag}'. Verifica el nombre exacto en tu CSV.")
-
-# endregion
-# region ── 7. CONFIGURACIÓN DE BLOQUES MULTI-TIMEFRAME ──────────────────────────────
-
-activo_cfg = CONFIG['activo']
-tf_cfg = CONFIG['tf']
-
-if activo_cfg in FACTORES and tf_cfg in FACTORES[activo_cfg]:
-    bloques = FACTORES[activo_cfg][tf_cfg]
-else:
-    bloques = {'dia': 1, 'semanal': 7, 'mensual': 30, 'trimestral': 90, 'anual': 365}
-
-def normalizar_serie(serie, bloques_agrupacion):
-    s = serie.groupby(np.arange(len(serie)) // int(bloques_agrupacion)).sum()
-    return s[np.isfinite(s)]
-
-def calc_max_dd_interno(grupo):
-    cum = np.exp(np.cumsum(grupo.values))
-    cum_max = np.maximum.accumulate(cum)
-    dd = np.divide(cum - cum_max, cum_max, out=np.zeros_like(cum), where=cum_max!=0)
-    return dd.min()
-
-series_temporales = {}
-stats_temporales = {}
-
-for periodo, n_bloques in bloques.items():
-    series_temporales[periodo] = normalizar_serie(df['retorno'], n_bloques)
-    s_actual = series_temporales[periodo]
-    
-    # Max DD Macro
-    cum_ret_p = np.exp(s_actual.cumsum())
-    mdd_p = ((cum_ret_p - cum_ret_p.cummax()) / cum_ret_p.cummax()).min()
-    
-    # Max DD Intra-periodo
-    bloques_id = np.arange(len(df)) // int(n_bloques)
-    dds_por_bloque = df['retorno'].groupby(bloques_id).apply(calc_max_dd_interno)
-    
-    peor_dd_intrabloque = dds_por_bloque.min()
-    idx_peor_bloque = dds_por_bloque.idxmin()
-    
-    if es_datetime_valido and len(df) > 0:
-        fechas_bloque = df.index[bloques_id == idx_peor_bloque]
-        fecha_peor = fechas_bloque[0].strftime('%Y-%m-%d')
-    else:
-        fecha_peor = "N/A"
-    
-    if len(s_actual) > 2:
-        stat_jb_p, p_jb_p = stats.jarque_bera(s_actual)
-    else:
-        stat_jb_p, p_jb_p = 0.0, 1.0
-    
-    # 1. Crear el diccionario base
-    stats_temporales[periodo] = {
-        'media': s_actual.mean(),
-        'std':   s_actual.std(),
-        'max_dd': mdd_p,
-        'max_dd_interno': peor_dd_intrabloque,
-        'fecha_peor': fecha_peor,
-        'p_value_normalidad': p_jb_p
-    }
-    
-    # 2. Análisis de Dependencia Estadística (ACF/PACF)
-    n_lags = min(40, len(s_actual) // 4) 
-    if len(s_actual) > n_lags + 5:
-        acf_vals = acf(s_actual, nlags=n_lags)
-        pacf_vals = pacf(s_actual, nlags=n_lags)
-        umbral_dependencia = 1.96 / np.sqrt(len(s_actual))
-    else:
-        acf_vals, pacf_vals, umbral_dependencia = [], [], 0.0
-
-    # 3. Actualizar el diccionario existente
-    stats_temporales[periodo].update({
-        'acf_vals': acf_vals,
-        'pacf_vals': pacf_vals,
-        'umbral': umbral_dependencia
-    })
-    
-    #Determinaciones para análisis de dependencia
-def estado_adn(val, umbral):
-    """Determina el estado táctico según la dependencia estadística."""
-    if val > umbral: 
-        return "INERCIA"
-    elif val < -umbral: 
-        return "REVERSIÓN"
-    else: 
-        return "RUIDO"
-    
-
-# Variables globales para acceso rápido
-r_diario_real = series_temporales['dia']
-ret_diario, vol_diaria = stats_temporales['dia']['media'], stats_temporales['dia']['std']
-ret_semanal, vol_semanal = stats_temporales['semanal']['media'], stats_temporales['semanal']['std']
-ret_mensual, vol_mensual = stats_temporales['mensual']['media'], stats_temporales['mensual']['std']
-ret_trimestral, vol_trimestral = stats_temporales['trimestral']['media'], stats_temporales['trimestral']['std']
-ret_anual, vol_anual = stats_temporales['anual']['media'], stats_temporales['anual']['std']
-
-# Función de validación temporal
-def validar_output_terminal(stats_temporales):
-    print("\n" + "="*50)
-    print("VALIDACIÓN: ANÁLISIS DE ARQUITECTURA TEMPORAL")
-    print("="*50)
-    print(f"{'Escala':<12} | {'Lag 1':<10} | {'Tipo':<15} | {'Umbral'}")
-    print("-" * 50)
-    orden = ['dia', 'semanal', 'mensual', 'trimestral', 'anual']
-    for periodo in orden:
-        if periodo in stats_temporales:
-            data = stats_temporales[periodo]
-            val = data['pacf_vals'][1] 
-            umbral = data['umbral']
-            if val > umbral: estado = "INERCIA"
-            elif val < -umbral: estado = "REVERSIÓN"
-            else: estado = "RUIDO"
-            print(f"{periodo.capitalize():<12} | {val:>8.4f} | {estado:<15} | {umbral:.4f}")
-    print("="*50 + "\n")
-
-validar_output_terminal(stats_temporales)
-# endregion
-# region ── 8. MÉTRICAS ──────────────────────────────────────────────────────────────
-
-# ==========================================================================
-# region PASO 1: Cálculos de Volatilidad y Retornos Anualizados/Diarios Compuestos
-# Calcula la dispersión del precio y el rendimiento compuesto esperado en base al régimen operativo anual del activo.
-if velas_por_anio is not None:
-    vol_anual  = r.std() * np.sqrt(velas_por_anio)
-    vol_diaria = r.std() * np.sqrt(velas_por_dia)
-    
-    media_log_diaria_real = r_diario_real.mean()
-    ret_diario = np.exp(media_log_diaria_real) - 1
-    
-    dias_ano_regimen = 365 if CONFIG['activo'] == 'CRYPTO' else 252
-    ret_anual  = np.exp(media_log_diaria_real * dias_ano_regimen) - 1
-    
-    sharpe     = ret_anual / vol_anual if (vol_anual is not None and vol_anual != 0) else 0
-    calmar_disponible = True
-else:
-    # AQUÍ ESTÁ EL CAMBIO: Asignamos 0.0 en lugar de None
-    vol_anual = vol_diaria = ret_anual = ret_diario = sharpe = 0.0
-    calmar_disponible = False
-    
-# endregion
-# ==========================================================================
-# region PASO 2: Cálculo del Máximo Drawdown (Max DD) Histórico
-# Mide la peor pérdida acumulada de pico a valle sufrida por el precio a lo largo del histórico.
-cum_returns = np.exp(r.cumsum())
-peak        = cum_returns.cummax()
-mdd         = ((cum_returns - peak) / peak).min()
-# endregion
-# ==========================================================================
-# region PASO 3: Cálculo de Tiempos de Recuperación en Drawdown
-# Mide la cantidad de velas y el tiempo exacto transcurrido entre el pico máximo y su break-even o recuperación completa.
-drawdown_series = (cum_returns - peak) / peak
-en_drawdown      = drawdown_series < 0
-
-bloques          = (en_drawdown != en_drawdown.shift()).cumsum()
-duraciones_velas = en_drawdown.groupby(bloques).sum()
-duraciones_velas = duraciones_velas[duraciones_velas > 0]
-
-if len(duraciones_velas) > 0:
-    bloque_max_id      = duraciones_velas.idxmax()
-    recovery_velas_max = int(duraciones_velas.max())
-
     if es_datetime_valido:
-        indices_bloque = en_drawdown[bloques == bloque_max_id].index
-
-        # Fecha del PICO (breakeven inicial): la última vela en máximo, justo antes de empezar a caer.
-        pos_primera_en_dd = df.index.get_loc(indices_bloque[0])
-        ts_pico = df.index[pos_primera_en_dd - 1] if pos_primera_en_dd > 0 else indices_bloque[0]
-
-        # Fecha de RECUPERACIÓN COMPLETA: la primera vela donde el precio vuelve a superar (o igualar) el pico anterior.
-        pos_ultima_en_dd = df.index.get_loc(indices_bloque[-1])
-        if pos_ultima_en_dd + 1 < len(df.index):
-            ts_recuperado = df.index[pos_ultima_en_dd + 1]
-        else:
-            ts_recuperado = indices_bloque[-1]  # aún no recuperado al final de los datos
-
-        recovery_timedelta = ts_recuperado - ts_pico
-        dias_rec    = recovery_timedelta.days
-        horas_rec   = recovery_timedelta.seconds // 3600
-        minutos_rec = (recovery_timedelta.seconds % 3600) // 60
-
-        # Si la recuperación alcanza o supera 1 año (365 días), se descompone en años + el resto en d/h/m.
-        if dias_rec >= 365:
-            anios_rec    = dias_rec // 365
-            dias_resto   = dias_rec % 365
-            etiqueta_anio = "año" if anios_rec == 1 else "años"
-            duracion_str = f"{anios_rec} {etiqueta_anio} {dias_resto}d {horas_rec}h {minutos_rec}m"
-        else:
-            duracion_str = f"{dias_rec}d {horas_rec}h {minutos_rec}m"
-
-        # Formato de fecha: con hora solo si el timeframe es intradía
-        fmt_fecha = '%Y-%m-%d %H:%M' if recovery_timedelta < pd.Timedelta(days=3) else '%Y-%m-%d'
-        rango_fechas_str = f"{ts_pico.strftime(fmt_fecha)} → {ts_recuperado.strftime(fmt_fecha)}"
-
-        recovery_str = f"{duracion_str}   ({rango_fechas_str})"
+        mes_stats = df.groupby(df.index.month)['retorno'].sum() * 100
+        mask_lab = df.index.dayofweek < 5
+        dia_stats = df[mask_lab].groupby(df[mask_lab].index.dayofweek)['retorno'].sum() * 100
     else:
-        recovery_str = "N/A (TICKS — sin temporalidad)"
-else:
-    recovery_velas_max = 0
-    recovery_str = "0d 0h 0m" if es_datetime_valido else "N/A (TICKS — sin temporalidad)"
-
-# endregion
-# ==========================================================================
-# region PASO 4: Cálculo de la Profundidad del Drawdown Medio
-# Obtiene el promedio del punto más bajo registrado de manera aislada en cada episodio consecutivo de caída.
-if en_drawdown.any():
-    profundidad_por_episodio = drawdown_series[en_drawdown].groupby(bloques[en_drawdown]).min()
-    drawdown_medio = profundidad_por_episodio.mean()
-    num_episodios_dd = len(profundidad_por_episodio)
-else:
-    drawdown_medio = None
-    num_episodios_dd = 0
-
-# endregion
-# ==========================================================================
-# region PASO 5: Cálculo del Calmar Ratio
-# Relaciona el retorno compuesto anualizado frente al máximo drawdown histórico para medir la recompensa por unidad de riesgo.
-if calmar_disponible and mdd != 0:
-    calmar_ratio = ret_anual / abs(mdd)
-else:
-    calmar_ratio = None
-
-# endregion
-# ==========================================================================
-# region PASO 6: VaR paramétrico e histórico
-# Establece las funciones de formateo numérico de strings y las variables de temporalidad del activo.
-tf_actual = CONFIG['tf']
-var_95_hist = np.percentile(r, 5)
-var_99_hist = np.percentile(r, 1)
-z_95 = stats.norm.ppf(0.05)
-z_99 = stats.norm.ppf(0.01)
-var_95_param = r.mean() + z_95 * r.std()
-var_99_param = r.mean() + z_99 * r.std()
-
-def fmt_pct(valor, decimales=2):
-    return f"{valor*100:.{decimales}f}%" if valor is not None else "N/A (TICKS)"
-
-def fmt_num(valor, decimales=4):
-    return f"{valor:.{decimales}f}" if valor is not None else "N/A (TICKS)"
-
-tf_actual = CONFIG['tf']
-
-# endregion
-# ==========================================================================
-# region PASO 7: Test de Normalidad de Jarque-Bera y Lógica Adaptativa de Módulo VaR
-# Evalúa la asimetría y curtosis de la serie para decidir dinámicamente si aplicar un cálculo de VaR Histórico o Paramétrico.
-r_clean = r[np.isfinite(r)].dropna()
-
-if len(r_clean) > 0:
-    stat_jb, p_jb = stats.jarque_bera(r_clean)
-else:
-    stat_jb, p_jb = 0.0, 1.0 # Valores seguros si la serie está vacía
-
-if p_jb < 0.05:
-    var_95 = np.percentile(r_clean, 5)
-    var_99 = np.percentile(r_clean, 1)
-    lbl_var_95, lbl_var_99 = f'VaR 95% Histórico ({tf_actual})', f'VaR 99% Histórico ({tf_actual})'
-else:
-    z_95, z_99 = stats.norm.ppf(0.05), stats.norm.ppf(0.01)
-    var_95 = r_clean.mean() + z_95 * r_clean.std()
-    var_99 = r_clean.mean() + z_99 * r_clean.std()
-    lbl_var_95, lbl_var_99 = f'VaR 95% Paramétrico ({tf_actual})', f'VaR 99% Paramétrico ({tf_actual})'
-
-val_var_95, val_var_99 = f"{-var_95*100:.4f}%", f"{-var_99*100:.4f}%"
-
-# endregion
-# ==========================================================================
-# region PASO 8: Cálculo de Persistencia de Rangos vía Ratio de Eficiencia (ER)
-# Cuantifica el ruido direccional de las series analizando cuántas velas rompen los umbrales de tendencia o ruido locales.
-er_medio         = df['ER'].mean()
-er_std           = df['ER'].std()
-
-umbral_tendencia = min(0.95, er_medio + er_std)
-umbral_ruido     = max(0.05, er_medio - er_std)
-
-total_tendencia  = (df['ER'] > umbral_tendencia).sum()
-total_ruido      = (df['ER'] < umbral_ruido).sum()
-
-# Agrupa y contabiliza las ocurrencias del coeficiente Hurst en zonas de tendencia, paseo aleatorio o reversión a la media.
-
-total_tendencia_h = ((df['hurst'] > 0.58)).sum()
-total_aleatorio_h  = ((df['hurst'] >= 0.52) & (df['hurst'] <= 0.58)).sum()
-total_reversion_h  = ((df['hurst'] < 0.52)).sum()
-
-# endregion
-# ==========================================================================
-# region PASO 9: Cálculo del Average True Range (ATR) histórico
-# Mide la volatilidad en puntos (USD) y en porcentaje relativo al precio.
-df['tr'] = np.maximum(
-    df['high'] - df['low'],
-    np.maximum(
-        abs(df['high'] - df['close'].shift(1)),
-        abs(df['low'] - df['close'].shift(1))
-    )
-)
-df['atr14'] = df['tr'].rolling(14).mean()
-df['atr14_pct'] = df['atr14'] / df['close'] * 100
-
-atr14_actual  = float(df['atr14'].iloc[-1])
-atr14_media   = float(df['atr14'].mean())
-atr14_max     = float(df['atr14'].max())
-atr14_min     = float(df['atr14'].min())
-atr14_p25     = float(df['atr14'].quantile(0.25))
-atr14_p75     = float(df['atr14'].quantile(0.75))
-atr14_pct_actual = float(df['atr14_pct'].iloc[-1])
-atr14_pct_media  = float(df['atr14_pct'].mean())
-atr14_pct_max    = float(df['atr14_pct'].max())
-atr14_percentil  = stats.percentileofscore(df['atr14'].dropna(), atr14_actual)
-# endregion
-# ==========================================================================
-# region PASO 10: Cálculos Multitemporales de Volatilidad Histórica Rodante (Rolling Vol)
-# Extrae ventanas rodantes estandarizadas (7d, 30d, 90d, 365d) parametrizando las velas operativas según el tipo de producto.
-tipo_activo = CONFIG['activo']  
-tf_actual = CONFIG['tf']
-
-velas_dia = FACTORES[tipo_activo][tf_actual]['dia']
-velas_anual = FACTORES[tipo_activo][tf_actual]['anual']
-
-dias_ano = 365 if tipo_activo == 'CRYPTO' else 252
-dias_trimestre = 90 if tipo_activo == 'CRYPTO' else 63
-
-vol_historica_total = r.std() * np.sqrt(velas_anual)
-
-hv_7d  = r.rolling(window=int(7 * velas_dia)).std() * np.sqrt(velas_anual)
-hv_30d = r.rolling(window=int(30 * velas_dia)).std() * np.sqrt(velas_anual)
-hv_90d = r.rolling(window=int(dias_trimestre * velas_dia)).std() * np.sqrt(velas_anual)
-hv_365d = r.rolling(window=int(dias_ano * velas_dia)).std() * np.sqrt(velas_anual)
-
-val_hv_7d   = hv_7d.iloc[-1] if len(hv_7d) >= (7 * velas_dia) else None
-val_hv_30d  = hv_30d.iloc[-1] if len(hv_30d) >= (30 * velas_dia) else None
-val_hv_90d  = hv_90d.iloc[-1] if len(hv_90d) >= (dias_trimestre * velas_dia) else None
-val_hv_365d = hv_365d.iloc[-1] if len(hv_365d) >= (dias_ano * velas_dia) else None
-
-# --- Comparativa de Regímenes Geométricos de Tendencia Estructural ---
-ventana_sma = int(200 * velas_dia)
-
-if len(df) > ventana_sma:
-    df['SMA_Regimen'] = df['close'].rolling(window=ventana_sma).mean()
-    es_bull = df['close'] > df['SMA_Regimen']
-    es_bear = df['close'] <= df['SMA_Regimen']
+        mes_stats = pd.Series(dtype=float)
+        dia_stats = pd.Series(dtype=float)
     
-    ret_bull = r[es_bull].mean() * velas_anual
-    vol_bull = r[es_bull].std() * np.sqrt(velas_anual)
+    # endregion
+    # region ── 6. AUDITORÍA DE CALIDAD Y CONTROL DE INTERPOLACIÓN ──────────────────────────
+    # ==============================================================================
+    # [CONFIGURACIÓN] Cambia el nombre si tu columna se llama diferente (ej. 'is_interpolated')
+    col_flag = 'interpolado' 
     
-    ret_bear = r[es_bear].mean() * velas_anual
-    vol_bear = r[es_bear].std() * np.sqrt(velas_anual)
+    if col_flag in df.columns:
+        total_filas = len(df)
+        total_interpoladas = int(df[col_flag].sum())
+        total_originales = total_filas - total_interpoladas
+        
+        # Calculamos la distancia real por calendario basada en tus fechas exactas
+        fecha_inicio = df.index.min()
+        fecha_fin = df.index.max()
+        segundos_reales = (fecha_fin - fecha_inicio).total_seconds()
+        if segundos_reales > 0:
+            try:
+                vpd_teorico = get_factores(CONFIG['activo'], CONFIG['tf'])['dia']
+            except Exception:
+                vpd_teorico = None
+            if vpd_teorico is not None and vpd_teorico > 0:
+                velas_teoricas = int((segundos_reales / 86400) * vpd_teorico) + 1
+            else:
+                velas_teoricas = int(segundos_reales / 3600) + 1
+        else:
+            velas_teoricas = total_filas
+        
+        # Cálculos de control
+        filas_fantasma = max(0, velas_teoricas - total_filas)
+        pct_completitud = total_filas / velas_teoricas * 100 if velas_teoricas > 0 else 0
     
-    str_bull = f"Ret: {ret_bull*100:.2f}% | Vol: {vol_bull*100:.2f}%"
-    str_bear = f"Ret: {ret_bear*100:.2f}% | Vol: {vol_bear*100:.2f}%"
-else:
-    str_bull = "N/A"
-    str_bear = "N/A"
-
-# ==========================================================================
-# region PASO 10b: Desviación del Escalado Fractal
-# Mide cuánto se desvía la volatilidad real observada del escalado teórico
-# por raíz cuadrada del tiempo (propio de un random walk puro).
-# Una desviación alta indica memoria en la serie (persistencia o anti-persistencia).
-
-if velas_por_anio is not None and velas_por_dia is not None and velas_por_dia > 0:
-    vol_tf         = r.std()
-    vol_diaria_teo = vol_tf * np.sqrt(velas_por_dia)
-    vol_diaria_obs = r_diario_real.std()
-    desviacion_escalado = (
-        abs(vol_diaria_obs - vol_diaria_teo) / vol_diaria_teo
-        if vol_diaria_teo > 0 else 0.0
-    )
-else:
-    desviacion_escalado = 0.0
-
-# endregion
-# endregion
-# ==========================================================================
-# region PASO 11: Análisis Estadístico de Correlaciones Temporales y Estacionalidad Multi-Bloque
-# =======================================================================================================
-ventana_vol = 0
-ventana_corr = 0
-corr_media_historica = 0.0
-corr_max = 0.0
-corr_min = 0.0
-tiempo_negativa = 0.0
-tiempo_positiva = 0.0
-
-# Inicializar todas las variables de salida como vacías o N/A
-hora_mas_volatil = "N/A"
-vol_maxima_hora = 0.0
-vol_por_hora = pd.Series(dtype=float)
-
-dia_mas_volatil = "N/A"
-vol_maxima_dia = 0.0
-vol_por_dia_semana = pd.Series(dtype=float)
-
-mes_mas_volatil = "N/A"
-vol_maxima_mes = 0.0
-vol_por_mes = pd.Series(dtype=float)
-
-DIAS_MAP = {0: 'Lunes', 1: 'Martes', 2: 'Miércoles', 3: 'Jueves', 4: 'Viernes', 5: 'Sábado', 6: 'Domingo'}
-MESES_MAP = {1: 'Enero', 2: 'Febrero', 3: 'Marzo', 4: 'Abril', 5: 'Mayo', 6: 'Junio', 
-             7: 'Julio', 8: 'Agosto', 9: 'Septiembre', 10: 'Octubre', 11: 'Noviembre', 12: 'Diciembre'}
-
-try:
+        print(f"\n📊 [AUDITORÍA] DIAGNÓSTICO DE CONTROL DE CALIDAD:")
+        print(f"======================================================================")
+        print(f" • Velas teóricas por calendario:  {velas_teoricas:>12,} velas.")
+        print(f" • Filas físicas en tu archivo:    {total_filas:>12,} velas.")
+        print(f"   └── {'⚠️' if filas_fantasma > 0 else '✅'} Huecos temporales:          {filas_fantasma:>12,} velas ({pct_completitud:.2f}% completitud)")
+        print(f" 📊 DESGLOSE DE LOS DATOS DEL ARCHIVO:")
+        print(f" ======================================================================")
+        print(f"    Total filas en el archivo:                    {total_filas:>10,}")
+        print(f"    ├── 🟢 Datos reales (Exchange):               {total_originales:>10,}  ({total_originales/total_filas:.2%})")
+        print(f"    └── 🔵 Datos rellenados (Script):             {total_interpoladas:>10,}  ({total_interpoladas/total_filas:.2%})")
+        if 'anomalia' in df.columns:
+            total_anomalias = int(df['anomalia'].sum())
+            total_huecos_puros = total_interpoladas - total_anomalias
+            print(f"        ├── 🟡 Bad Ticks (anomalías):            {total_anomalias:>10,}  ({total_anomalias/total_filas:.2%})")
+            print(f"        └── ⚪ Huecos temporales:                 {total_huecos_puros:>10,}  ({total_huecos_puros/total_filas:.2%})")
+        print(f" ======================================================================\n")
+    else:
+        print(f"⚠️ No se encontró la columna '{col_flag}'. Verifica el nombre exacto en tu CSV.")
+    
+    # endregion
+    # region ── 7. CONFIGURACIÓN DE BLOQUES MULTI-TIMEFRAME ──────────────────────────────
     activo_cfg = CONFIG['activo']
     tf_cfg = CONFIG['tf']
     
-    # 1. BLOQUE HORARIO ADAPTATIVO
-    if tf_cfg not in ['4h', '1d']:
-        # TFs < 4h: agrupación exacta por hora mediante desfase de velas
-        n_velas_por_hora = FACTORES[activo_cfg][tf_cfg]['horaria']
+    try:
+        bloques = get_factores(activo_cfg, tf_cfg)
+    except (ValueError, KeyError, TypeError):
+        bloques = {'dia': 1, 'semanal': 7, 'mensual': 30, 'trimestral': 90, 'anual': 365}
+    
+    def normalizar_serie(serie, bloques_agrupacion):
+        s = serie.groupby(np.arange(len(serie)) // int(bloques_agrupacion)).sum()
+        return s[np.isfinite(s)]
+    
+    def calc_max_dd_interno(grupo):
+        if len(grupo) <= 1:
+            v = float(grupo.iloc[0])
+            return min(np.exp(v) - 1, 0)
+        cum = np.exp(np.cumsum(grupo.values))
+        cum_max = np.maximum.accumulate(cum)
+        dd = np.divide(cum - cum_max, cum_max, out=np.zeros_like(cum), where=cum_max!=0)
+        return dd.min()
+    
+    series_temporales = {}
+    stats_temporales = {}
+    
+    for periodo, n_bloques in bloques.items():
+        if n_bloques < 1:
+            continue
+        series_temporales[periodo] = normalizar_serie(df['retorno'], n_bloques)
+        s_actual = series_temporales[periodo]
         
-        primer_timestamp = df.index[0]
-        minutos_totales  = primer_timestamp.hour * 60 + primer_timestamp.minute
-        dur_vela_min     = 60 / n_velas_por_hora
-        desfase          = int(minutos_totales // dur_vela_min)
+        # Max DD Macro
+        cum_ret_p = np.exp(s_actual.cumsum())
+        mdd_p = ((cum_ret_p - cum_ret_p.cummax()) / cum_ret_p.cummax()).min()
         
-        posiciones_adj  = np.arange(len(df)) + desfase
-        bloques_hora_id = posiciones_adj // int(n_velas_por_hora)
+        # Max DD Intra-periodo
+        bloques_id = np.arange(len(df)) // int(n_bloques)
+        dds_por_bloque = df['retorno'].groupby(bloques_id).apply(calc_max_dd_interno)
         
-        df['hora_factor'] = bloques_hora_id % 24
+        peor_dd_intrabloque = dds_por_bloque.min()
+        idx_peor_bloque = dds_por_bloque.idxmin()
         
-        vol_por_hora    = df.groupby('hora_factor')['retorno'].std() * 100
-        hora_mas_volatil = int(vol_por_hora.idxmax())
-        vol_maxima_hora  = vol_por_hora.max()
-
-    else:
-        # TFs >= 4h: sin resolución horaria exacta → proxy por hora de apertura de vela
-        # Cada vela de 4h cubre un bloque de sesión, agrupamos por hora UTC de inicio
-        if es_datetime_valido:
-            vol_por_hora     = df.groupby(df.index.hour)['retorno'].std() * 100
-            vol_por_hora     = vol_por_hora.dropna()
-            hora_mas_volatil = int(vol_por_hora.idxmax()) if len(vol_por_hora) > 0 else 14
-            vol_maxima_hora  = vol_por_hora.max()         if len(vol_por_hora) > 0 else 0.0
-            print(f"INFO: Timeframe '{tf_cfg}' — usando hora de apertura de vela como proxy horario.")
+        if es_datetime_valido and len(df) > 0:
+            fechas_bloque = df.index[bloques_id == idx_peor_bloque]
+            fecha_peor = fechas_bloque[0].strftime('%Y-%m-%d') if len(fechas_bloque) > 0 else "N/A"
         else:
-            vol_por_hora     = pd.Series(dtype=float)
-            hora_mas_volatil = "N/A"
-            vol_maxima_hora  = 0.0
-
-    # 2. BLOQUES SEMANAL Y MENSUAL: Universales (Se ejecutan SIEMPRE)
-    # Pandas extrae el día y el mes directamente del índice Datetime, adaptándose al TF que haya.
+            fecha_peor = "N/A"
+        
+        if len(s_actual) > 2:
+            stat_jb_p, p_jb_p = stats.jarque_bera(s_actual)
+        else:
+            stat_jb_p, p_jb_p = 0.0, 1.0
+        
+        # 1. Crear el diccionario base
+        stats_temporales[periodo] = {
+            'media': s_actual.mean(),
+            'std':   s_actual.std(),
+            'max_dd': mdd_p,
+            'max_dd_interno': peor_dd_intrabloque,
+            'fecha_peor': fecha_peor,
+            'p_value_normalidad': p_jb_p
+        }
+        
+        # 2. Análisis de Dependencia Estadística (ACF/PACF)
+        n_lags = min(40, len(s_actual) // 4) 
+        if len(s_actual) > n_lags + 5:
+            acf_vals = acf(s_actual, nlags=n_lags)
+            pacf_vals = pacf(s_actual, nlags=n_lags)
+            umbral_dependencia = 1.96 / np.sqrt(len(s_actual))
+        else:
+            acf_vals, pacf_vals, umbral_dependencia = [], [], 0.0
     
-    # Agrupación Semanal
-    df['dia_semana_index'] = df.index.dayofweek
-    vol_por_dia_semana = df.groupby('dia_semana_index')['retorno'].std() * 100
-    vol_por_dia_semana.index = vol_por_dia_semana.index.map(DIAS_MAP)
-    dia_mas_volatil = vol_por_dia_semana.idxmax()
-    vol_maxima_dia = vol_por_dia_semana.max()
+        # 3. Actualizar el diccionario existente
+        stats_temporales[periodo].update({
+            'acf_vals': acf_vals,
+            'pacf_vals': pacf_vals,
+            'umbral': umbral_dependencia
+        })
+        
+        #Determinaciones para análisis de dependencia
+    def estado_adn(val, umbral):
+        """Determina el estado táctico según la dependencia estadística."""
+        if val > umbral: 
+            return "INERCIA"
+        elif val < -umbral: 
+            return "REVERSIÓN"
+        else: 
+            return "RUIDO"
     
-    # Agrupación Mensual
-    df['mes_index'] = df.index.month
-    vol_por_mes = df.groupby('mes_index')['retorno'].std() * 100
-    vol_por_mes.index = vol_por_mes.index.map(MESES_MAP)
-    mes_mas_volatil = vol_por_mes.idxmax()
-    vol_maxima_mes = vol_por_mes.max()
-
-
-    # 3. CÁLCULOS MATEMÁTICOS DE VENTANAS RODANTES (Para todos los TF)
-    velas_por_dia = FACTORES[activo_cfg][tf_cfg]['dia']
-    ventana_vol = int(velas_por_dia)
-    ventana_corr = int(velas_por_dia * 7)
+    def _pacf1(stats):
+        vals = stats.get('pacf_vals', [])
+        return vals[1] if len(vals) > 1 else 0.0
     
-    if tf_cfg == '1d':
-        ventana_vol = 7
-        ventana_corr = 30
-
-    df['vol_rodante_tf'] = df['retorno'].rolling(window=ventana_vol).std()
-    df['corr_leverage'] = df['retorno'].rolling(window=ventana_corr).corr(df['vol_rodante_tf'])
+    def _fmt_dependencia(stats):
+        val = _pacf1(stats)
+        return f"{val:.4f} → {estado_adn(val, stats['umbral'])}"
+        
     
-    df_clean_corr = df.dropna(subset=['corr_leverage'])
-    corr_media_historica = df_clean_corr['corr_leverage'].mean()
-    corr_max = df_clean_corr['corr_leverage'].max()
-    corr_min = df_clean_corr['corr_leverage'].min()
-    tiempo_negativa = (df_clean_corr['corr_leverage'] < 0).mean() * 100
-    tiempo_positiva = (df_clean_corr['corr_leverage'] > 0).mean() * 100
+    # Variables globales para acceso rápido
+    r_diario_real = series_temporales['dia']
+    ret_diario, vol_diaria = stats_temporales['dia']['media'], stats_temporales['dia']['std']
+    ret_semanal, vol_semanal = stats_temporales['semanal']['media'], stats_temporales['semanal']['std']
+    ret_mensual, vol_mensual = stats_temporales['mensual']['media'], stats_temporales['mensual']['std']
+    ret_trimestral, vol_trimestral = stats_temporales['trimestral']['media'], stats_temporales['trimestral']['std']
+    ret_anual, vol_anual = stats_temporales['anual']['media'], stats_temporales['anual']['std']
+    
+    # Función de validación temporal
+    def validar_output_terminal(stats_temporales):
+        print("\n" + "="*50)
+        print("VALIDACIÓN: ANÁLISIS DE ARQUITECTURA TEMPORAL")
+        print("="*50)
+        print(f"{'Escala':<12} | {'Lag 1':<10} | {'Tipo':<15} | {'Umbral'}")
+        print("-" * 50)
+        orden = ['dia', 'semanal', 'mensual', 'trimestral', 'anual']
+        for periodo in orden:
+            if periodo in stats_temporales:
+                data = stats_temporales[periodo]
+                pacf = data['pacf_vals']
+                umbral = data['umbral']
+                val = pacf[1] if len(pacf) > 1 else 0.0
+                if val > umbral: estado = "INERCIA"
+                elif val < -umbral: estado = "REVERSIÓN"
+                else: estado = "RUIDO"
+                print(f"{periodo.capitalize():<12} | {val:>8.4f} | {estado:<15} | {umbral:.4f}")
+        print("="*50 + "\n")
+    
+    validar_output_terminal(stats_temporales)
+    # endregion
+    # region ── 8. MÉTRICAS ──────────────────────────────────────────────────────────────
+    
+    # ==========================================================================
+    # region PASO 1: Cálculos de Volatilidad y Retornos Anualizados/Diarios Compuestos
+    # Calcula la dispersión del precio y el rendimiento compuesto esperado en base al régimen operativo anual del activo.
+    if velas_por_anio is not None:
+        try:
+            velas_anual_regimen = get_factores(CONFIG['activo'], CONFIG['tf'])['anual']
+        except (ValueError, KeyError, TypeError):
+            velas_anual_regimen = velas_por_anio
+        vol_anual  = r.std() * np.sqrt(velas_anual_regimen)
+        vol_diaria = r.std() * np.sqrt(velas_por_dia)
+        
+        media_log_diaria_real = r_diario_real.mean()
+        ret_diario = np.exp(media_log_diaria_real) - 1
+        
+        dias_ano_regimen = 365 if CONFIG['activo'] == 'CRYPTO' else 252
+        ret_anual  = np.exp(media_log_diaria_real * dias_ano_regimen) - 1
+        
+        rf_anual   = CONFIG.get('rf_rate', 0.0) / 100.0
+        if rf_anual > 0:
+            print(f"      Rf rate: {rf_anual:.4%} (configurado)")
+        else:
+            print(f"      Rf rate: 0.00% (sin tasa libre de riesgo)")
+        sharpe     = (ret_anual - rf_anual) / vol_anual if (vol_anual is not None and vol_anual != 0 and vol_anual != 0.0) else 0
+        calmar_disponible = True
+    else:
+        # AQUÍ ESTÁ EL CAMBIO: Asignamos 0.0 en lugar de None
+        vol_anual = vol_diaria = ret_anual = ret_diario = sharpe = 0.0
+        calmar_disponible = False
+        
+    # endregion
+    # ==========================================================================
+    # region PASO 2: Cálculo del Máximo Drawdown (Max DD) Histórico
+    # Mide la peor pérdida acumulada de pico a valle sufrida por el precio a lo largo del histórico.
+    cum_returns = np.exp(r.cumsum())
+    peak        = cum_returns.cummax()
+    mdd         = ((cum_returns - peak) / peak).min()
+    # endregion
+    # ==========================================================================
+    # region PASO 3: Cálculo de Tiempos de Recuperación en Drawdown
+    # Mide la cantidad de velas y el tiempo exacto transcurrido entre el pico máximo y su break-even o recuperación completa.
+    drawdown_series = (cum_returns - peak) / peak
+    en_drawdown      = drawdown_series < 0
+    
+    bloques          = (en_drawdown != en_drawdown.shift()).cumsum()
+    duraciones_velas = en_drawdown.groupby(bloques).sum()
+    duraciones_velas = duraciones_velas[duraciones_velas > 0]
+    
+    if len(duraciones_velas) > 0:
+        bloque_max_id      = duraciones_velas.idxmax()
+        recovery_velas_max = int(duraciones_velas.max())
+    
+        if es_datetime_valido:
+            indices_bloque = en_drawdown[bloques == bloque_max_id].index
+    
+            # Fecha del PICO (breakeven inicial): la última vela en máximo, justo antes de empezar a caer.
+            pos_primera_en_dd = df.index.get_loc(indices_bloque[0])
+            ts_pico = df.index[pos_primera_en_dd - 1] if pos_primera_en_dd > 0 else indices_bloque[0]
+    
+            # Fecha de RECUPERACIÓN COMPLETA: la primera vela donde el precio vuelve a superar (o igualar) el pico anterior.
+            pos_ultima_en_dd = df.index.get_loc(indices_bloque[-1])
+            if pos_ultima_en_dd + 1 < len(df.index):
+                ts_recuperado = df.index[pos_ultima_en_dd + 1]
+            else:
+                ts_recuperado = indices_bloque[-1]  # aún no recuperado al final de los datos
+    
+            recovery_timedelta = ts_recuperado - ts_pico
+            dias_rec    = recovery_timedelta.days
+            horas_rec   = recovery_timedelta.seconds // 3600
+            minutos_rec = (recovery_timedelta.seconds % 3600) // 60
+    
+            # Si la recuperación alcanza o supera 1 año (365 días), se descompone en años + el resto en d/h/m.
+            if dias_rec >= 365:
+                anios_rec    = dias_rec // 365
+                dias_resto   = dias_rec % 365
+                etiqueta_anio = "año" if anios_rec == 1 else "años"
+                duracion_str = f"{anios_rec} {etiqueta_anio} {dias_resto}d {horas_rec}h {minutos_rec}m"
+            else:
+                duracion_str = f"{dias_rec}d {horas_rec}h {minutos_rec}m"
+    
+            # Formato de fecha: con hora solo si el timeframe es intradía
+            fmt_fecha = '%Y-%m-%d %H:%M' if recovery_timedelta < pd.Timedelta(days=3) else '%Y-%m-%d'
+            rango_fechas_str = f"{ts_pico.strftime(fmt_fecha)} → {ts_recuperado.strftime(fmt_fecha)}"
+    
+            recovery_str = f"{duracion_str}   ({rango_fechas_str})"
+        else:
+            recovery_str = "N/A (TICKS — sin temporalidad)"
+    else:
+        recovery_velas_max = 0
+        recovery_str = "0d 0h 0m" if es_datetime_valido else "N/A (TICKS — sin temporalidad)"
+    
+    # endregion
+    # ==========================================================================
+    # region PASO 4: Cálculo de la Profundidad del Drawdown Medio
+    # Obtiene el promedio del punto más bajo registrado de manera aislada en cada episodio consecutivo de caída.
+    if en_drawdown.any():
+        profundidad_por_episodio = drawdown_series[en_drawdown].groupby(bloques[en_drawdown]).min()
+        drawdown_medio = profundidad_por_episodio.mean()
+        num_episodios_dd = len(profundidad_por_episodio)
+    else:
+        drawdown_medio = None
+        num_episodios_dd = 0
+    
+    # endregion
+    # ==========================================================================
+    # region PASO 5: Cálculo del Calmar Ratio
+    # Relaciona el retorno compuesto anualizado frente al máximo drawdown histórico para medir la recompensa por unidad de riesgo.
+    if calmar_disponible and mdd != 0:
+        calmar_ratio = ret_anual / abs(mdd)
+    else:
+        calmar_ratio = None
+    
+    # endregion
+    # ==========================================================================
+    # region PASO 6: Inicialización de Parámetros Auxiliares de Riesgo y Formatos
+    # Establece las funciones de formateo numérico de strings y las variables de temporalidad del activo.
+    tf_actual = CONFIG['tf']
+    var_95_hist = np.percentile(r, 5)
+    var_99_hist = np.percentile(r, 1)
+    z_95 = stats.norm.ppf(0.05)
+    z_99 = stats.norm.ppf(0.01)
+    var_95_param = r.mean() + z_95 * r.std()
+    var_99_param = r.mean() + z_99 * r.std()
+    
+    def fmt_pct(valor, decimales=2):
+        return f"{valor*100:.{decimales}f}%" if valor is not None else "N/A (TICKS)"
+    
+    def fmt_num(valor, decimales=4):
+        return f"{valor:.{decimales}f}" if valor is not None else "N/A (TICKS)"
 
-except Exception as e:
-    print(f"AVISO: Cálculo de correlaciones/estacionalidad saltado: {e}")
+    tf_actual = CONFIG['tf']
+    
+    # endregion
+    # ==========================================================================
+    # region PASO 7: Test de Normalidad de Jarque-Bera y Lógica Adaptativa de Módulo VaR
+    # Evalúa la asimetría y curtosis de la serie para decidir dinámicamente si aplicar un cálculo de VaR Histórico o Paramétrico.
+    r_clean = r[np.isfinite(r)].dropna()
+    
+    if len(r_clean) > 0:
+        stat_jb, p_jb = stats.jarque_bera(r_clean)
+    else:
+        stat_jb, p_jb = 0.0, 1.0 # Valores seguros si la serie está vacía
+    
+    if p_jb < 0.05:
+        var_95 = np.percentile(r_clean, 5)
+        var_99 = np.percentile(r_clean, 1)
+        lbl_var_95, lbl_var_99 = f'VaR 95% Histórico ({tf_actual})', f'VaR 99% Histórico ({tf_actual})'
+    else:
+        z_95, z_99 = stats.norm.ppf(0.05), stats.norm.ppf(0.01)
+        var_95 = r_clean.mean() + z_95 * r_clean.std()
+        var_99 = r_clean.mean() + z_99 * r_clean.std()
+        lbl_var_95, lbl_var_99 = f'VaR 95% Paramétrico ({tf_actual})', f'VaR 99% Paramétrico ({tf_actual})'
+    
+    val_var_95, val_var_99 = f"{-var_95*100:.4f}%", f"{-var_99*100:.4f}%"
+    
+    # endregion
+    # ==========================================================================
+    # region PASO 8: Cálculo de Persistencia de Rangos vía Ratio de Eficiencia (ER)
+    # Cuantifica el ruido direccional de las series analizando cuántas velas rompen los umbrales de tendencia o ruido locales.
+    er_medio         = df['ER'].mean()
+    er_std           = df['ER'].std()
+    
+    umbral_tendencia = min(0.95, er_medio + er_std)
+    umbral_ruido     = max(0.05, er_medio - er_std)
+    
+    total_tendencia  = (df['ER'] > umbral_tendencia).sum()
+    total_ruido      = (df['ER'] < umbral_ruido).sum()
+    
+    # Agrupa y contabiliza las ocurrencias del coeficiente Hurst en zonas de tendencia, paseo aleatorio o reversión a la media.
+    
+    total_tendencia_h = ((df['hurst'] > 0.58)).sum()
+    total_aleatorio_h  = ((df['hurst'] >= 0.52) & (df['hurst'] <= 0.58)).sum()
+    total_reversion_h  = ((df['hurst'] < 0.52)).sum()
+    
+    # endregion
+    # ==========================================================================
+    # region PASO 9: Análisis de Periodos Tendenciales (H > 0.6) y Mean Reversion (H < 0.52)
+    # ==========================================================================
+    mask_h_tend = df['hurst'] > 0.6
+    mask_h_rev  = df['hurst'] < 0.52
+    
+    # --- Rachas consecutivas de tendencia ---
+    en_tend = mask_h_tend
+    rachas_tend = (en_tend != en_tend.shift()).cumsum()
+    rachas_tend_len = en_tend.groupby(rachas_tend).sum()
+    rachas_tend_len = rachas_tend_len[rachas_tend_len > 0]
+    if len(rachas_tend_len) > 0:
+        duracion_media_racha_tend = rachas_tend_len.mean()
+        duracion_max_racha_tend   = rachas_tend_len.max()
+    else:
+        duracion_media_racha_tend = None
+        duracion_max_racha_tend   = None
+    
+    pct_tiempo_tend = mask_h_tend.sum() / len(df)
+    pct_tiempo_rev  = mask_h_rev.sum() / len(df)
+    
+    if velas_por_dia is not None and velas_por_dia > 0:
+        try:
+            velas_dia_tend = get_factores(CONFIG['activo'], CONFIG['tf'])['dia']
+        except (ValueError, KeyError, TypeError):
+            velas_dia_tend = velas_por_dia
+        if mask_h_tend.any():
+            ret_dia_tend = r[mask_h_tend].mean() * velas_dia_tend * 100
+            vol_dia_tend = r[mask_h_tend].std() * np.sqrt(velas_dia_tend) * 100
+            sharpe_tend = ret_dia_tend / vol_dia_tend if vol_dia_tend != 0 else 0.0
+        else:
+            ret_dia_tend = vol_dia_tend = sharpe_tend = None
+        if mask_h_rev.any():
+            ret_dia_rev = r[mask_h_rev].mean() * velas_dia_tend * 100
+            vol_dia_rev = r[mask_h_rev].std() * np.sqrt(velas_dia_tend) * 100
+            sharpe_rev = ret_dia_rev / vol_dia_rev if vol_dia_rev != 0 else 0.0
+        else:
+            ret_dia_rev = vol_dia_rev = sharpe_rev = None
+    else:
+        ret_dia_tend = vol_dia_tend = ret_dia_rev = vol_dia_rev = sharpe_tend = sharpe_rev = None
+    
+    # endregion
+    # ==========================================================================
+    # region PASO 10: Cálculos Multitemporales de Volatilidad Histórica Rodante (Rolling Vol)
+    # Extrae ventanas rodantes estandarizadas (7d, 30d, 90d, 365d) parametrizando las velas operativas según el tipo de producto.
+    tipo_activo = CONFIG['activo']  
+    tf_actual = CONFIG['tf']
+    
+    velas_dia = get_factores(tipo_activo, tf_actual)['dia']
+    velas_anual = get_factores(tipo_activo, tf_actual)['anual']
+    
+    dias_ano = 365 if tipo_activo == 'CRYPTO' else 252
+    dias_trimestre = 90 if tipo_activo == 'CRYPTO' else 63
+    
+    vol_historica_total = r.std() * np.sqrt(velas_anual)
+    
+    hv_7d  = r.rolling(window=int(7 * velas_dia)).std() * np.sqrt(velas_anual)
+    hv_30d = r.rolling(window=int(30 * velas_dia)).std() * np.sqrt(velas_anual)
+    hv_90d = r.rolling(window=int(dias_trimestre * velas_dia)).std() * np.sqrt(velas_anual)
+    hv_365d = r.rolling(window=int(dias_ano * velas_dia)).std() * np.sqrt(velas_anual)
+    
+    val_hv_7d   = hv_7d.iloc[-1] if len(hv_7d) >= (7 * velas_dia) else None
+    val_hv_30d  = hv_30d.iloc[-1] if len(hv_30d) >= (30 * velas_dia) else None
+    val_hv_90d  = hv_90d.iloc[-1] if len(hv_90d) >= (dias_trimestre * velas_dia) else None
+    val_hv_365d = hv_365d.iloc[-1] if len(hv_365d) >= (dias_ano * velas_dia) else None
+    
+    # --- Comparativa de Regímenes Geométricos de Tendencia Estructural ---
+    ventana_sma = int(200 * velas_dia)
+    
+    if len(df) > ventana_sma:
+        df['SMA_Regimen'] = df['close'].rolling(window=ventana_sma).mean()
+        es_bull = df['close'] > df['SMA_Regimen']
+        es_bear = df['close'] <= df['SMA_Regimen']
+        
+        ret_bull = r[es_bull].mean() * velas_anual
+        vol_bull = r[es_bull].std() * np.sqrt(velas_anual)
+        
+        ret_bear = r[es_bear].mean() * velas_anual
+        vol_bear = r[es_bear].std() * np.sqrt(velas_anual)
+        
+        str_bull = f"Ret: {ret_bull*100:.2f}% | Vol: {vol_bull*100:.2f}%"
+        str_bear = f"Ret: {ret_bear*100:.2f}% | Vol: {vol_bear*100:.2f}%"
+    else:
+        str_bull = "N/A"
+        str_bear = "N/A"
+    
+    # endregion
+    # ==========================================================================
+    # region PASO 11: Análisis Estadístico de Correlaciones Temporales (Leverage Effect)
+    # ==========================================================================
+    ventana_vol = 0
+    ventana_corr = 0
+    corr_media_historica = 0.0
+    corr_max = 0.0
+    corr_min = 0.0
+    tiempo_negativa = 0.0
+    tiempo_positiva = 0.0
+    hora_mas_volatil = 0
+    vol_maxima = 0.0
+    vol_por_hora = pd.Series(dtype=float)
+    vol_relativa_asia = 0.0
+    vol_relativa_london = 0.0
+    vol_relativa_ny = 0.0
+    vol_weekend_ratio = 0.0
+    pivot_week = pd.DataFrame(dtype=float)
+    pivot_month = pd.DataFrame(dtype=float)
+    corr_24 = pd.DataFrame(dtype=float)
+    overall_vol = 0.0
+    
+    try:
+        if 'hora_utc' not in df.columns:
+            df['hora_utc'] = df.index.hour
+    
+        velas_por_dia = get_factores(CONFIG['activo'], CONFIG['tf'])['dia']
+        ventana_vol = int(velas_por_dia)
+        ventana_corr = int(velas_por_dia * 7)
+        
+        if CONFIG['tf'] == '1d':
+            ventana_vol = 7
+            ventana_corr = 30
+    
+        df['vol_rodante_tf'] = df['retorno'].rolling(window=ventana_vol).std()
+        df['corr_leverage'] = df['retorno'].rolling(window=ventana_corr).corr(df['vol_rodante_tf'])
+        
+        df_clean_corr = df.dropna(subset=['corr_leverage'])
+        corr_media_historica = df_clean_corr['corr_leverage'].mean()
+        corr_max = df_clean_corr['corr_leverage'].max()
+        corr_min = df_clean_corr['corr_leverage'].min()
+        tiempo_negativa = (df_clean_corr['corr_leverage'] < 0).mean() * 100
+        tiempo_positiva = (df_clean_corr['corr_leverage'] > 0).mean() * 100
+        
+        if df['hora_utc'].nunique() > 1:
+            vol_por_hora = df.groupby('hora_utc')['retorno'].std() * 100
+            vol_por_hora = vol_por_hora.dropna()
+            if vol_por_hora.empty:
+                hora_mas_volatil = 0
+                vol_maxima = 0.0
+            else:
+                hora_mas_volatil = vol_por_hora.idxmax()
+                vol_maxima = vol_por_hora.max()
+    
+            # Estacionalidad temporal por sesión
+            overall_vol = df['retorno'].std()
+            if overall_vol > 0:
+                asia = df[df['hora_utc'].between(0, 7)]
+                london = df[df['hora_utc'].between(8, 13)]
+                ny = df[df['hora_utc'].between(14, 21)]
+                vol_relativa_asia = asia['retorno'].std() / overall_vol if len(asia) > 50 else 0.0
+                vol_relativa_london = london['retorno'].std() / overall_vol if len(london) > 50 else 0.0
+                vol_relativa_ny = ny['retorno'].std() / overall_vol if len(ny) > 50 else 0.0
+                weekday = df[df.index.dayofweek < 5]
+                weekend = df[df.index.dayofweek >= 5]
+                vol_weekend = weekend['retorno'].std() if len(weekend) > 20 else None
+                vol_weekday = weekday['retorno'].std() if len(weekday) > 20 else None
+                if vol_weekend is not None and vol_weekday is not None and vol_weekday > 0:
+                    vol_weekend_ratio = vol_weekend / vol_weekday
+    
+            # ── Matrices para heatmaps ──
+            df['retorno_pct'] = df['retorno'] * 100
+            pivot_week = df.pivot_table(
+                values='retorno_pct',
+                index=df.index.dayofweek,
+                columns='hora_utc',
+                aggfunc='std'
+            )
+            pivot_week = pivot_week.reindex(columns=range(24), fill_value=0)
+            pivot_month = df.pivot_table(
+                values='retorno_pct',
+                index=df.index.month,
+                columns='hora_utc',
+                aggfunc='std'
+            )
+            pivot_month = pivot_month.reindex(columns=range(24), fill_value=0)
+            daily_profile = df.pivot_table(
+                values='retorno',
+                index=df.index.date,
+                columns='hora_utc',
+                aggfunc='first'
+            ).reindex(columns=range(24), fill_value=0)
+            daily_profile.columns = [f'hora_{h}' for h in daily_profile.columns]
+            corr_24 = daily_profile.corr(method='spearman')
+        else:
+            print("      📅 Timeframe diario — no hay distribución horaria intradía.")
+    
+    except Exception as e:
+        print(f"AVISO: Cálculo de correlaciones saltado: {e}")
+    
+    # endregion
+    # ==========================================================================
+    # region PASO 12: Desviación de la Ley de Escalado Fractal (Raíz de T)
+    # ==========================================================================
+    vol_diaria_real = stats_temporales['dia']['std']
+    vol_mensual_real = stats_temporales['mensual']['std']
+    # Buscamos la anomalía matemática
+    vol_mensual_teorica = vol_diaria_real * np.sqrt(30) 
+    desviacion_escalado = vol_mensual_real - vol_mensual_teorica
+    
+    # endregion
+    # ==========================================================================
+    # region PASO 13: Score de Confluencia Macro (Trend Confluence)
+    # ==========================================================================
+    score_tendencia = 0
+    if series_temporales['mensual'].iloc[-1] > 0: score_tendencia += 1
+    if series_temporales['semanal'].iloc[-1] > 0: score_tendencia += 1
+    if series_temporales['dia'].iloc[-1] > 0:     score_tendencia += 1
+    # endregion
+    # ==========================================================================
+    # region PASO 14: Análisis de dependencia — Autocorrelación (ACF) y Parcial (PACF)
+    def analizar_dependencia_temporal(df, lags=50):
+        # Asegurar que tenemos retornos logarítmicos
+        if 'retorno_log' not in df.columns:
+            df['retorno_log'] = np.log(df['close'] / df['close'].shift(1))
+        
+        df_clean = df.dropna(subset=['retorno_log'])
+        n = len(df_clean)
+        
+        # Calcular ACF y PACF
+        acf_vals = acf(df_clean['retorno_log'], nlags=lags)
+        pacf_vals = pacf(df_clean['retorno_log'], nlags=lags)
+        
+        # Calcular umbral de significancia (95% confianza)
+        umbral = 1.96 / np.sqrt(n)
+        
+        return acf_vals, pacf_vals, umbral
+    # endregion
+    # ==========================================================================
+    # region PASO 15: Volatility Clustering — Autocorrelación de Volatilidad (ARCH)
+    # ==========================================================================
+    retorno_sq = df['retorno'] ** 2
+    r_sq_clean = retorno_sq.dropna()
+    clustering_lag1 = np.nan
+    clustering_lb_q = np.nan
+    clustering_lb_p = np.nan
+    clustering_presente = False
+    
+    if len(r_sq_clean) > 30:
+        try:
+            lags_sq = min(20, len(r_sq_clean) // 4 - 1)
+            if lags_sq >= 2:
+                acf_sq_full = acf(r_sq_clean, nlags=lags_sq)
+                clustering_lag1 = acf_sq_full[1]
+                lb_result = acf(r_sq_clean, nlags=min(12, lags_sq), qstat=True)
+                clustering_lb_q = lb_result[1][-1]
+                clustering_lb_p = lb_result[2][-1]
+                clustering_presente = clustering_lb_p < 0.05
+        except Exception:
+            pass
+    # endregion
+    # ==========================================================================
+    # endregion
+    # region ── 9. 📊 ESTRUCTURACIÓN Y PRESENTACIÓN DE MÉTRICAS FINANCIERAS EN TERMINAL
+    # ── CONFIGURACIÓN DE ETIQUETAS DINÁMICAS (Para Ticks o Tiempo Fijo) ──────────
+    if tipo_muestreo == 'tiempo_fijo':
+        lbl_c, lbl_m, lbl_l = 'Diario', 'Semanal', 'Mensual'
+    else:
+        lbl_c, lbl_m, lbl_l = 'Bloque Corto', 'Bloque Medio', 'Bloque Largo'
+    
+    def barra(valor, total, ancho=12):
+        if total is None or total <= 0: return '░' * ancho
+        llenos = min(int(round(valor / total * ancho)), ancho)
+        return '█' * llenos + '░' * (ancho - llenos)
+    
+    # Pre-cálculos para barras
+    er_tend = int((df['ER'] > 0.5).sum())
+    er_alet = int(((df['ER'] >= 0.3) & (df['ER'] <= 0.5)).sum())
+    er_ruido = int((df['ER'] < 0.3).sum())
+    er_total = er_tend + er_alet + er_ruido
+    
+    h_tend = int(total_tendencia_h)
+    h_alet = int(total_aleatorio_h)
+    h_rev = int(total_reversion_h)
+    h_total = h_tend + h_alet + h_rev
+    
+    hv_vals = [v for v in [val_hv_7d, val_hv_30d, val_hv_90d, val_hv_365d] if v is not None]
+    max_hv = max(hv_vals) if hv_vals else 1
+    
+    # Max reference for HV bars (relative to highest period)
+    _hv_max = max(hv_vals) if hv_vals else 1
+    
+    # Max reference for session bars (relative to busiest session)
+    _rel_hours = [v for v in [vol_relativa_asia, vol_relativa_london, vol_relativa_ny] if v > 0]
+    _rel_h_max = max(_rel_hours) if _rel_hours else 1
+    
+    metricas = {}
 
-# endregion
-# ==========================================================================
-# region PASO 12: Alineación marcos temporales
-# Rango 0-3: 0 = sin dirección clara, 3 = tendencia alineada en todas las escalas.
+    def _mostrar_categoria(titulo, datos):
+        metricas[titulo] = datos
+        print(f"\n ▶ {titulo}")
+        print(f"  {'─' * (len(titulo) + 2)}")
+        for metrica, valor in datos.items():
+            if metrica.strip():
+                print(f"    {metrica:<40} : {valor}")
+        sys.stdout.flush()
 
-_escalas_score = ['dia', 'semanal', 'mensual']
-score_tendencia = sum(
-    1 for p in _escalas_score
-    if p in stats_temporales
-    and len(stats_temporales[p].get('pacf_vals', [])) > 1
-    and stats_temporales[p]['pacf_vals'][1] > stats_temporales[p]['umbral']
-)
-
-# endregion
-# ==========================================================================
-# endregion
-# region ── 9. 📊 ESTRUCTURACIÓN Y PRESENTACIÓN DE MÉTRICAS FINANCIERAS EN TERMINAL
-# ── CONFIGURACIÓN DE ETIQUETAS DINÁMICAS (Para Ticks o Tiempo Fijo) ──────────
-if tipo_muestreo == 'tiempo_fijo':
-    lbl_c, lbl_m, lbl_l = 'Diario', 'Semanal', 'Mensual'
-else:
-    lbl_c, lbl_m, lbl_l = 'Bloque Corto', 'Bloque Medio', 'Bloque Largo'
-metricas = {
-    '1. Información General y tipo de muestreo': {
+    _mostrar_categoria('1. Información General y tipo de muestreo', {
         'Periodo': f"{df.index.min()} → {df.index.max()}" if es_datetime_valido else f"{len(df):,} ticks (archivo sin temporalidad)",
         'Tipo de muestreo': tipo_muestreo,
         'Total velas': f"{len(df):,}"
-    },
-    '2. Rendimiento y Retornos': {
+    })
+
+    _mostrar_categoria('2. Rendimiento y Retornos', {
         'Retorno anualizado (CAGR)': fmt_pct(ret_anual),
         f'Media retorno ({tf_actual})': f"{r.mean()*100:.6f}%",
         f'Mediana retorno ({tf_actual})': f"{r.median()*100:.6f}%",
         'Retorno diario promedio': f"{(ret_diario or 0)*100:.4f}%",
         'Retornos positivos': f"{(r > 0).sum() / r.count() * 100:.2f}%",
         'Retornos negativos': f"{(r < 0).sum() / r.count() * 100:.2f}%",
-        'Alineación de marcos temporales': f"{score_tendencia}/3"
-    },
-    '3. Avanzada & Volatilidad Histórica': {
+        'Alineación de marcos temporales': f"{barra(score_tendencia, 3)} {score_tendencia}/3"
+    })
+
+    _mostrar_categoria('3. Avanzada & Volatilidad Histórica', {
         'Volatilidad Histórica Total': f"{vol_historica_total*100:.2f}%",
-        'HV 7d': f"{val_hv_7d*100:.2f}%" if val_hv_7d is not None else "N/A",
-        'HV 30d': f"{val_hv_30d*100:.2f}%" if val_hv_30d is not None else "N/A",
-        f'HV {dias_trimestre}d': f"{val_hv_90d*100:.2f}%" if val_hv_90d is not None else "N/A",
-        f'HV {dias_ano}d': f"{val_hv_365d*100:.2f}%" if val_hv_365d is not None else "N/A",
+        'HV 7d': f"{barra(val_hv_7d, _hv_max)} {val_hv_7d / vol_historica_total:.3f}x" if val_hv_7d is not None else "N/A",
+        'HV 30d': f"{barra(val_hv_30d, _hv_max)} {val_hv_30d / vol_historica_total:.3f}x" if val_hv_30d is not None else "N/A",
+        f'HV {dias_trimestre}d': f"{barra(val_hv_90d, _hv_max)} {val_hv_90d / vol_historica_total:.3f}x" if val_hv_90d is not None else "N/A",
+        f'HV {dias_ano}d': f"{barra(val_hv_365d, _hv_max)} {val_hv_365d / vol_historica_total:.3f}x" if val_hv_365d is not None else "N/A",
         'Desviación Escalado Fractal': f"{desviacion_escalado:.4%}",
-        ' ': '',
-    },
-    '4. Riesgo y Volatilidad': {
+    })
+
+    _mostrar_categoria('4. Riesgo y Volatilidad', {
         'Volatilidad anualizada': fmt_pct(vol_anual),
         'Volatilidad diaria': fmt_pct(vol_diaria),
         'Desv. estandar': f"{r.std()*100:.6f}%",
-        'Ratio Sharpe (Rf=0)': fmt_num(sharpe),
-        'Calmar Ratio': fmt_num(calmar_ratio)
-    },
-    '5. Drawdown Analysis': {
+        'Ratio Sharpe (Rf=T-Bill 3m)': fmt_num(sharpe),
+        'Calmar Ratio': (f"{'\033[92m' + f'{calmar_ratio:.4f}' + '\033[0m'}" if calmar_ratio and calmar_ratio > 1
+                         else f"{'\033[93m' + f'{calmar_ratio:.4f}' + '\033[0m'}" if calmar_ratio and calmar_ratio > 0.5
+                         else f"{'\033[91m' + f'{calmar_ratio:.4f}' + '\033[0m'}" if calmar_ratio is not None
+                         else "N/A (TICKS)")
+    })
+
+    _mostrar_categoria('5. Drawdown Analysis', {
         'Max Drawdown Histórico': f"{mdd*100:.2f}%",
         'Max Drawdown Interno (Semanal)': f"{stats_temporales['semanal']['max_dd_interno']*100:.2f}%",
         'Max Drawdown Interno (Diario)': f"{stats_temporales['dia']['max_dd_interno']*100:.2f}%  ({stats_temporales['dia']['fecha_peor']})",
@@ -697,8 +1100,9 @@ metricas = {
         'Episodios de drawdown': f"{num_episodios_dd:,}",
         'Tiempo recuperación (velas)': f"{recovery_velas_max:,}",
         'Tiempo recuperación (real)': recovery_str
-    },
-    '6. VaR y Riesgo del Activo': {
+    })
+
+    _mostrar_categoria('6. VaR y Riesgo del Activo', {
         lbl_var_95: val_var_95,
         lbl_var_99: val_var_99,
         f'Peor caída en {tf_actual} (Mínimo)': f"{r.min()*100:.4f}%",
@@ -709,25 +1113,38 @@ metricas = {
         'Jarque-Bera p-value': f"{p_jb:.6f}",
         f'Jarque-Bera p-value ({lbl_c})': f"{stats_temporales['dia']['p_value_normalidad']:.6f}",
         'Distribucion normal': f"{'NO (fat tails)' if p_jb < 0.05 else 'SI'}"
-    },
-    '7. Ratio Eficiencia (ER) y Exponente de Hurst': {
+    })
+
+    _mostrar_categoria('7. Ratio Eficiencia (ER) y Exponente de Hurst', {
         'ER medio': f"{df['ER'].mean():.4f}",
         'ER maximo': f"{df['ER'].max():.4f}",
         'ER minimo': f"{df['ER'].min():.4f}",
-        'Periodos tendencia (ER>0.5)': f"{(df['ER'] > 0.5).sum():,}",
-        'Paseo aleatorio (ER 0.3-0.5)': f"{((df['ER'] >= 0.3) & (df['ER'] <= 0.5)).sum():,} (Random Walk)",
-        'Periodos ruido (ER<0.3)': f"{(df['ER'] < 0.3).sum():,}",
-        
+        'Periodos tendencia (ER>0.5)': f"{barra(er_tend, er_total)} {er_tend:,}",
+        'Paseo aleatorio (ER 0.3-0.5)': f"{barra(er_alet, er_total)} {er_alet:,} (Random Walk)",
+        'Periodos ruido (ER<0.3)': f"{barra(er_ruido, er_total)} {er_ruido:,}",
         ' ': '',
-        
         'Hurst medio': f"{df['hurst'].mean():.4f}",
         'Hurst maximo': f"{df['hurst'].max():.4f}",
         'Hurst minimo': f"{df['hurst'].min():.4f}",
-        'Periodos tendencia (H>0.58)': f"{total_tendencia_h:,}",
-        'Paseo aleatorio (H 0.52-0.58)': f"{total_aleatorio_h:,}",
-        'Periodos mean reversion (H<0.52)': f"{total_reversion_h:,}"
-    },
-    '8. Análisis de Correlación y Estacionalidad': {
+        'Periodos tendencia (H>0.58)': f"{barra(h_tend, h_total)} {h_tend:,}",
+        'Paseo aleatorio (H 0.52-0.58)': f"{barra(h_alet, h_total)} {h_alet:,}",
+        'Periodos mean reversion (H<0.52)': f"{barra(h_rev, h_total)} {h_rev:,}",
+        ' ': '',
+        '% Tiempo en tendencia pura': f"{pct_tiempo_tend:.2%}",
+        'Retorno diario promedio en tendencia': f"{ret_dia_tend:.4f}%" if ret_dia_tend is not None else "N/A",
+        'Volatilidad diaria en tendencia': f"{vol_dia_tend:.4f}%" if vol_dia_tend is not None else "N/A",
+        'Sharpe en tendencia': fmt_num(sharpe_tend),
+        'Duración media racha tendencial': f"{duracion_media_racha_tend:.1f} velas" if duracion_media_racha_tend is not None else "N/A",
+        'Duración máxima racha tendencial': f"{duracion_max_racha_tend:.0f} velas" if duracion_max_racha_tend is not None else "N/A",
+        ' ': '',
+        '% Tiempo en mean reversion': f"{pct_tiempo_rev:.2%}",
+        'Retorno diario promedio en mean rev.': f"{ret_dia_rev:.4f}%" if ret_dia_rev is not None else "N/A",
+        'Volatilidad diaria en mean reversion': f"{vol_dia_rev:.4f}%" if vol_dia_rev is not None else "N/A",
+        'Sharpe en mean reversion': fmt_num(sharpe_rev),
+        'Mejora Sharpe (Tend vs Rev)': f"{(sharpe_tend - sharpe_rev):.4f}" if (sharpe_tend is not None and sharpe_rev is not None) else "N/A"
+    })
+
+    _mostrar_categoria('8. Análisis de Correlación y Estacionalidad', dict({
         'Contexto': f"Timeframe: {CONFIG['tf']} | Análisis Generalizado",
         'Ventana Volatilidad (1 dia)': f"{int(ventana_vol)} velas",
         'Ventana Correlación (1 semana)': f"{int(ventana_corr)} velas",
@@ -735,744 +1152,1101 @@ metricas = {
         'Maxima correlación (FOMO)': f"{corr_max:.4f}",
         'Minima correlación (Panic)': f"{corr_min:.4f}",
         'Tiempo corr. negativa (%)': f"{tiempo_negativa:.2f}%",
-        'Hora más volátil (UTC)': f"{int(hora_mas_volatil):02d}:00",
-        'Vol. hora pico (%)': f"{vol_maxima_hora:.4f}%",
-        'Vol. Londres (08:00)': f"{vol_por_hora.get(8, 0):.4f}%",
-        'Vol. NY (14:00)': f"{vol_por_hora.get(14, 0):.4f}%"
-    },
-    '9. Análisis ATR (Rango Verdadero)': {
-        'ATR 14 actual (USD)': f"${atr14_actual:.2f}",
-        'ATR 14 medio (USD)': f"${atr14_media:.2f}",
-        'ATR 14 maximo (USD)': f"${atr14_max:.2f}",
-        'ATR 14 minimo (USD)': f"${atr14_min:.2f}",
-        'ATR 14 P25 (USD)': f"${atr14_p25:.2f}",
-        'ATR 14 P75 (USD)': f"${atr14_p75:.2f}",
-        'ATR 14 percentil actual': f"{atr14_percentil:.1f}%",
-        'ATR 14 relativo actual': f"{atr14_pct_actual:.2f}%",
-        'ATR 14 relativo medio': f"{atr14_pct_media:.2f}%",
-        'ATR 14 relativo maximo': f"{atr14_pct_max:.2f}%",
-    },
-    '10. Average True Range (Dependencia Temporal)': {
+    }, **({
+        'Volatilidad promedio Asia (00-08)': f"{barra(vol_relativa_asia, _rel_h_max)} {vol_relativa_asia:.2f}x" if vol_relativa_asia > 0 else f"{barra(0, 1)} N/A",
+        'Volatilidad promedio Londres (08-14)': f"{barra(vol_relativa_london, _rel_h_max)} {vol_relativa_london:.2f}x" if vol_relativa_london > 0 else f"{barra(0, 1)} N/A",
+        'Volatilidad promedio NY (14-22)': f"{barra(vol_relativa_ny, _rel_h_max)} {vol_relativa_ny:.2f}x" if vol_relativa_ny > 0 else f"{barra(0, 1)} N/A",
+        'Vol. fin de semana vs laborable': f"{vol_weekend_ratio:.1%}" if vol_weekend_ratio > 0 else "N/A"
+    } if len(vol_por_hora) > 0 else {})))
+
+
+    _mostrar_categoria('9. Análisis de dependencia — Autocorrelación (ACF) y Parcial (PACF)', {
         'Contexto': f"Análisis basado en PACF Lag 1",
         'Significancia (Umbral)': f"{stats_temporales['dia']['umbral']:.4f}",
-        'Dependencia Diaria': f"{stats_temporales['dia']['pacf_vals'][1]:.4f} → {estado_adn(stats_temporales['dia']['pacf_vals'][1], stats_temporales['dia']['umbral'])}",
-        'Dependencia Semanal': f"{stats_temporales['semanal']['pacf_vals'][1]:.4f} → {estado_adn(stats_temporales['semanal']['pacf_vals'][1], stats_temporales['semanal']['umbral'])}",
-        'Dependencia Mensual': f"{stats_temporales['mensual']['pacf_vals'][1]:.4f} → {estado_adn(stats_temporales['mensual']['pacf_vals'][1], stats_temporales['mensual']['umbral'])}",
-        'Dependencia Trimestral': f"{stats_temporales['trimestral']['pacf_vals'][1]:.4f} → {estado_adn(stats_temporales['trimestral']['pacf_vals'][1], stats_temporales['trimestral']['umbral'])}",
-        'Memoria Estructural': "Fuerte (D)" if abs(stats_temporales['dia']['pacf_vals'][1]) > stats_temporales['dia']['umbral'] else "Débil/Ruido"
-    }
-}
-# Output formateado y elegante en la terminal
-print(f"\n{'═'*70}")
-print(f"{'SISTEMA DE ANALÍTICA DE ACTIVOS - REPORTE DESCRIPTIVO':^70}")
-print(f"{'═'*70}")
-
-for categoria, items in metricas.items():
-    print(f"\n ▶ {categoria}")
-    print(f"  {'─' * (len(categoria) + 2)}")
-    for metrica, valor in items.items():
-        print(f"    {metrica:<35} : {valor}")
-
-print(f"\n{'═'*70}\n")
-
-# endregion
-# region ── 10. PREPARACIÓN PREVIA PDF ──────────────────────────────────────────
-# Preparación máscaras de regimen
-mask_tend  = df['ER'] > 0.45
-mask_trans = (df['ER'] >= 0.30) & (df['ER'] <= 0.45)
-mask_ruido = df['ER'] < 0.30
-
-media_er_graf = df['ER'].mean()
-std_er_graf = df['ER'].std()
-
-def color_regimen(er_val):
-    if er_val > media_er_graf + std_er_graf: return '#1D9E75'
-    elif er_val < media_er_graf - std_er_graf: return '#E24B4A'
-    else:                                     return '#3A86FF'
-
-print("Generando PDF...")
-
-# ── CÁLCULO DE RENDIMIENTOS ESTACIONALES (Capitalización Compuesta) ──
-df['factor_crecimiento'] = np.exp(df['retorno'])
-
-orden_meses = ['Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio',
-               'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre']
-orden_dias  = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado', 'Domingo']
-
-if es_datetime_valido:
-    # Mapeo por número (independiente del locale del sistema)
-    df['mes_nombre'] = df.index.month.map({
-        1:'Enero', 2:'Febrero', 3:'Marzo', 4:'Abril', 5:'Mayo', 6:'Junio',
-        7:'Julio', 8:'Agosto', 9:'Septiembre', 10:'Octubre', 11:'Noviembre', 12:'Diciembre'
-    })
-    df['dia_nombre'] = df.index.dayofweek.map({
-        0:'Lunes', 1:'Martes', 2:'Miércoles', 3:'Jueves',
-        4:'Viernes', 5:'Sábado', 6:'Domingo'
+        'Dependencia Diaria': _fmt_dependencia(stats_temporales['dia']),
+        'Dependencia Semanal': _fmt_dependencia(stats_temporales['semanal']),
+        'Dependencia Mensual': _fmt_dependencia(stats_temporales['mensual']),
+        'Dependencia Trimestral': _fmt_dependencia(stats_temporales['trimestral']),
+        'Memoria Estructural': "Fuerte (D)" if abs(_pacf1(stats_temporales['dia'])) > stats_temporales['dia']['umbral'] else "Débil/Ruido"
     })
 
-    mes_stats = (df.groupby('mes_nombre')['factor_crecimiento'].prod() - 1) * 100
-    dia_stats = (df.groupby('dia_nombre')['factor_crecimiento'].prod() - 1) * 100
-    mes_stats = mes_stats.reindex(orden_meses)
-    dia_stats = dia_stats.reindex(orden_dias)
-else:
-    mes_stats = pd.Series(dtype=float)
-    dia_stats = pd.Series(dtype=float)
-# endregion
-# region ── 11. REPRESENTACIONES VISUALES Y GRÁFICAS DE DATOS, GENERACIÓN DE PDF  ──
+    _mostrar_categoria('10. Volatility Clustering (Efecto ARCH)', {
+        'Contexto': f"ACF retornos² lag-1 | Test Ljung-Box (H₀: no clustering)",
+        'Clustering Lag-1': f"{clustering_lag1:.4f}" if not np.isnan(clustering_lag1) else "N/A",
+        'Ljung-Box Q-stat': f"{clustering_lb_q:.2f}" if not np.isnan(clustering_lb_q) else "N/A",
+        'Ljung-Box p-valor': f"{clustering_lb_p:.4f}" if not np.isnan(clustering_lb_p) else "N/A",
+        'Clustering detectado': "SÍ" if clustering_presente else "NO",
+        'Interpretación': ("La volatilidad se agrupa" if clustering_presente
+                          else "No hay evidencia de agrupación de volatilidad")
+    })
 
-with PdfPages(OUTPUT_PDF) as pdf:
-
-# region ── PÁGINA 1 Y 2 — Métricas Estructuradas (MOTOR DINÁMICO MULTIPÁGINA) ──
-    categorias_reales = list(metricas.keys())
+    print()
+    print(f"\n{'═'*70}\n")
     
-    # Configuración de diseño: Máximo de categorías por página (2 por columna)
-    CATS_POR_PAGINA = 4
-    dy = 0.022  
+    # endregion
+    # region ── 16. ESTIMADORES DE VOLATILIDAD OHLC ────────────────────────────────────
+    df_ohlc = df[['open', 'high', 'low', 'close']].replace(0, np.nan).dropna()
+
+    log_hl = np.log(df_ohlc['high'] / df_ohlc['low'])
+    log_co = np.log(df_ohlc['close'] / df_ohlc['open'])
+    log_oc_prev = np.log(df_ohlc['open'] / df_ohlc['close'].shift(1))
+    log_ho = np.log(df_ohlc['high'] / df_ohlc['open'])
+    log_lo = np.log(df_ohlc['low'] / df_ohlc['open'])
+
+    factor_park = 1 / (4 * np.log(2))
+    parkinson_var = factor_park * (log_hl ** 2)
+    parkinson_vol_periodo = np.sqrt(parkinson_var.mean())
+
+    gk_var = 0.5 * (log_hl ** 2) - (2 * np.log(2) - 1) * (log_co ** 2)
+    gk_var = gk_var.clip(lower=0)
+    gk_vol_periodo = np.sqrt(gk_var.mean())
+
+    rs_var = log_ho * (log_ho - log_co) + log_lo * (log_lo - log_co)
+    rs_var = rs_var.clip(lower=0)
+    rs_vol_periodo = np.sqrt(rs_var.mean())
+
+    ctc_vol_periodo = r.std()
+
+    if velas_por_anio is not None:
+        try:
+            factor_anual_ohlc = get_factores(CONFIG['activo'], CONFIG['tf'])['anual']
+        except (ValueError, KeyError, TypeError):
+            factor_anual_ohlc = velas_por_anio
+        parkinson_vol_anual = parkinson_vol_periodo * np.sqrt(factor_anual_ohlc)
+        gk_vol_anual       = gk_vol_periodo * np.sqrt(factor_anual_ohlc)
+        rs_vol_anual        = rs_vol_periodo * np.sqrt(factor_anual_ohlc)
+        ctc_vol_anual        = ctc_vol_periodo * np.sqrt(factor_anual_ohlc)
+    else:
+        parkinson_vol_anual = gk_vol_anual = rs_vol_anual = ctc_vol_anual = None
+
+    eficiencia_parkinson = (ctc_vol_periodo / parkinson_vol_periodo) ** 2 if parkinson_vol_periodo > 0 else None
+    eficiencia_gk        = (ctc_vol_periodo / gk_vol_periodo) ** 2 if gk_vol_periodo > 0 else None
+    eficiencia_rs         = (ctc_vol_periodo / rs_vol_periodo) ** 2 if rs_vol_periodo > 0 else None
+    # endregion
+
+    # region ── 17. TESTS DE ESTACIONARIEDAD (ADF / KPSS) ──────────────────────────────
+    MAX_OBS_STATIONARITY = 20000
+    precio_test = df_ohlc['close']
+    if len(precio_test) > MAX_OBS_STATIONARITY:
+        paso_stat = len(precio_test) // MAX_OBS_STATIONARITY
+        precio_test_sample = precio_test.iloc[::paso_stat]
+        r_test_sample       = r.iloc[::paso_stat] if len(r) > MAX_OBS_STATIONARITY else r
+    else:
+        precio_test_sample = precio_test
+        r_test_sample       = r
+
+    try:
+        adf_precio_stat, adf_precio_p, *_ = adfuller(precio_test_sample, autolag='AIC')
+    except Exception:
+        adf_precio_stat, adf_precio_p = np.nan, np.nan
+
+    try:
+        adf_ret_stat, adf_ret_p, *_ = adfuller(r_test_sample, autolag='AIC')
+    except Exception:
+        adf_ret_stat, adf_ret_p = np.nan, np.nan
+
+    try:
+        with np.errstate(all='ignore'):
+            kpss_precio_stat, kpss_precio_p, *_ = kpss(precio_test_sample, regression='c', nlags='auto')
+    except Exception:
+        kpss_precio_stat, kpss_precio_p = np.nan, np.nan
+
+    try:
+        with np.errstate(all='ignore'):
+            kpss_ret_stat, kpss_ret_p, *_ = kpss(r_test_sample, regression='c', nlags='auto')
+    except Exception:
+        kpss_ret_stat, kpss_ret_p = np.nan, np.nan
+
+    def diagnostico_estacionariedad(adf_p, kpss_p):
+        if np.isnan(adf_p) or np.isnan(kpss_p):
+            return "N/A"
+        adf_estacionaria  = adf_p < 0.05
+        kpss_estacionaria = kpss_p > 0.05
+        if adf_estacionaria and kpss_estacionaria:
+            return "ESTACIONARIA (consenso)"
+        elif not adf_estacionaria and not kpss_estacionaria:
+            return "NO ESTACIONARIA (consenso)"
+        else:
+            return "AMBIGUA (tests discrepan)"
+
+    veredicto_precio   = diagnostico_estacionariedad(adf_precio_p, kpss_precio_p)
+    veredicto_retornos = diagnostico_estacionariedad(adf_ret_p, kpss_ret_p)
+    # endregion
+
+    # region ── 18. VIDA MEDIA DE REVERSIÓN (HALF-LIFE OU) ────────────────────────────
+    precio_log = np.log(df_ohlc['close'])
+    delta_p    = precio_log.diff().dropna()
+    p_lag      = precio_log.shift(1).dropna()
+
+    idx_comun   = delta_p.index.intersection(p_lag.index)
+    delta_p_hl  = delta_p.loc[idx_comun].values
+    p_lag_hl    = p_lag.loc[idx_comun].values
+
+    try:
+        p_lag_mean   = p_lag_hl.mean()
+        cov_hl       = np.mean((p_lag_hl - p_lag_mean) * (delta_p_hl - delta_p_hl.mean()))
+        var_hl       = np.var(p_lag_hl)
+        beta_hl      = cov_hl / var_hl if var_hl != 0 else 0.0
+
+        if -1 < beta_hl < 0:
+            half_life_velas = -np.log(2) / np.log(1 + beta_hl)
+        else:
+            half_life_velas = None
+
+        if half_life_velas is not None and velas_por_dia is not None and velas_por_dia > 0:
+            half_life_dias = half_life_velas / velas_por_dia
+        else:
+            half_life_dias = None
+    except Exception:
+        beta_hl = None
+        half_life_velas = None
+        half_life_dias = None
+    # endregion
+
+    _mostrar_categoria('11. Estimadores de Volatilidad OHLC', {
+        'Contexto': "Parkinson / Garman-Klass / Rogers-Satchell vs Close-to-Close",
+        'Vol. Close-to-Close (anual)': fmt_pct(ctc_vol_anual) if ctc_vol_anual is not None else "N/A",
+        'Vol. Parkinson (anual)': fmt_pct(parkinson_vol_anual) if parkinson_vol_anual is not None else "N/A",
+        'Vol. Garman-Klass (anual)': fmt_pct(gk_vol_anual) if gk_vol_anual is not None else "N/A",
+        'Vol. Rogers-Satchell (anual)': fmt_pct(rs_vol_anual) if rs_vol_anual is not None else "N/A",
+        ' ': '',
+        'Eficiencia Parkinson vs CtC': f"{eficiencia_parkinson:.2f}x" if eficiencia_parkinson else "N/A",
+        'Eficiencia Garman-Klass vs CtC': f"{eficiencia_gk:.2f}x" if eficiencia_gk else "N/A",
+        'Eficiencia Rogers-Satchell vs CtC': f"{eficiencia_rs:.2f}x" if eficiencia_rs else "N/A",
+        'Estimador recomendado': "Rogers-Satchell (robusto a drift)" if rs_vol_periodo > 0 else "N/A"
+    })
+
+    _mostrar_categoria('12. Test de Estacionariedad (ADF / KPSS)', {
+        'Contexto': "ADF: H0=raiz unitaria | KPSS: H0=estacionaria",
+        'ADF stat (Precio)': f"{adf_precio_stat:.4f}" if not np.isnan(adf_precio_stat) else "N/A",
+        'ADF p-valor (Precio)': f"{adf_precio_p:.4f}" if not np.isnan(adf_precio_p) else "N/A",
+        'KPSS stat (Precio)': f"{kpss_precio_stat:.4f}" if not np.isnan(kpss_precio_stat) else "N/A",
+        'KPSS p-valor (Precio)': f"{kpss_precio_p:.4f}" if not np.isnan(kpss_precio_p) else "N/A",
+        'Veredicto (Precio)': veredicto_precio,
+        ' ': '',
+        'ADF stat (Retornos)': f"{adf_ret_stat:.4f}" if not np.isnan(adf_ret_stat) else "N/A",
+        'ADF p-valor (Retornos)': f"{adf_ret_p:.4f}" if not np.isnan(adf_ret_p) else "N/A",
+        'KPSS stat (Retornos)': f"{kpss_ret_stat:.4f}" if not np.isnan(kpss_ret_stat) else "N/A",
+        'KPSS p-valor (Retornos)': f"{kpss_ret_p:.4f}" if not np.isnan(kpss_ret_p) else "N/A",
+        'Veredicto (Retornos)': veredicto_retornos
+    })
+
+    _mostrar_categoria('13. Vida Media de Reversión (Half-Life OU)', {
+        'Contexto': "Modelo Ornstein-Uhlenbeck discreto sobre log(precio)",
+        'Beta (velocidad de reversión)': f"{beta_hl:.6f}" if beta_hl is not None else "N/A",
+        'Half-Life (velas)': f"{half_life_velas:.1f}" if half_life_velas is not None else "N/A (no reversiva)",
+        'Half-Life (días)': f"{half_life_dias:.2f}" if half_life_dias is not None else "N/A",
+        'Interpretación': (
+            "Serie mean-reverting: usese holding ≈ half-life" if half_life_velas is not None and half_life_velas > 0
+            else "Sin reversión detectada (random walk / tendencia)"
+        )
+    })
+
+    print()
+    print(f"\n{'═'*70}\n")
+
+    # endregion
+    # region ── 10. PREPARACIÓN PREVIA PDF ──────────────────────────────────────────
+    # Preparación máscaras de regimen
+    mask_tend  = df['ER'] > 0.45
+    mask_trans = (df['ER'] >= 0.30) & (df['ER'] <= 0.45)
+    mask_ruido = df['ER'] < 0.30
     
-    # Iniciamos el contador de páginas en 2 para el output de la terminal
-    for pag_num, i in enumerate(range(0, len(categorias_reales), CATS_POR_PAGINA), start=2):
-        real_idx = (pag_num - 2) * CATS_POR_PAGINA
-        chunk_pagina = categorias_reales[real_idx : real_idx + CATS_POR_PAGINA]
+    def color_regimen(er_val):
+        if er_val > 0.45:   return '#1D9E75'
+        elif er_val > 0.30: return '#888888'
+        else:               return '#E24B4A'
+    
+    print("Generando PDF...")
+    
+    # ── CÁLCULO DE RENDIMIENTOS ESTACIONALES (Capitalización Compuesta) ──
+    df['factor_crecimiento'] = np.exp(df['retorno'])
+    
+    orden_meses = ['Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio',
+                   'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre']
+    orden_dias  = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado', 'Domingo']
+    
+    if es_datetime_valido:
+        # Mapeo por número (independiente del locale del sistema)
+        df['mes_nombre'] = df.index.month.map({
+            1:'Enero', 2:'Febrero', 3:'Marzo', 4:'Abril', 5:'Mayo', 6:'Junio',
+            7:'Julio', 8:'Agosto', 9:'Septiembre', 10:'Octubre', 11:'Noviembre', 12:'Diciembre'
+        })
+        df['dia_nombre'] = df.index.dayofweek.map({
+            0:'Lunes', 1:'Martes', 2:'Miércoles', 3:'Jueves',
+            4:'Viernes', 5:'Sábado', 6:'Domingo'
+        })
+    
+        mes_stats = (df.groupby('mes_nombre')['factor_crecimiento'].prod() - 1) * 100
+        dia_stats = (df.groupby('dia_nombre')['factor_crecimiento'].prod() - 1) * 100
+        mes_stats = mes_stats.reindex(orden_meses)
+        dia_stats = dia_stats.reindex(orden_dias)
+    else:
+        mes_stats = pd.Series(dtype=float)
+        dia_stats = pd.Series(dtype=float)
+    # endregion
+    # region ── 11. REPRESENTACIONES VISUALES Y GRÁFICAS DE DATOS, GENERACIÓN DE PDF  ──
+    
+    with PdfPages(OUTPUT_PDF) as pdf:
+    
+    # region ── PÁGINA 1 Y 2 — Métricas Estructuradas (MOTOR DINÁMICO MULTIPÁGINA) ──
+        categorias_reales = list(metricas.keys())
         
-        # Dividimos el lote de esta página equitativamente entre las dos columnas
-        mitad = (len(chunk_pagina) + 1) // 2
-        col_izq = chunk_pagina[:mitad]
-        col_der = chunk_pagina[mitad:]
+        # Configuración de diseño: Máximo de categorías por página (2 por columna)
+        CATS_POR_PAGINA = 6
+        dy = 0.020
+        TOTAL_PAGINAS = math.ceil(len(categorias_reales) / CATS_POR_PAGINA) + 9
+        PRIMERA_PAG_NO_METRICAS = math.ceil(len(categorias_reales) / CATS_POR_PAGINA) + 1
         
-        # Inicializar una nueva hoja en el PDF
-        fig, ax = plt.subplots(figsize=(11.69, 8.27))
-        ax.axis('off')
-        fig.patch.set_facecolor('#0f0f0f')
-
-        # Encabezados principales
-        texto_titulo = f"{CONFIG['nombre']} ({CONFIG['tf']}) — Analisis Descriptivo"
-        if len(categorias_reales) > CATS_POR_PAGINA:
-            texto_titulo += f" (Parte {pag_num - 1})"
+        for pag_num, i in enumerate(range(0, len(categorias_reales), CATS_POR_PAGINA), start=1):
+            real_idx = (pag_num - 1) * CATS_POR_PAGINA
+            chunk_pagina = categorias_reales[real_idx : real_idx + CATS_POR_PAGINA]
             
-        fig.text(0.5, 0.94, texto_titulo, ha='center', va='top', fontsize=16, fontweight='bold', color='white')
-        fig.text(0.5, 0.89, f"Activo: {CONFIG['activo']} | Archivo: {os.path.basename(CONFIG['input_path'])}",
-                 ha='center', va='top', fontsize=9, color='#888780')
-
-        # --- RENDEREAR COLUMNA 1 (IZQUIERDA) ---
-        y_current = 0.83
-        for categoria in col_izq:
-            fig.text(0.04, y_current, categoria, fontsize=10, color='#ff9900', fontweight='bold', va='center')
-            y_current -= 0.022
+            # Dividimos el lote de esta página equitativamente entre las dos columnas
+            mitad = (len(chunk_pagina) + 1) // 2
+            col_izq = chunk_pagina[:mitad]
+            col_der = chunk_pagina[mitad:]
             
-            for idx, (k, v) in enumerate(metricas[categoria].items()):
-                bg = '#161616' if idx % 2 == 0 else '#0d0d0d'
-                fig.patches.append(plt.Rectangle((0.03, y_current - 0.008), 0.44, dy,
-                                                   transform=fig.transFigure, facecolor=bg, zorder=0))
-                if str(k).strip() != '':
-                    fig.text(0.05, y_current, str(k), fontsize=8.5, color='#a0a0a0', va='center')
+            # Inicializar una nueva hoja en el PDF
+            fig, ax = plt.subplots(figsize=(11.69, 8.27))
+            ax.axis('off')
+            fig.patch.set_facecolor('#0f0f0f')
+    
+            # Encabezados principales
+            texto_titulo = f"{CONFIG['nombre']} ({CONFIG['tf']}) — Analisis Descriptivo"
+            if len(categorias_reales) > CATS_POR_PAGINA:
+                texto_titulo += f" (Parte {pag_num - 1})"
+                
+            fig.text(0.5, 0.94, texto_titulo, ha='center', va='top', fontsize=16, fontweight='bold', color='white')
+            fig.text(0.5, 0.89, f"Activo: {CONFIG['activo']} | Archivo: {os.path.basename(CONFIG['input_path'])}",
+                     ha='center', va='top', fontsize=9, color='#888780')
+    
+            # --- RENDEREAR COLUMNA 1 (IZQUIERDA) ---
+            y_current = 0.83
+            for categoria in col_izq:
+                fig.text(0.04, y_current, categoria, fontsize=10, color='#ff9900', fontweight='bold', va='center')
+                y_current -= 0.022
+                
+                for idx, (k, v) in enumerate(metricas[categoria].items()):
+                    nombre_metrica = str(k).strip()
+                    # Saltar separadores vacíos para no desperdiciar espacio
+                    if nombre_metrica == '':
+                        y_current -= dy * 0.5
+                        continue
+                        
+                    bg = '#161616' if idx % 2 == 0 else '#0d0d0d'
+                    fig.patches.append(plt.Rectangle((0.02, y_current - 0.008), 0.46, dy,
+                                                       transform=fig.transFigure, facecolor=bg, zorder=0))
+                    key_fsize = 7.0 if len(nombre_metrica) > 33 else 8.5
+                    fig.text(0.04, y_current, nombre_metrica, fontsize=key_fsize, color='#a0a0a0', va='center')
                     
                     # Valores por defecto para la columna izquierda
-                    valor_str = str(v)
-                    x_val = 0.32
-                    f_size = 9
+                    valor_str = re.sub(r'\033\[[0-9;]*m', '', str(v))
+                    x_val = 0.33
+                    f_size = 7.0 if len(valor_str) > 30 else 9
                     
                     # CORRECCIÓN: Match exacto para 'Periodo' y específico para la versión '(real)'
-                    nombre_metrica = str(k).strip()
-                    if nombre_metrica == 'Periodo' or 'Tiempo recuperación (real)' in nombre_metrica:
-                        if nombre_metrica == 'Periodo':
-                            valor_str = re.sub(r'\+\d{2}:\d{2}', '', valor_str)
-                        x_val = 0.19  # Desplazamiento exclusivo para los dos textos gigantes
-                        f_size = 7.5  
+                    if nombre_metrica == 'Periodo':
+                        valor_str = re.sub(r'\+\d{2}:\d{2}', '', valor_str)
+                        x_val = 0.20
+                        f_size = min(f_size, 7.0)
+                    elif 'Tiempo recuperación (real)' in nombre_metrica:
+                        x_val = 0.26
+                        f_size = min(f_size, 6.5)
                     elif any(w in nombre_metrica for w in ['Periodo', 'Régimen', 'Fractal', 'Paseo', 'reversion']):
-                        f_size = 8  # Las métricas de la sección 7 caen aquí, manteniendo su x_val en 0.32
+                        f_size = min(f_size, 8)
                         
                     fig.text(x_val, y_current, valor_str, fontsize=f_size, color='white', va='center', fontweight='bold')
-                y_current -= dy
-            y_current -= 0.020  
-
-        # --- RENDEREAR COLUMNA 2 (DERECHA) ---
-        y_current = 0.83
-        for categoria in col_der:
-            fig.text(0.53, y_current, categoria, fontsize=10, color='#ff9900', fontweight='bold', va='center')
-            y_current -= 0.022
-            
-            for idx, (k, v) in enumerate(metricas[categoria].items()):
-                bg = '#161616' if idx % 2 == 0 else '#0d0d0d'
-                fig.patches.append(plt.Rectangle((0.52, y_current - 0.008), 0.44, dy,
-                                                   transform=fig.transFigure, facecolor=bg, zorder=0))
-                if str(k).strip() != '':
-                    fig.text(0.54, y_current, str(k), fontsize=8.5, color='#a0a0a0', va='center')
+                    y_current -= dy
+                y_current -= 0.020  
+    
+            # --- RENDEREAR COLUMNA 2 (DERECHA) ---
+            y_current = 0.83
+            for categoria in col_der:
+                fig.text(0.53, y_current, categoria, fontsize=10, color='#ff9900', fontweight='bold', va='center')
+                y_current -= 0.022
+                
+                for idx, (k, v) in enumerate(metricas[categoria].items()):
+                    nombre_metrica = str(k).strip()
+                    # Saltar separadores vacíos para no desperdiciar espacio
+                    if nombre_metrica == '':
+                        y_current -= dy * 0.5
+                        continue
+                        
+                    bg = '#161616' if idx % 2 == 0 else '#0d0d0d'
+                    fig.patches.append(plt.Rectangle((0.52, y_current - 0.008), 0.46, dy,
+                                                       transform=fig.transFigure, facecolor=bg, zorder=0))
+                    key_fsize = 7.0 if len(nombre_metrica) > 33 else 8.5
+                    fig.text(0.54, y_current, nombre_metrica, fontsize=key_fsize, color='#a0a0a0', va='center')
                     
                     # Valores por defecto para la columna derecha
-                    valor_str = str(v)
-                    x_val = 0.72
-                    f_size = 9
+                    valor_str = re.sub(r'\033\[[0-9;]*m', '', str(v))
+                    x_val = 0.74
+                    f_size = 7.0 if len(valor_str) > 30 else 9
                     
                     # CORRECCIÓN: Match exacto para 'Periodo' y específico para la versión '(real)'
-                    nombre_metrica = str(k).strip()
-                    if nombre_metrica == 'Periodo' or 'Tiempo recuperación (real)' in nombre_metrica:
-                        if nombre_metrica == 'Periodo':
-                            valor_str = re.sub(r'\+\d{2}:\d{2}', '', valor_str)
-                        x_val = 0.59  # Desplazamiento exclusivo
-                        f_size = 7.5  
+                    if nombre_metrica == 'Periodo':
+                        valor_str = re.sub(r'\+\d{2}:\d{2}', '', valor_str)
+                        x_val = 0.61
+                        f_size = min(f_size, 7.0)
+                    elif 'Tiempo recuperación (real)' in nombre_metrica:
+                        x_val = 0.70
+                        f_size = min(f_size, 6.5)
                     elif any(w in nombre_metrica for w in ['real', 'Normalidad', 'p-value', 'Paseo', 'reversion']):
-                        f_size = 7.5 # Mantiene su x_val en 0.72 original
+                        f_size = min(f_size, 7.5)
                         
                     fig.text(x_val, y_current, valor_str, fontsize=f_size, color='white', va='center', fontweight='bold')
-                y_current -= dy
-            y_current -= 0.020  
-
-        # Guardar la página actual
-        pdf.savefig(fig, facecolor=fig.get_facecolor())
-        plt.close()
-        
-        print(f"Generado página {pag_num}/9 — Métricas")
-        
-    # endregion
-# region ── PÁGINA 2 — Precio y Retornos ─────────────────────
-    fig = plt.figure(figsize=(11.69, 8.27))
-    fig.patch.set_facecolor('#0f0f0f')
-    gs  = gridspec.GridSpec(2, 1, hspace=0.35)
+                    y_current -= dy
+                y_current -= 0.020  
     
-    paso = 200
-    df_plot = df.iloc[::paso]
-    r_plot = r[::paso]
-    eje_x_plot = df_plot.index if es_datetime_valido else np.arange(len(df_plot))
-
-    ax1 = fig.add_subplot(gs[0])
-    ax1.plot(eje_x_plot, df_plot['close'], color='#1D9E75', linewidth=0.5, rasterized=True)
-    ax1.set_facecolor('#111111')
-    ax1.set_title(f"{CONFIG['nombre']} — Precio de Cierre ({CONFIG['tf']})",
-                  color='white', fontsize=11)
-    ax1.set_ylabel('Precio', color='#888780')
-    ax1.set_xlabel('Tiempo' if es_datetime_valido else 'Nº de vela (TICKS)', color='#888780')
-    ax1.tick_params(colors='#888780')
-    ax1.grid(True, alpha=0.2, color='#444')
-    for spine in ax1.spines.values(): spine.set_edgecolor('#333')
-
-    ax2 = fig.add_subplot(gs[1])
-    ax2.plot(eje_x_plot, r_plot, color='#185FA5', linewidth=0.3, alpha=0.8, rasterized=True)
-    ax2.axhline(0, color='#E24B4A', linewidth=0.8, linestyle='--')
-    ax2.set_facecolor('#111111')
-    ax2.set_title(f"{CONFIG['nombre']} — Retornos Logaritmicos ({CONFIG['tf']})",
-                  color='white', fontsize=11)
-    ax2.set_ylabel('Retorno log', color='#888780')
-    ax2.set_xlabel('Tiempo' if es_datetime_valido else 'Nº de vela (TICKS)', color='#888780')
-    ax2.tick_params(colors='#888780')
-    ax2.grid(True, alpha=0.2, color='#444')
-    for spine in ax2.spines.values(): spine.set_edgecolor('#333')
-
-    pdf.savefig(fig, facecolor=fig.get_facecolor(), dpi=150)
-    plt.close()
-    print("Generado página 2/9 — Precio y Retornos...")
-
-# endregion
-# region ── PÁGINA 3 — Análisis de Estacionalidad ────────
-    fig = plt.figure(figsize=(11.69, 8.27))
-    fig.patch.set_facecolor('#0f0f0f')
-
-    # ── TÍTULO PRINCIPAL ──
-    fig.text(0.5, 0.97, f"{CONFIG['nombre']} ({CONFIG['tf']}) — Análisis de Estacionalidad",
-             ha='center', va='top', fontsize=16, fontweight='bold', color='white')
-    fig.text(0.5, 0.93, f"Activo: {CONFIG['activo']} | Archivo: {os.path.basename(CONFIG['input_path'])}",
-             ha='center', va='top', fontsize=9, color='#888780')
-
-    if es_datetime_valido and mes_stats.notna().any():
-        gs = gridspec.GridSpec(2, 1, hspace=0.4)
-
+            # Guardar la página actual
+            pdf.savefig(fig, facecolor=fig.get_facecolor())
+            plt.close()
+            
+            print(f"Generado página {pag_num}/{TOTAL_PAGINAS} — Métricas")
+            
+        # endregion
+    # region ── PÁGINA 2 — Precio, Equity Curve y Underwater Drawdown ─────
+        fig = plt.figure(figsize=(11.69, 8.27))
+        fig.patch.set_facecolor('#0f0f0f')
+        gs  = gridspec.GridSpec(3, 1, hspace=0.50, height_ratios=[1.2, 1, 1])
+        
+        paso = 200
+        df_plot = df.iloc[::paso]
+        equity_plot = cum_returns.iloc[::paso]
+        dd_plot = drawdown_series.iloc[::paso]
+        eje_x_plot = df_plot.index if es_datetime_valido else np.arange(len(df_plot))
+    
         ax1 = fig.add_subplot(gs[0])
-        mes_plot = mes_stats.fillna(0)
-        cols_m = ['#1D9E75' if x >= 0 else '#E24B4A' for x in mes_plot]
-        bars1 = ax1.bar(mes_plot.index, mes_plot, color=cols_m, alpha=0.8)
-        ax1.set_title('Retorno Acumulado por Mes (%)', color='white', fontsize=12)
-        ax1.tick_params(colors='#888780')
-        ax1.grid(True, axis='y', alpha=0.2)
+        ax1.fill_between(eje_x_plot, df_plot['close'].min(), df_plot['close'],
+                          color='#1D9E75', alpha=0.08, rasterized=True)
+        ax1.plot(eje_x_plot, df_plot['close'], color='#1D9E75', linewidth=1.6, rasterized=True)
+        if 'SMA_Regimen' in df_plot.columns:
+            ax1.plot(eje_x_plot, df_plot['SMA_Regimen'], color='#d29922', linewidth=0.6, alpha=0.6, linestyle='--', rasterized=True)
+            ax1.text(0.98, 0.98, 'SMA (200pp)', transform=ax1.transAxes, fontsize=8,
+                     color='#d29922', ha='right', va='top',
+                     bbox=dict(facecolor='#111111', alpha=0.7, edgecolor='#d29922', linewidth=0.5))
         ax1.set_facecolor('#111111')
+        ax1.set_title(f"{CONFIG['nombre']} — Precio de Cierre ({CONFIG['tf']})",
+                      color='white', fontsize=11)
+        ax1.set_ylabel('Precio', color='#888780')
+        ax1.tick_params(colors='#888780')
+        ax1.grid(True, alpha=0.2, color='#444')
         for spine in ax1.spines.values(): spine.set_edgecolor('#333')
-        for bar in bars1:
-            h = bar.get_height()
-            if h != 0:
-                ax1.text(bar.get_x() + bar.get_width()/2, h,
-                         f'{h:.1f}%', ha='center',
-                         va='bottom' if h > 0 else 'top',
-                         color='white', fontsize=8)
-
+        ax1.set_xticklabels([])
+    
         ax2 = fig.add_subplot(gs[1])
-        dia_plot = dia_stats.fillna(0)
-        cols_d = ['#1D9E75' if x >= 0 else '#E24B4A' for x in dia_plot]
-        bars2 = ax2.bar(dia_plot.index, dia_plot, color=cols_d, alpha=0.8)
-        ax2.set_title('Retorno Acumulado por Día de la Semana (%)', color='white', fontsize=12)
-        ax2.tick_params(colors='#888780')
-        ax2.grid(True, axis='y', alpha=0.2)
+        ax2.fill_between(eje_x_plot, 1, equity_plot, where=(equity_plot >= 1),
+                          color='#1D9E75', alpha=0.15, step='pre', rasterized=True)
+        ax2.fill_between(eje_x_plot, 1, equity_plot, where=(equity_plot < 1),
+                          color='#E24B4A', alpha=0.15, step='pre', rasterized=True)
+        ax2.plot(eje_x_plot, equity_plot, color='#58a6ff', linewidth=0.8, rasterized=True)
+        ax2.axhline(1, color='#888780', linewidth=0.5, linestyle='--')
         ax2.set_facecolor('#111111')
+        ax2.set_title(f"{CONFIG['nombre']} — Curva de Equity (Base 1.0)",
+                      color='white', fontsize=11)
+        ax2.set_ylabel('Capital (×)', color='#888780')
+        ax2.tick_params(colors='#888780')
+        ax2.grid(True, alpha=0.2, color='#444')
         for spine in ax2.spines.values(): spine.set_edgecolor('#333')
-        for bar in bars2:
-            h = bar.get_height()
-            if h != 0:
-                ax2.text(bar.get_x() + bar.get_width()/2, h,
-                         f'{h:.1f}%', ha='center',
-                         va='bottom' if h > 0 else 'top',
-                         color='white', fontsize=8)
-    else:
-        ax = fig.add_subplot(111)
-        ax.axis('off')
-        ax.set_facecolor('#111111')
-        ax.text(0.5, 0.5,
-                "Análisis de estacionalidad no disponible.\n\n"
-                "El archivo está basado en TICKS (sin temporalidad de calendario fija),\n"
-                "por lo que no es posible agrupar los retornos por mes o día de la semana.",
-                ha='center', va='center', fontsize=12, color='#888780',
-                transform=ax.transAxes)
-
-    pdf.savefig(fig, facecolor=fig.get_facecolor())
-    plt.close()
-    print("Generado página 3/9 — Análisis de Estacionalidad...")
+        ax2.set_xticklabels([])
     
-# endregion
-# region ── PÁGINA 4 — PRECIO COLOREADO POR RÉGIMEN ER ────────
-    fig = plt.figure(figsize=(11.69, 8.27))
-    fig.patch.set_facecolor('#0f0f0f')
-    gs  = gridspec.GridSpec(2, 1, hspace=0.4, height_ratios=[3, 1])
-
-    # --- MUESTREO PARA VISUALIZACIÓN ---
-    step = 500
-    df_sub = df.iloc[::step]
+        ax3 = fig.add_subplot(gs[2])
+        ax3.fill_between(eje_x_plot, 0, dd_plot * 100,
+                          color='#E24B4A', alpha=0.4, step='pre', rasterized=True)
+        ax3.plot(eje_x_plot, dd_plot * 100, color='#f85149', linewidth=0.5, rasterized=True)
+        ax3.axhline(0, color='#888780', linewidth=0.5, linestyle='--')
+        ax3.set_facecolor('#111111')
+        ax3.set_title(f"{CONFIG['nombre']} — Underwater Drawdown (%)",
+                      color='white', fontsize=11)
+        ax3.set_ylabel('Drawdown %', color='#888780')
+        ax3.set_xlabel('Tiempo' if es_datetime_valido else 'Nº de vela (TICKS)', color='#888780')
+        ax3.tick_params(colors='#888780')
+        ax3.grid(True, alpha=0.2, color='#444')
+        for spine in ax3.spines.values(): spine.set_edgecolor('#333')
     
-    ax4 = fig.add_subplot(gs[0])
-    ax4.set_facecolor('#111111')
-    ax4.set_title(f"{CONFIG['activo']} — Precio coloreado por Regimen ER ({CONFIG['tf']})", color='white', fontsize=11)
-    ax4.set_ylabel('Precio', color='#888780')
-    ax4.set_xlabel('Tiempo' if es_datetime_valido else 'Nº de vela (TICKS)', color='#888780')
-    ax4.tick_params(colors='#888780')
-    ax4.grid(True, alpha=0.2, color='#444')
-    for spine in ax4.spines.values(): spine.set_edgecolor('#333')
-
-    # Aplicamos el muestreo a las coordenadas y colores
-    eje_x_num = df_sub.index.astype(np.int64) if es_datetime_valido else np.arange(len(df_sub))
-    points = np.array([eje_x_num, df_sub['close'].values]).T.reshape(-1, 1, 2)
-    segments = np.concatenate([points[:-1], points[1:]], axis=1)
-    colors = [color_regimen(er) for er in df_sub['ER'].values]
+        if es_datetime_valido:
+            for y in pd.date_range(df_plot.index[0], df_plot.index[-1], freq='YS'):
+                ax1.axvline(y, color='#444', linewidth=0.4, alpha=0.4)
+                ax2.axvline(y, color='#444', linewidth=0.4, alpha=0.4)
+                ax3.axvline(y, color='#444', linewidth=0.4, alpha=0.4)
     
-    lc = LineCollection(segments, colors=colors, linewidth=0.6, alpha=0.8, rasterized=True)
-    ax4.add_collection(lc)
-    ax4.autoscale()
-
-    legend_elements = [
-        Line2D([0], [0], color='#1D9E75', linewidth=2, label=f'Direccional (+1σ: {media_er_graf + std_er_graf:.2f})'),
-        Line2D([0], [0], color='#3A86FF', linewidth=2, label=f'Random Walk (±1σ)'),
-        Line2D([0], [0], color='#E24B4A', linewidth=2, label=f'Ruido (-1σ: {media_er_graf - std_er_graf:.2f})'),
-    ]
-    ax4.legend(handles=legend_elements, facecolor='#222', labelcolor='white', fontsize=8, loc='upper right')
-
-    ax5 = fig.add_subplot(gs[1])
-    ax5.set_title("Histórico ER Acumulado", color='white', fontsize=10, pad=10)
-    
-    x_plot = df.index[::step] if es_datetime_valido else np.arange(len(df))[::step]
-    er_plot = df['ER'].values[::step]
-    
-    ax5.fill_between(x_plot, er_plot, color='#BA7517', alpha=0.2, linewidth=0, rasterized=True)
-    ax5.plot(x_plot, er_plot, color='#BA7517', linewidth=0.3, alpha=0.5, rasterized=True)
-
-    er_suavizado = df['ER'].rolling(200).mean()
-    ax5.plot(x_plot, er_suavizado[::step], color='white', linewidth=1.0, label='Tendencia (SMA 200)', rasterized=True)
-    
-    # --- CÁLCULO DE MEDIA Y DESVIACIONES ---
-    media_er = df['ER'].mean()
-    std_er = df['ER'].std()
-    
-    ax5.axhline(media_er, color='#185FA5', linewidth=1.2, linestyle='-', label=f'Media: {media_er:.2f}')
-    
-    # Líneas de desviación con OPACIDAD REDUCIDA (alpha=0.35)
-    ax5.axhline(media_er + std_er, color='#3A86FF', linewidth=1.0, linestyle='--', alpha=0.35, label=f'+1 Std Dev: {(media_er + std_er):.2f}')
-    ax5.axhline(media_er - std_er, color='#3A86FF', linewidth=1.0, linestyle='--', alpha=0.35, label=f'-1 Std Dev: {(media_er - std_er):.2f}')
-    
-    ax5.axhline(0.45, color='#1D9E75', linewidth=0.8, linestyle='--', label='Ruido Bajo (ER > 0.45)')
-    ax5.axhline(0.30, color='#E24B4A', linewidth=0.8, linestyle='--', label='Ruido Alto (ER < 0.30)')
-
-    ax5.set_facecolor('#111111')
-    ax5.set_ylabel('ER', color='#888780')
-    ax5.set_ylim(0, 1)
-    ax5.tick_params(colors='#888780')
-    ax5.grid(True, alpha=0.2, color='#444')
-    
-    ax5.legend(loc='upper right', facecolor='#222', labelcolor='white', fontsize=7, ncol=3)
-
-    for spine in ax5.spines.values(): spine.set_edgecolor('#333')
-
-    pdf.savefig(fig, facecolor=fig.get_facecolor(), dpi=150)
-    plt.close()
-    print("Generado página 4/9 — Histórico ER Acumulado")
-
-# endregion
-# region ── PÁGINA 5 — Análisis de Riesgo: Diario y Anual ────────
-    try:
-        fig = plt.figure(figsize=(11.69, 8.27))
-        fig.patch.set_facecolor('#0f0f0f')
-        gs = gridspec.GridSpec(2, 1, height_ratios=[1, 1], hspace=0.50)
-
-        sigmas = [1, 2, 3]
-        colores_sigmas = ['#1D9E75', '#BA7517', '#E24B4A']
-
-        def dibujar_campana_p5(ax, media, std, titulo, es_anual=False):
-            ax.set_facecolor('#111111')
-            x = np.linspace(media - 4*std, media + 4*std, 200)
-            y = stats.norm.pdf(x, media, std)
-            ax.plot(x, y, color='#185FA5', linewidth=2, label='Distribución Proyectada', rasterized=True)
-
-            # Etiqueta de la Media (μ)
-            ax.axvline(media, color='white', linestyle='--', linewidth=1.2, alpha=0.6)
-            ax.text(media, -max(y) * 0.06, f"μ: {media:.2%}", color='white', fontsize=7,
-                    ha='center', fontweight='bold', bbox=dict(facecolor='black', alpha=0.8, edgecolor='none', pad=1))
-
-            # Lógica de niveles sigma
-            for s in sigmas:
-                ax.fill_between(x, y, where=(x >= media-s*std) & (x <= media+s*std),
-                                color=colores_sigmas[s-1], alpha=0.15, rasterized=True)
-                for lado in [-1, 1]:
-                    val = media + (lado * s * std)
-                    ax.axvline(val, color=colores_sigmas[s-1], linestyle=':', alpha=0.5)
-                    
-                    if not es_anual:
-                        prob = np.mean(r_diario_real <= val) if lado == -1 else np.mean(r_diario_real >= val)
-                        txt = f"1 c/{1/prob:.1f}d" if prob > 0 else "No reg."
-                    else:
-                        factor = 365 if CONFIG['activo'] == 'CRYPTO' else 252
-                        umbral = val / np.sqrt(factor)
-                        prob = np.mean(r_diario_real <= umbral) if lado == -1 else np.mean(r_diario_real >= umbral)
-                        txt = f"1 c/{(1/prob)/factor:.1f}añ" if prob > 0 else "No reg."
-                    
-                    etiqueta = f"{lado*s}σ: {val:.2%}\n({txt})"
-                    ax.text(val, -max(y) * (0.05 if s % 2 != 0 else 0.14), etiqueta,
-                            color=colores_sigmas[s-1], fontsize=6, ha='center', fontweight='bold',
-                            bbox=dict(facecolor='black', alpha=0.8, edgecolor='none', pad=1))
-
-            ax.set_ylim(-max(y)*0.24, max(y)*1.15)
-            ax.set_title(titulo, color='white', fontsize=11, pad=8)
-            ax.tick_params(colors='#888780', labelsize=7)
-            ax.grid(True, alpha=0.03)
-            ax.legend(facecolor='#222', labelcolor='white', fontsize=7, loc='upper right')
-            for spine in ax.spines.values(): spine.set_edgecolor('#333')
-
-        # Subplots 1 y 2 con títulos dinámicos extraídos de CONFIG
-        ax1 = fig.add_subplot(gs[0])
-        titulo_diario = f"(Proyección) Retorno Diario {CONFIG['tf']} {CONFIG['nombre']}"
-        dibujar_campana_p5(ax1, ret_diario, vol_diaria, titulo_diario, es_anual=False)
-
-        ax2 = fig.add_subplot(gs[1])
-        titulo_anual = f"(Proyección) Retorno Anual ({CONFIG['tf']})"
-        dibujar_campana_p5(ax2, ret_anual, vol_anual, titulo_anual, es_anual=True)
-
         pdf.savefig(fig, facecolor=fig.get_facecolor(), dpi=150)
         plt.close()
-        print("Generado página 5/9 — Riesgo Diario/Anual con Media...")
-    except Exception as e:
-        print(f"ERROR EN PÁGINA 5: {e}")
-        plt.close()
-
-# endregion
-# region ── PÁGINA 6 — Análisis de Riesgo Intradiario: Temporalidad Pura ────────
-    try:
+        print(f"Generado página {PRIMERA_PAG_NO_METRICAS + 0}/{TOTAL_PAGINAS} — Precio, Equity y Underwater...")
+    
+    # endregion
+    # region ── PÁGINA 3 — Análisis de Estacionalidad ────────
         fig = plt.figure(figsize=(11.69, 8.27))
         fig.patch.set_facecolor('#0f0f0f')
-        gs = gridspec.GridSpec(2, 1, height_ratios=[1, 1], hspace=0.50)
-
-        sigmas = [1, 2, 3]
-        colores_sigmas = ['#1D9E75', '#BA7517', '#E24B4A']
-        jb_stat_p6, jb_p_val_p6 = stats.jarque_bera(r)
-        es_normal_p6 = jb_p_val_p6 > 0.05
-
-        def dibujar_campana_micro(ax, media, std, titulo, tipo_grafico='tf_puro'):
-            ax.set_facecolor('#111111')
-            x = np.linspace(media - 4*std, media + 4*std, 200)
-            y = stats.norm.pdf(x, media, std)
-            ax.plot(x, y, color='#185FA5', linewidth=2, label='Distribución Proyectada', rasterized=True)
-
-            if tipo_grafico == 'tf_puro':
-                for s in sigmas:
-                    ax.fill_between(x, y, where=(x >= media-s*std) & (x <= media+s*std),
-                                    color=colores_sigmas[s-1], alpha=0.15, rasterized=True)
-                    for lado in [-1, 1]:
-                        val = media + (lado * s * std)
-                        ax.axvline(val, color=colores_sigmas[s-1], linestyle=':', alpha=0.5)
-                        prob_evento = np.mean(r <= val) if lado == -1 else np.mean(r >= val)
-                        texto_frecuencia = f"1 c/{1/prob_evento:.1f}vel" if prob_evento > 0 else "No reg."
-                        etiqueta = f"{lado*s}σ: {val:.2%}\n({texto_frecuencia})"
-                        ax.text(val, -max(y) * (0.05 if s % 2 != 0 else 0.14), etiqueta,
-                                color=colores_sigmas[s-1], fontsize=6, ha='center', fontweight='bold',
-                                bbox=dict(facecolor='black', alpha=0.8, edgecolor='none', pad=1))
-            else:
-                niveles_var  = [0.95, 0.99]
-                colores_var  = ['#BA7517', '#E24B4A']
-                z_scores_var = [1.645, 2.326]
-                for idx, (conf, z) in enumerate(zip(niveles_var, z_scores_var)):
-                    val_var = media - (z * std) if es_normal_p6 else np.percentile(r, (1-conf)*100)
-                    ax.fill_between(x, y, where=(x <= val_var), color=colores_var[idx], alpha=0.2, rasterized=True)
-                    ax.axvline(val_var, color=colores_var[idx], linestyle='-', linewidth=1.5, alpha=0.7)
-                    prob_evento = np.mean(r <= val_var)
-                    texto_frecuencia = f"1 c/{1/prob_evento:.1f}vel" if prob_evento > 0 else "No reg."
-                    etiqueta = f"VaR ({int(conf*100)}%): {val_var:.2%}\n({texto_frecuencia})"
-                    ax.text(val_var, -max(y) * (0.06 if idx == 0 else 0.16), etiqueta,
-                            color=colores_var[idx], fontsize=6, ha='center', fontweight='bold',
-                            bbox=dict(facecolor='black', alpha=0.8, edgecolor='none', pad=1))
-
-            ax.axvline(media, color='white', linestyle='--', linewidth=1.2, alpha=0.5)
-            ax.set_ylim(-max(y)*0.24, max(y)*1.15)
-            ax.set_title(titulo, color='white', fontsize=11, pad=8)
-            ax.tick_params(colors='#888780', labelsize=7)
-            ax.grid(True, alpha=0.03)
-            ax.legend(facecolor='#222', labelcolor='white', fontsize=7, loc='upper right')
-            for spine in ax.spines.values(): spine.set_edgecolor('#333')
-
-        ax1 = fig.add_subplot(gs[0])
-        dibujar_campana_micro(ax1, r.mean(), r.std(),
-                              f"Retorno por Vela {CONFIG['tf']}", tipo_grafico='tf_puro')
-
-        ax2 = fig.add_subplot(gs[1])
-        dibujar_campana_micro(ax2, r.mean(), r.std(),
-                              f"VaR {'Paramétrico' if es_normal_p6 else 'Histórico'} ({CONFIG['tf']})",
-                              tipo_grafico='var')
-
-        pdf.savefig(fig, facecolor=fig.get_facecolor(), dpi=150)
-        plt.close()
-        print("Generado página 6/9 — Análisis de Riesgos VaR...")
-
-    except Exception as e:
-        print(f"ERROR EN PÁGINA 6: {e}")
-        plt.close()
-
-# endregion
-# region ── PÁGINA 7 — Volatilidad por Hora (Estacionalidad Intradía) ────────
-    if 'vol_por_hora' not in locals():
-        vol_por_hora = pd.Series(dtype=float)
-    tiene_datos_hora = len(vol_por_hora) > 0
-
-    try:
-        fig = plt.figure(figsize=(11.69, 8.27))
-        fig.patch.set_facecolor('#0f0f0f')
-
-        if tiene_datos_hora:
-            gs = gridspec.GridSpec(3, 1, hspace=0.45, top=0.88, bottom=0.08, left=0.07, right=0.95)
-
-            # ── GRÁFICO 1: Volatilidad por hora ──
+    
+        # ── TÍTULO PRINCIPAL ──
+        fig.text(0.5, 0.97, f"{CONFIG['nombre']} ({CONFIG['tf']}) — Análisis de Estacionalidad",
+                 ha='center', va='top', fontsize=16, fontweight='bold', color='white')
+        fig.text(0.5, 0.93, f"Activo: {CONFIG['activo']} | Archivo: {os.path.basename(CONFIG['input_path'])}",
+                 ha='center', va='top', fontsize=9, color='#888780')
+    
+        if es_datetime_valido and mes_stats.notna().any():
+            gs = gridspec.GridSpec(2, 1, hspace=0.4)
+    
             ax1 = fig.add_subplot(gs[0])
-            ax1.set_facecolor('#111111')
-            cols_h = ['#E24B4A' if i == hora_mas_volatil else '#185FA5'
-                      for i in vol_por_hora.index]
-            ax1.bar(vol_por_hora.index, vol_por_hora.values, color=cols_h, alpha=0.8)
-            ax1.set_title(f"{CONFIG['nombre']} — Volatilidad por Hora UTC ({CONFIG['tf']})",
-                          color='white', fontsize=11)
-            ax1.set_xlabel('Hora UTC', color='#888780')
-            ax1.set_ylabel('Volatilidad (%)', color='#888780')
+            mes_plot = mes_stats.fillna(0)
+            cols_m = ['#1D9E75' if x >= 0 else '#E24B4A' for x in mes_plot]
+            bars1 = ax1.bar(mes_plot.index, mes_plot, color=cols_m, alpha=0.8)
+            ax1.set_title('Retorno Acumulado por Mes (%)', color='white', fontsize=12)
             ax1.tick_params(colors='#888780')
-            ax1.set_xticks(range(0, 24))
-            ax1.grid(True, alpha=0.2, color='#444')
+            ax1.grid(True, axis='y', alpha=0.2)
+            ax1.set_facecolor('#111111')
             for spine in ax1.spines.values(): spine.set_edgecolor('#333')
-
-            # Etiqueta hora más volátil
-            ax1.axvline(hora_mas_volatil, color='#E24B4A', linewidth=1.2,
-                        linestyle='--', label=f'Hora pico: {int(hora_mas_volatil):02d}:00')
-            ax1.legend(facecolor='#222', labelcolor='white', fontsize=8)
-
-            # Líneas sesiones
-            for hora, nombre, color in [(0, 'Asia', '#888888'), (8, 'Londres', '#BA7517'), (14, 'NY', '#1D9E75')]:
-                ax1.axvline(hora, color=color, linewidth=1, linestyle=':', alpha=0.7, label=nombre)
-
-            # ── GRÁFICO 2: Histograma de Retorno por Hora ──
-            ret_por_hora = df.groupby('hora_utc')['retorno'].mean() * 100
-            ret_por_hora = ret_por_hora.reindex(range(24), fill_value=0)
-            cols_r = ['#1D9E75' if v >= 0 else '#E24B4A' for v in ret_por_hora.values]
-
-            ax1b = fig.add_subplot(gs[1])
-            ax1b.set_facecolor('#111111')
-            ax1b.bar(ret_por_hora.index, ret_por_hora.values, color=cols_r, alpha=0.8)
-            ax1b.axhline(0, color='white', linewidth=0.6)
-            ax1b.set_title(f"{CONFIG['nombre']} — Retorno Medio por Hora UTC ({CONFIG['tf']})",
-                           color='white', fontsize=11)
-            ax1b.set_xlabel('Hora UTC', color='#888780')
-            ax1b.set_ylabel('Retorno medio (%)', color='#888780')
-            ax1b.tick_params(colors='#888780')
-            ax1b.set_xticks(range(0, 24))
-            ax1b.grid(True, alpha=0.2, color='#444')
-            for spine in ax1b.spines.values(): spine.set_edgecolor('#333')
-
-            for hora, nombre, color in [(0, 'Asia', '#888888'), (8, 'Londres', '#BA7517'), (14, 'NY', '#1D9E75')]:
-                ax1b.axvline(hora, color=color, linewidth=1, linestyle=':', alpha=0.7, label=nombre)
-            ax1b.legend(facecolor='#222', labelcolor='white', fontsize=8)
-
-            # ── GRÁFICO 3: Correlación Retorno-Volatilidad ──
-            ax2 = fig.add_subplot(gs[2])
+            for bar in bars1:
+                h = bar.get_height()
+                if h != 0:
+                    ax1.text(bar.get_x() + bar.get_width()/2, h,
+                             f'{h:.1f}%', ha='center',
+                             va='bottom' if h > 0 else 'top',
+                             color='white', fontsize=8)
+    
+            ax2 = fig.add_subplot(gs[1])
+            dia_plot = dia_stats.fillna(0)
+            cols_d = ['#1D9E75' if x >= 0 else '#E24B4A' for x in dia_plot]
+            bars2 = ax2.bar(dia_plot.index, dia_plot, color=cols_d, alpha=0.8)
+            ax2.set_title('Retorno Acumulado por Día de la Semana (%)', color='white', fontsize=12)
+            ax2.tick_params(colors='#888780')
+            ax2.grid(True, axis='y', alpha=0.2)
             ax2.set_facecolor('#111111')
             for spine in ax2.spines.values(): spine.set_edgecolor('#333')
-
-            if 'corr_leverage' in df.columns and df['corr_leverage'].notna().any():
-                paso = 500
-                eje_x    = (df.index[::paso] if es_datetime_valido else np.arange(len(df))[::paso])
-                corr_vals = df['corr_leverage'].values[::paso]
-
-                ax2.fill_between(eje_x, corr_vals, where=(corr_vals >= 0),
-                                 color='#1D9E75', alpha=0.4, label='Corr. positiva', rasterized=True)
-                ax2.fill_between(eje_x, corr_vals, where=(corr_vals < 0),
-                                 color='#E24B4A', alpha=0.4, label='Corr. negativa', rasterized=True)
-                ax2.plot(eje_x, corr_vals, color='#888888', linewidth=0.4, alpha=0.6, rasterized=True)
-                ax2.axhline(0, color='white', linewidth=0.8, linestyle='--', alpha=0.5)
-                ax2.axhline(corr_media_historica, color='#185FA5', linewidth=1.2,
-                            linestyle='-', label=f'Media: {corr_media_historica:.4f}')
-                ax2.set_title('Correlación Retorno-Volatilidad (Leverage Effect)',
-                              color='white', fontsize=11)
-                ax2.set_ylabel('Correlación', color='#888780')
-                ax2.tick_params(colors='#888780')
-                ax2.grid(True, alpha=0.2, color='#444')
-                ax2.legend(facecolor='#222', labelcolor='white', fontsize=8)
-            else:
-                ax2.axis('off')
-                ax2.text(0.5, 0.5, "Datos de correlación no disponibles.",
-                         ha='center', va='center', color='#888780',
-                         fontsize=11, transform=ax2.transAxes)
+            for bar in bars2:
+                h = bar.get_height()
+                if h != 0:
+                    ax2.text(bar.get_x() + bar.get_width()/2, h,
+                             f'{h:.1f}%', ha='center',
+                             va='bottom' if h > 0 else 'top',
+                             color='white', fontsize=8)
         else:
             ax = fig.add_subplot(111)
             ax.axis('off')
             ax.set_facecolor('#111111')
             ax.text(0.5, 0.5,
-                    "Análisis intradía no disponible.\n\n"
-                    "El archivo no contiene temporalidad horaria.",
-                    ha='center', va='center', fontsize=12,
-                    color='#888780', transform=ax.transAxes)
-
-        pdf.savefig(fig, facecolor=fig.get_facecolor(), dpi=150)
+                    "Análisis de estacionalidad no disponible.\n\n"
+                    "El archivo está basado en TICKS (sin temporalidad de calendario fija),\n"
+                    "por lo que no es posible agrupar los retornos por mes o día de la semana.",
+                    ha='center', va='center', fontsize=12, color='#888780',
+                    transform=ax.transAxes)
+    
+        pdf.savefig(fig, facecolor=fig.get_facecolor())
         plt.close()
-        print("Generado página 7/9 — Volatilidad Intradía...")
-
-    except Exception as e:
-        print(f"ERROR EN PÁGINA 7: {e}")
-        plt.close()
-
-# endregion
-# region ── PÁGINA 8 — ATR Histórico ────────
-    try:
+        print(f"Generado página {PRIMERA_PAG_NO_METRICAS + 1}/{TOTAL_PAGINAS} — Análisis de Estacionalidad...")
+        
+    # endregion
+    # region ── PÁGINA 4 — Precio coloreado por régimen ER ────────
         fig = plt.figure(figsize=(11.69, 8.27))
-        fig.patch.set_facecolor('#0f0f0f')
-        gs = gridspec.GridSpec(4, 1, hspace=0.45, top=0.93, bottom=0.05, left=0.09, right=0.95)
-
-        step = 200
-        df_atr = df.iloc[::step]
-        eje_x_atr = df_atr.index if es_datetime_valido else np.arange(len(df_atr))
-
-        # ── GRÁFICO 1: ATR 14 en USD ──
-        ax1 = fig.add_subplot(gs[0])
-        ax1.set_facecolor('#111111')
-        ax1.fill_between(eje_x_atr, df_atr['atr14'].values, color='#3A86FF', alpha=0.25, rasterized=True)
-        ax1.plot(eje_x_atr, df_atr['atr14'].values, color='#3A86FF', linewidth=0.6, rasterized=True)
-        ax1.set_title(f"{CONFIG['nombre']} — ATR 14 Histórico (USD) + Precio", color='white', fontsize=10)
-        ax1.set_ylabel('ATR 14 (USD)', color='#888780')
-        ax1.tick_params(colors='#888780')
-        ax1.grid(True, alpha=0.2, color='#444')
-        for spine in ax1.spines.values(): spine.set_edgecolor('#333')
-        ax1_2 = ax1.twinx()
-        ax1_2.plot(eje_x_atr, df_atr['close'].values, color='white', linewidth=0.8, alpha=0.7, zorder=5, rasterized=True)
-        ax1_2.set_ylabel('Precio (USD)', color='#888780')
-        ax1_2.tick_params(colors='#888780')
-        for spine in ax1_2.spines.values(): spine.set_edgecolor('#333')
-
-        # ── GRÁFICO 2: ATR 14 Relativo % ──
-        ax2 = fig.add_subplot(gs[1])
-        ax2.set_facecolor('#111111')
-        ax2.fill_between(eje_x_atr, df_atr['atr14_pct'].values, color='#BA7517', alpha=0.2, rasterized=True)
-        ax2.plot(eje_x_atr, df_atr['atr14_pct'].values, color='#BA7517', linewidth=0.6, rasterized=True)
-        ax2.axhline(atr14_pct_media, color='#185FA5', linewidth=1.0, linestyle='--', label=f'Media: {atr14_pct_media:.2f}%')
-        ax2.axhline(atr14_p25 / df['close'].mean() * 100, color='#1D9E75', linewidth=0.8, linestyle=':', alpha=0.6, label='P25')
-        ax2.axhline(atr14_p75 / df['close'].mean() * 100, color='#E24B4A', linewidth=0.8, linestyle=':', alpha=0.6, label='P75')
-        ax2.set_title(f"{CONFIG['nombre']} — ATR 14 Relativo (%)", color='white', fontsize=10)
-        ax2.set_ylabel('ATR 14 (%)', color='#888780')
-        ax2.tick_params(colors='#888780')
-        ax2.grid(True, alpha=0.2, color='#444')
-        ax2.legend(facecolor='#222', labelcolor='white', fontsize=7)
-        for spine in ax2.spines.values(): spine.set_edgecolor('#333')
-
-        # ── GRÁFICO 3: Histograma de Distribución ATR ──
-        ax3 = fig.add_subplot(gs[2])
-        ax3.set_facecolor('#111111')
-        atr_vals = df['atr14'].dropna().values
-        n, bins, patches = ax3.hist(atr_vals, bins=80, color='#185FA5', alpha=0.7, rasterized=True)
-        p10 = float(np.percentile(atr_vals, 10))
-        p50 = float(np.percentile(atr_vals, 50))
-        p90 = float(np.percentile(atr_vals, 90))
-        for val, color, lbl in [(p10, '#1D9E75', f'P10: ${p10:.0f}'),
-                                (p50, '#BA7517', f'P50: ${p50:.0f}'),
-                                (p90, '#E24B4A', f'P90: ${p90:.0f}')]:
-            ax3.axvline(val, color=color, linewidth=1.2, linestyle='--', alpha=0.8)
-            ax3.text(val, ax3.get_ylim()[1] * 0.85, lbl, color=color, fontsize=7,
-                     ha='center', fontweight='bold',
-                     bbox=dict(facecolor='black', alpha=0.7, edgecolor='none', pad=1))
-        ax3.axvline(atr14_actual, color='white', linewidth=1.5, linestyle='-', label=f'Actual: ${atr14_actual:.0f}')
-        ax3.set_title(f"{CONFIG['nombre']} — Distribución del ATR 14", color='white', fontsize=10)
-        ax3.set_xlabel('ATR 14 (USD)', color='#888780')
-        ax3.set_ylabel('Frecuencia', color='#888780')
-        ax3.tick_params(colors='#888780')
-        ax3.grid(True, alpha=0.2, color='#444')
-        ax3.legend(facecolor='#222', labelcolor='white', fontsize=7)
-        for spine in ax3.spines.values(): spine.set_edgecolor('#333')
-
-        # ── GRÁFICO 4: ATR 14 medio por hora ──
-        atr_por_hora = df.groupby('hora_utc')['atr14'].mean()
-        atr_por_hora = atr_por_hora.reindex(range(24), fill_value=0)
-        media_atr_hora = atr_por_hora.mean()
-        cols_a = ['#1D9E75' if v >= media_atr_hora else '#E24B4A' for v in atr_por_hora.values]
-
-        ax4 = fig.add_subplot(gs[3])
-        ax4.set_facecolor('#111111')
-        ax4.bar(atr_por_hora.index, atr_por_hora.values, color=cols_a, alpha=0.8)
-        ax4.axhline(media_atr_hora, color='#185FA5', linewidth=1.0, linestyle='--', label=f'Media: ${media_atr_hora:.2f}')
-        ax4.set_title(f"{CONFIG['nombre']} — ATR 14 Medio por Hora UTC", color='white', fontsize=10)
-        ax4.set_xlabel('Hora UTC', color='#888780')
-        ax4.set_ylabel('ATR 14 medio (USD)', color='#888780')
-        ax4.tick_params(colors='#888780')
-        ax4.set_xticks(range(0, 24))
-        ax4.grid(True, alpha=0.2, color='#444')
-        for hora, nombre, color in [(0, 'Asia', '#888888'), (8, 'Londres', '#BA7517'), (14, 'NY', '#1D9E75')]:
-            ax4.axvline(hora, color=color, linewidth=1, linestyle=':', alpha=0.7, label=nombre)
-        ax4.legend(facecolor='#222', labelcolor='white', fontsize=7)
-        for spine in ax4.spines.values(): spine.set_edgecolor('#333')
-
+        fig.patch.set_facecolor('#0d1117')
+        gs  = gridspec.GridSpec(2, 1, hspace=0.4, height_ratios=[3, 1])
+    
+        # --- MUESTREO PARA VISUALIZACIÓN ---
+        step = 500
+        df_sub = df.iloc[::step]
+    
+        # Umbrales fijos
+        UMBRAL_TEND = 0.5
+        UMBRAL_RUID = 0.3
+    
+        def color_regimen_dinamico(er_val):
+            if er_val > UMBRAL_TEND:   return '#00d4aa'
+            elif er_val > UMBRAL_RUID: return '#8b949e'
+            else:                      return '#f85149'
+    
+        ax4 = fig.add_subplot(gs[0])
+        ax4.set_facecolor('#0d1117')
+        ax4.set_title(f"{CONFIG['activo']} — Precio coloreado por Regimen ER ({CONFIG['tf']})", color='#e6edf3', fontsize=11)
+        ax4.set_ylabel('Precio', color='#8b949e')
+        ax4.set_xlabel('Tiempo' if es_datetime_valido else 'Nº de vela (TICKS)', color='#8b949e')
+        ax4.tick_params(colors='#8b949e')
+        ax4.grid(True, alpha=0.12, color='#30363d')
+        for spine in ax4.spines.values(): spine.set_edgecolor('#21262d')
+    
+        eje_x_num = df_sub.index.astype(np.int64) if es_datetime_valido else np.arange(len(df_sub))
+        points = np.array([eje_x_num, df_sub['close'].values]).T.reshape(-1, 1, 2)
+        segments = np.concatenate([points[:-1], points[1:]], axis=1)
+        colors = [color_regimen_dinamico(er) for er in df_sub['ER'].values]
+        
+        lc = LineCollection(segments, colors=colors, linewidth=0.6, alpha=0.9, rasterized=True)
+        ax4.add_collection(lc)
+        ax4.autoscale()
+    
+        legend_elements = [
+            Line2D([0], [0], color='#00d4aa', linewidth=2, label=f'Tendencia (ER>0.50)'),
+            Line2D([0], [0], color='#8b949e', linewidth=2, label=f'Transicion (0.30-0.50)'),
+            Line2D([0], [0], color='#f85149', linewidth=2, label=f'Ruido (ER<0.30)'),
+        ]
+        ax4.legend(handles=legend_elements, facecolor='#161b22', labelcolor='#e6edf3', fontsize=8, loc='upper right')
+    
+        ax5 = fig.add_subplot(gs[1])
+        ax5.set_title("Histórico ER Acumulado", color='#e6edf3', fontsize=10, pad=10)
+        
+        x_plot = df.index[::step] if es_datetime_valido else np.arange(len(df))[::step]
+        er_plot = df['ER'].values[::step]
+        
+        ax5.fill_between(x_plot, er_plot, color='#d29922', alpha=0.15, linewidth=0, rasterized=True)
+        ax5.plot(x_plot, er_plot, color='#d29922', linewidth=0.3, alpha=0.5, rasterized=True)
+    
+        er_suavizado = df['ER'].rolling(200).mean()
+        ax5.plot(x_plot, er_suavizado[::step], color='#e6edf3', linewidth=1.0, label='Tendencia (SMA 200)', rasterized=True)
+        
+        media_er = df['ER'].mean()
+        er_std   = df['ER'].std()
+        ax5.axhline(0.5,     color='#00d4aa', linewidth=0.8, linestyle='--', label='Direccionalidad (0.5)')
+        ax5.axhline(0.3,     color='#f85149', linewidth=0.8, linestyle='--', label='Alto Ruido (0.3)')
+        ax5.axhline(media_er,               color='#58a6ff', linewidth=1.0, linestyle='-',  alpha=0.7, label=f'Media ({media_er:.2f})')
+        ax5.axhline(media_er + er_std,      color='#58a6ff', linewidth=0.7, linestyle=':',  alpha=0.7, label=f'+1σ ({media_er+er_std:.2f})')
+        ax5.axhline(media_er - er_std,      color='#58a6ff', linewidth=0.7, linestyle=':',  alpha=0.7, label=f'-1σ ({media_er-er_std:.2f})')
+    
+        ax5.set_facecolor('#0d1117')
+        ax5.set_ylabel('ER', color='#8b949e')
+        ax5.set_ylim(0, 1)
+        ax5.tick_params(colors='#8b949e')
+        ax5.grid(True, alpha=0.12, color='#30363d')
+        ax5.legend(loc='upper right', facecolor='#161b22', labelcolor='#e6edf3', fontsize=7, ncol=2)
+    
+        for spine in ax5.spines.values(): spine.set_edgecolor('#21262d')
+    
         pdf.savefig(fig, facecolor=fig.get_facecolor(), dpi=150)
         plt.close()
-        print("Generado página 8/9 — ATR Histórico...")
-    except Exception as e:
-        print(f"ERROR EN PÁGINA 8: {e}")
-        plt.close()
+        print(f"Generado página {PRIMERA_PAG_NO_METRICAS + 2}/{TOTAL_PAGINAS} — Precio por régimen ER...")
+    
+    # endregion
+    # region ── PÁGINA 5 — Riesgo Diario/Anual + QQ-Plot ────────
+        try:
+            fig = plt.figure(figsize=(11.69, 8.27))
+            fig.patch.set_facecolor('#0f0f0f')
+            gs = gridspec.GridSpec(3, 1, height_ratios=[1, 1, 0.8], hspace=0.45)
+    
+            sigmas = [1, 2, 3]
+            colores_sigmas = ['#1D9E75', '#BA7517', '#E24B4A']
+    
+            def dibujar_campana_p5(ax, media, std, titulo, es_anual=False):
+                ax.set_facecolor('#111111')
+                x = np.linspace(media - 4*std, media + 4*std, 200)
+                y = stats.norm.pdf(x, media, std)
+                ax.plot(x, y, color='#185FA5', linewidth=1.8, label='Distribución Proyectada', rasterized=True)
+    
+                ax.axvline(media, color='white', linestyle='--', linewidth=1, alpha=0.5)
+                ax.text(media, -max(y) * 0.06, f"μ: {media:.2%}", color='white', fontsize=6.5,
+                        ha='center', fontweight='bold', bbox=dict(facecolor='black', alpha=0.8, edgecolor='none', pad=1))
+    
+                for s in sigmas:
+                    ax.fill_between(x, y, where=(x >= media-s*std) & (x <= media+s*std),
+                                    color=colores_sigmas[s-1], alpha=0.12, rasterized=True)
+                    for lado in [-1, 1]:
+                        val = media + (lado * s * std)
+                        ax.axvline(val, color=colores_sigmas[s-1], linestyle=':', alpha=0.4)
+                        
+                        if not es_anual:
+                            prob = np.mean(r_diario_real <= val) if lado == -1 else np.mean(r_diario_real >= val)
+                            txt = f"1 c/{1/prob:.1f}d" if prob > 0 else "No reg."
+                        else:
+                            factor = 365 if CONFIG['activo'] == 'CRYPTO' else 252
+                            umbral = val / np.sqrt(factor)
+                            prob = np.mean(r_diario_real <= umbral) if lado == -1 else np.mean(r_diario_real >= umbral)
+                            txt = f"1 c/{(1/prob)/factor:.1f}añ" if prob > 0 else "No reg."
+                        
+                        etiqueta = f"{lado*s}σ: {val:.2%}\n({txt})"
+                        ax.text(val, -max(y) * (0.05 if s % 2 != 0 else 0.14), etiqueta,
+                                color=colores_sigmas[s-1], fontsize=5.5, ha='center', fontweight='bold',
+                                bbox=dict(facecolor='black', alpha=0.8, edgecolor='none', pad=0.5))
+    
+                ax.set_ylim(-max(y)*0.24, max(y)*1.15)
+                ax.set_title(titulo, color='white', fontsize=10, pad=6)
+                ax.tick_params(colors='#888780', labelsize=6)
+                ax.grid(True, alpha=0.03)
+                ax.legend(facecolor='#222', labelcolor='white', fontsize=6, loc='upper right')
+                for spine in ax.spines.values(): spine.set_edgecolor('#333')
+    
+            ax1 = fig.add_subplot(gs[0])
+            dibujar_campana_p5(ax1, ret_diario, vol_diaria, "Retorno Diario (Proyección)", es_anual=False)
+    
+            ax2 = fig.add_subplot(gs[1])
+            dibujar_campana_p5(ax2, ret_anual, vol_anual, "Retorno Anual (Proyección)", es_anual=True)
+    
+            ax3 = fig.add_subplot(gs[2])
+            ax3.set_facecolor('#111111')
+            (osm, osr), (slope, intercept, r_sq) = stats.probplot(r_clean, dist="norm")
+            ax3.scatter(osm, osr, color='#58a6ff', s=8, alpha=0.4, rasterized=True)
+            ax3.plot(osm, slope * osm + intercept, color='#E24B4A', linewidth=1.2, linestyle='--')
+            ax3.set_title(f"QQ-Plot: Retornos {CONFIG['tf']} vs Normal", color='white', fontsize=10, pad=6)
+            ax3.set_xlabel('Cuantiles teóricos', color='#888780', fontsize=7)
+            ax3.set_ylabel('Cuantiles observados', color='#888780', fontsize=7)
+            ax3.tick_params(colors='#888780', labelsize=6)
+            ax3.grid(True, alpha=0.15, color='#444')
+            for spine in ax3.spines.values(): spine.set_edgecolor('#333')
+            ax3.text(0.98, 0.05, f"R² ajuste: {r_sq:.4f}", transform=ax3.transAxes, ha='right', va='bottom',
+                     fontsize=7, color='#888780', fontweight='bold')
+    
+            pdf.savefig(fig, facecolor=fig.get_facecolor(), dpi=150)
+            plt.close()
+            print(f"Generado página {PRIMERA_PAG_NO_METRICAS + 3}/{TOTAL_PAGINAS} — Riesgo Diario/Anual + QQ-Plot...")
+        except Exception as e:
+            print(f"ERROR EN PÁGINA 5: {e}")
+            plt.close()
+    
+    # endregion
+    # region ── PÁGINA 6 — Riesgo Intradiario + Rolling VaR ────────
+        try:
+            fig = plt.figure(figsize=(11.69, 8.27))
+            fig.patch.set_facecolor('#0f0f0f')
+            gs = gridspec.GridSpec(3, 1, height_ratios=[1, 1, 0.8], hspace=0.45)
+    
+            sigmas = [1, 2, 3]
+            colores_sigmas = ['#1D9E75', '#BA7517', '#E24B4A']
+            jb_stat_p6, jb_p_val_p6 = stats.jarque_bera(r)
+            es_normal_p6 = jb_p_val_p6 > 0.05
+    
+            def dibujar_campana_micro(ax, media, std, titulo, tipo_grafico='tf_puro'):
+                ax.set_facecolor('#111111')
+                x = np.linspace(media - 4*std, media + 4*std, 200)
+                y = stats.norm.pdf(x, media, std)
+                ax.plot(x, y, color='#185FA5', linewidth=1.8, label='Distribución Proyectada', rasterized=True)
+    
+                if tipo_grafico == 'tf_puro':
+                    for s in sigmas:
+                        ax.fill_between(x, y, where=(x >= media-s*std) & (x <= media+s*std),
+                                        color=colores_sigmas[s-1], alpha=0.12, rasterized=True)
+                        for lado in [-1, 1]:
+                            val = media + (lado * s * std)
+                            ax.axvline(val, color=colores_sigmas[s-1], linestyle=':', alpha=0.4)
+                            prob_evento = np.mean(r <= val) if lado == -1 else np.mean(r >= val)
+                            texto_frecuencia = f"1 c/{1/prob_evento:.1f}vel" if prob_evento > 0 else "No reg."
+                            etiqueta = f"{lado*s}σ: {val:.2%}\n({texto_frecuencia})"
+                            ax.text(val, -max(y) * (0.05 if s % 2 != 0 else 0.14), etiqueta,
+                                    color=colores_sigmas[s-1], fontsize=5.5, ha='center', fontweight='bold',
+                                    bbox=dict(facecolor='black', alpha=0.8, edgecolor='none', pad=0.5))
+                else:
+                    niveles_var  = [0.95, 0.99]
+                    colores_var  = ['#BA7517', '#E24B4A']
+                    z_scores_var = [1.645, 2.326]
+                    for idx, (conf, z) in enumerate(zip(niveles_var, z_scores_var)):
+                        val_var = media - (z * std) if es_normal_p6 else np.percentile(r, (1-conf)*100)
+                        ax.fill_between(x, y, where=(x <= val_var), color=colores_var[idx], alpha=0.18, rasterized=True)
+                        ax.axvline(val_var, color=colores_var[idx], linestyle='-', linewidth=1.3, alpha=0.6)
+                        prob_evento = np.mean(r <= val_var)
+                        texto_frecuencia = f"1 c/{1/prob_evento:.1f}vel" if prob_evento > 0 else "No reg."
+                        etiqueta = f"VaR ({int(conf*100)}%): {val_var:.2%}\n({texto_frecuencia})"
+                        ax.text(val_var, -max(y) * (0.06 if idx == 0 else 0.16), etiqueta,
+                                color=colores_var[idx], fontsize=5.5, ha='center', fontweight='bold',
+                                bbox=dict(facecolor='black', alpha=0.8, edgecolor='none', pad=0.5))
+    
+                ax.axvline(media, color='white', linestyle='--', linewidth=1, alpha=0.4)
+                ax.set_ylim(-max(y)*0.24, max(y)*1.15)
+                ax.set_title(titulo, color='white', fontsize=10, pad=6)
+                ax.tick_params(colors='#888780', labelsize=6)
+                ax.grid(True, alpha=0.03)
+                ax.legend(facecolor='#222', labelcolor='white', fontsize=6, loc='upper right')
+                for spine in ax.spines.values(): spine.set_edgecolor('#333')
+    
+            ax1 = fig.add_subplot(gs[0])
+            dibujar_campana_micro(ax1, r.mean(), r.std(),
+                                  f"Retorno por Vela {CONFIG['tf']}", tipo_grafico='tf_puro')
+    
+            ax2 = fig.add_subplot(gs[1])
+            dibujar_campana_micro(ax2, r.mean(), r.std(),
+                                  f"VaR {'Paramétrico' if es_normal_p6 else 'Histórico'} ({CONFIG['tf']})",
+                                  tipo_grafico='var')
+    
+            ax3 = fig.add_subplot(gs[2])
+            ax3.set_facecolor('#111111')
+            rolling_window = max(20, int(velas_por_dia * 20)) if velas_por_dia is not None else 100
+            if len(r) > rolling_window * 2:
+                r_var95 = r.rolling(window=rolling_window).quantile(0.05)
+                r_var99 = r.rolling(window=rolling_window).quantile(0.01)
+                paso_rolling = max(1, len(r_var95) // 2000)
+                idx_r = r_var95.index[::paso_rolling] if es_datetime_valido else np.arange(len(r_var95))[::paso_rolling]
+                ax3.plot(idx_r, r_var95.iloc[::paso_rolling] * 100,
+                         color='#BA7517', linewidth=0.6, label=f'VaR 95% ({rolling_window}v)', rasterized=True)
+                ax3.plot(idx_r, r_var99.iloc[::paso_rolling] * 100,
+                         color='#E24B4A', linewidth=0.6, label=f'VaR 99% ({rolling_window}v)', rasterized=True)
+                ax3.axhline(np.percentile(r, 5) * 100, color='#BA7517', linewidth=0.8, linestyle='--', alpha=0.5)
+                ax3.axhline(np.percentile(r, 1) * 100, color='#E24B4A', linewidth=0.8, linestyle='--', alpha=0.5)
+                ax3.fill_between(idx_r, r_var95.iloc[::paso_rolling] * 100, alpha=0.08, color='#BA7517')
+                ax3.set_title(f"Rolling VaR (ventana {rolling_window} velas)", color='white', fontsize=10, pad=6)
+            else:
+                ax3.text(0.5, 0.5, "Datos insuficientes para Rolling VaR",
+                         ha='center', va='center', fontsize=10, color='#888780', transform=ax3.transAxes)
+            ax3.set_xlabel('Tiempo' if es_datetime_valido else 'Nº de vela', color='#888780', fontsize=7)
+            ax3.set_ylabel('Pérdida %', color='#888780', fontsize=7)
+            ax3.tick_params(colors='#888780', labelsize=6)
+            ax3.grid(True, alpha=0.15, color='#444')
+            ax3.legend(facecolor='#222', labelcolor='white', fontsize=6, loc='lower left')
+            for spine in ax3.spines.values(): spine.set_edgecolor('#333')
+    
+            pdf.savefig(fig, facecolor=fig.get_facecolor(), dpi=150)
+            plt.close()
+            print(f"Generado página {PRIMERA_PAG_NO_METRICAS + 4}/{TOTAL_PAGINAS} — Riesgo Intradiario + Rolling VaR...")
+    
+        except Exception as e:
+            print(f"ERROR EN PÁGINA 6: {e}")
+            plt.close()
+    
+    # endregion
+    # region ── PÁGINA 7 — Boxplot + Retorno Esperado por Hora ──────────────────
+        if 'vol_por_hora' not in locals():
+            vol_por_hora = pd.Series(dtype=float)
+        tiene_datos_hora = len(vol_por_hora) > 0
+    
+        try:
+            fig = plt.figure(figsize=(11.69, 8.27))
+            fig.patch.set_facecolor('#0f0f0f')
+    
+            if tiene_datos_hora:
+                gs = gridspec.GridSpec(2, 1, hspace=0.40, height_ratios=[1.5, 1])
+    
+                # ── (0) Boxplot: Desviación Estándar por Hora ──
+                ax1 = fig.add_subplot(gs[0])
+                ax1.set_facecolor('#111111')
+                for spine in ax1.spines.values(): spine.set_edgecolor('#333')
+    
+                hourly_vol = df.groupby([pd.Grouper(freq='W-MON'), 'hora_utc'])['retorno'].std().dropna() * 100
+    
+                bxp_stats = []
+                hourly_means = []
+                hourly_n = []
+                for h in range(24):
+                    try:
+                        vals = hourly_vol.xs(h, level='hora_utc').values
+                    except KeyError:
+                        vals = np.array([])
+                    n = len(vals)
+                    hourly_n.append(n)
+                    if n > 0:
+                        q1, q2, q3 = np.percentile(vals, [25, 50, 75])
+                        iqr = q3 - q1
+                        umbral_iqr = 3.0 if n > 500 else 1.5
+                        lower, upper = q1 - umbral_iqr*iqr, q3 + umbral_iqr*iqr
+                        whislo = np.min(vals[vals >= lower])
+                        whishi = np.max(vals[vals <= upper])
+                        if n > 1000:
+                            fliers = np.array([])
+                        else:
+                            fliers = vals[(vals < whislo) | (vals > whishi)]
+                            if len(fliers) > 30:
+                                fliers = np.random.choice(fliers, 30, replace=False)
+                        mean_val = np.mean(vals)
+                    else:
+                        q1 = q2 = q3 = whislo = whishi = mean_val = 0.0
+                        fliers = np.array([])
+                    hourly_means.append(mean_val)
+                    bxp_stats.append({'med': q2, 'q1': q1, 'q3': q3,
+                                      'whislo': whislo, 'whishi': whishi,
+                                      'fliers': fliers, 'mean': mean_val, 'n': n})
+    
+                bp = ax1.bxp(bxp_stats, positions=range(24), widths=0.6,
+                             patch_artist=True,
+                             boxprops=dict(facecolor='#185FA5', alpha=0.6, edgecolor='#4A8BC2', linewidth=0.8),
+                             whiskerprops=dict(color='#4A8BC2', linewidth=0.8),
+                             capprops=dict(color='#4A8BC2', linewidth=0.8),
+                             medianprops=dict(color='#E24B4A', linewidth=1.5),
+                             flierprops=dict(marker='o', markerfacecolor='#E24B4A', markersize=3, alpha=0.4))
+    
+                for i, mv in enumerate(hourly_means):
+                    ax1.plot(i, mv, 'D', color='#E24B4A', markersize=5, zorder=5, alpha=0.9)
+    
+                total_avg_vol = hourly_vol.mean()
+                ax1.axhline(total_avg_vol, color='#BA7517', linewidth=1.2, linestyle='--',
+                            alpha=0.8, label=f'Vol. media total: {total_avg_vol:.4f}%')
+                ax1.plot(0, total_avg_vol, '>', color='#BA7517',
+                         transform=ax1.get_yaxis_transform(), markersize=6, clip_on=False)
+    
+                y_top = ax1.get_ylim()[1]
+                for hora, nombre, color in [(0, 'Tokio', '#E24B4A'), (8, 'Londres', '#58a6ff'), (13, 'NY', '#d29922')]:
+                    ax1.axvline(hora, color=color, linewidth=1, linestyle=':', alpha=0.5)
+                    ax1.text(hora + 0.3, y_top * 0.97, nombre, fontsize=6, color=color,
+                             ha='left', va='top', alpha=0.8)
+    
+                ax1.set_title(f"{CONFIG['nombre']} — Desviación Estándar de Retornos por Hora UTC ({CONFIG['tf']})",
+                              color='white', fontsize=11)
+                ax1.set_xlabel('Hora UTC', color='#888780')
+                ax1.set_ylabel('Desv. Est. 1h (%)', color='#888780')
+                ax1.tick_params(colors='#888780')
+                ax1.set_xticks(range(0, 24))
+                ax1.set_xticklabels(range(24), fontsize=8)
+                n_approx = int(round(np.mean(hourly_n), -2))
+                ax1.text(0.01, 0.01, f'N ≈ {n_approx:,} por hora',
+                         transform=ax1.transAxes, ha='left', va='bottom',
+                         fontsize=9, color='#888780')
+                ax1.grid(True, alpha=0.2, color='#444')
+                legend_elements = [
+                    Line2D([0], [0], color='#E24B4A', linewidth=1.5, label='Mediana'),
+                    Line2D([0], [0], marker='D', color='w', markerfacecolor='#E24B4A', markersize=5, label='Media'),
+                    Line2D([0], [0], color='#BA7517', linewidth=1.2, linestyle='--', label=f'Vol. media total: {total_avg_vol:.4f}%'),
+                ]
+                ax1.legend(handles=legend_elements, facecolor='#222', labelcolor='white', fontsize=8, loc='upper right')
+    
+                # ── (1) Perfil Horario de Retorno Esperado ──
+                ax2 = fig.add_subplot(gs[1])
+                ax2.set_facecolor('#111111')
+                ret_por_hora = df.groupby('hora_utc')['retorno'].mean() * 100
+                vals = ret_por_hora.reindex(range(24), fill_value=0).values
+                cols = ['#1D9E75' if v >= 0 else '#E24B4A' for v in vals]
+                ax2.bar(range(24), vals, color=cols, alpha=0.7, width=0.8)
+                ax2.axhline(0, color='#888780', linewidth=0.5, linestyle='--')
+                ax2.set_title(f"{CONFIG['nombre']} — Retorno Esperado por Hora (%)",
+                              color='white', fontsize=11, pad=6)
+                ax2.set_xlabel('Hora UTC', color='#888780', fontsize=8)
+                ax2.set_ylabel('Retorno %', color='#888780', fontsize=8)
+                ax2.set_xticks(range(24))
+                ax2.set_xticklabels([str(h) for h in range(24)], fontsize=6.5)
+                ax2.tick_params(colors='#888780', labelsize=7)
+                ax2.set_xlim(-0.5, 23.5)
+                ax2.grid(True, axis='y', alpha=0.15, color='#444')
+                y_top = ax2.get_ylim()[1]
+                for hora, nombre, color in [(0, 'Tokio', '#E24B4A'), (8, 'Londres', '#58a6ff'), (13, 'NY', '#d29922')]:
+                    ax2.axvline(hora, color=color, linewidth=0.8, linestyle='--', alpha=0.6)
+                    ax2.text(hora + 0.3, y_top * 0.95, nombre, fontsize=6, color=color,
+                             ha='left', va='top', alpha=0.8)
+                for h in range(24):
+                    if abs(vals[h]) > 0.001:
+                        ax2.text(h, vals[h], f'{vals[h]:.3f}', ha='center',
+                                 va='bottom' if vals[h] > 0 else 'top', fontsize=6, color='white')
+                for spine in ax2.spines.values(): spine.set_edgecolor('#333')
+    
+            else:
+                ax = fig.add_subplot(111)
+                ax.axis('off')
+                ax.set_facecolor('#111111')
+                ax.text(0.5, 0.5,
+                        "Análisis intradía no disponible.\n\n"
+                        "Timeframe diario (1d): todas las velas tienen marca\n"
+                        "de tiempo a las 00:00 UTC, no hay distribución horaria.",
+                        ha='center', va='center', fontsize=12,
+                        color='#888780', transform=ax.transAxes)
+    
+            pdf.savefig(fig, facecolor=fig.get_facecolor(), dpi=150)
+            plt.close()
+            print(f"Generado página {PRIMERA_PAG_NO_METRICAS + 5}/{TOTAL_PAGINAS} — Boxplot + Retorno Esperado por Hora...")
+    
+        except Exception as e:
+            print(f"ERROR EN PÁGINA 7: {e}")
+            plt.close()
+    
+    # endregion
+    # region ── PÁGINA 8 — Matriz de Correlación Intra-diaria 24×24 ────────────
+        try:
+            fig = plt.figure(figsize=(11.69, 8.27))
+            fig.patch.set_facecolor('#0f0f0f')
+            tiene_corr = 'corr_24' in locals() and not corr_24.empty and corr_24.shape == (24, 24)
+    
+            if tiene_corr:
+                ax = fig.add_subplot(111)
+                ax.set_facecolor('#111111')
+                mask = np.zeros_like(corr_24, dtype=bool)
+                mask[np.triu_indices_from(mask, k=1)] = True
+                sns.heatmap(corr_24, mask=mask, annot=False, cmap='coolwarm',
+                            center=0, vmin=-1, vmax=1, square=True, ax=ax,
+                            linewidths=0.3, linecolor='#333',
+                            cbar_kws={'label': 'Correlación de Pearson', 'shrink': 0.8})
+                for i in range(corr_24.shape[0]):
+                    for j in range(corr_24.shape[1]):
+                        if mask[i, j]:
+                            continue
+                        val = corr_24.iloc[i, j]
+                        color = 'white' if abs(val) >= 0.5 else '#000'
+                        ax.text(j + 0.5, i + 0.5, f'{val:.2f}',
+                                ha='center', va='center', fontsize=4.5, color=color,
+                                fontweight='bold' if abs(val) >= 0.5 else 'normal')
+                ax.set_title(f"{CONFIG['nombre']} — Matriz de Correlación Intra-diaria (Spearman, {CONFIG['tf']})",
+                             color='white', fontsize=12, pad=15)
+                ax.set_xlabel('Hora UTC', color='#888780')
+                ax.set_ylabel('Hora UTC', color='#888780')
+                ax.tick_params(colors='#888780', labelsize=8)
+                for spine in ax.spines.values(): spine.set_edgecolor('#333')
+                cbar = ax.collections[0].colorbar
+                cbar.ax.yaxis.label.set_color('#888780')
+                cbar.ax.tick_params(colors='#888780')
+                vmin, vmax = cbar.mappable.get_clim()
+                cbar.set_ticks([vmin, (vmin+vmax)/2, vmax])
+                cbar.ax.yaxis.set_major_formatter(mticker.FormatStrFormatter('%.2f'))
+            else:
+                ax = fig.add_subplot(111)
+                ax.axis('off')
+                ax.set_facecolor('#111111')
+                ax.text(0.5, 0.5, "Matriz de correlación intra-diaria no disponible.",
+                        ha='center', va='center', fontsize=12, color='#888780', transform=ax.transAxes)
+    
+            pdf.savefig(fig, facecolor=fig.get_facecolor(), dpi=150)
+            plt.close()
+            print(f"Generado página {PRIMERA_PAG_NO_METRICAS + 6}/{TOTAL_PAGINAS} — Matriz de Correlación Intra-diaria 24×24...")
+    
+        except Exception as e:
+            print(f"ERROR EN PÁGINA 8: {e}")
+            plt.close()
+    
+    # endregion
+    # region ── PÁGINA 9 — Heatmaps Semanal + Mensual ──
+        try:
+            fig = plt.figure(figsize=(11.69, 8.27))
+            fig.patch.set_facecolor('#0f0f0f')
+    
+            tiene_week = 'pivot_week' in locals() and not pivot_week.empty and pivot_week.shape[0] >= 3
+            tiene_mes  = 'pivot_month' in locals() and not pivot_month.empty and pivot_month.shape[0] >= 3
+    
+            if tiene_week or tiene_mes:
+                gs = gridspec.GridSpec(2, 1, hspace=0.40, height_ratios=[1, 1])
+    
+                # ── (0) Heatmap Semanal ──
+                ax1 = fig.add_subplot(gs[0])
+                ax1.set_facecolor('#111111')
+                if tiene_week:
+                    dias_labels = ['Lun', 'Mar', 'Mié', 'Jue', 'Vie', 'Sáb', 'Dom']
+                    pw = pivot_week.copy()
+                    pw.index = dias_labels[:len(pw)]
+                    sns.heatmap(pw, annot=False, cmap='YlOrRd', ax=ax1,
+                                linewidths=0.5, linecolor='#333', square=False,
+                                cbar_kws={'label': 'Volatilidad (%)', 'shrink': 0.8})
+                    for i in range(pw.shape[0]):
+                        for j in range(pw.shape[1]):
+                            val = pw.iloc[i, j]
+                            ax1.text(j + 0.5, i + 0.5, f'{val:.3f}',
+                                    ha='center', va='center', fontsize=5.5,
+                                    color='#000', fontweight='bold')
+                    ax1.set_title(f"{CONFIG['nombre']} — Estacionalidad Semanal: Volatilidad por Hora y Día ({CONFIG['tf']})",
+                                  color='white', fontsize=12, pad=15)
+                    ax1.set_xlabel('Hora UTC', color='#888780')
+                    ax1.set_ylabel('Día de la semana', color='#888780')
+                    ax1.tick_params(colors='#888780', labelsize=9)
+                    cbar1 = ax1.collections[0].colorbar
+                    cbar1.ax.yaxis.label.set_color('#888780')
+                    cbar1.ax.tick_params(colors='#888780')
+                    vmin1, vmax1 = cbar1.mappable.get_clim()
+                    cbar1.set_ticks([vmin1, (vmin1+vmax1)/2, vmax1])
+                    cbar1.ax.yaxis.set_major_formatter(mticker.FormatStrFormatter('%.2f'))
+                else:
+                    ax1.text(0.5, 0.5, "No disponible", ha='center', va='center', fontsize=11, color='#888780', transform=ax1.transAxes)
+                for spine in ax1.spines.values(): spine.set_edgecolor('#333')
+    
+                # ── (1) Heatmap Mensual ──
+                ax2 = fig.add_subplot(gs[1])
+                ax2.set_facecolor('#111111')
+                if tiene_mes:
+                    mes_labels = ['Ene','Feb','Mar','Abr','May','Jun',
+                                  'Jul','Ago','Sep','Oct','Nov','Dic']
+                    pm = pivot_month.copy()
+                    pm.index = mes_labels[:len(pm)]
+                    sns.heatmap(pm, annot=False, cmap='YlOrRd', ax=ax2,
+                                linewidths=0.5, linecolor='#333', square=False,
+                                cbar_kws={'label': 'Volatilidad (%)', 'shrink': 0.8})
+                    for i in range(pm.shape[0]):
+                        for j in range(pm.shape[1]):
+                            val = pm.iloc[i, j]
+                            ax2.text(j + 0.5, i + 0.5, f'{val:.3f}',
+                                    ha='center', va='center', fontsize=5.5,
+                                    color='#000', fontweight='bold')
+                    ax2.set_title(f"{CONFIG['nombre']} — Estacionalidad Mensual: Volatilidad por Hora y Mes ({CONFIG['tf']})",
+                                  color='white', fontsize=12, pad=15)
+                    ax2.set_xlabel('Hora UTC', color='#888780')
+                    ax2.set_ylabel('Mes', color='#888780')
+                    ax2.tick_params(colors='#888780', labelsize=9)
+                    cbar2 = ax2.collections[0].colorbar
+                    cbar2.ax.yaxis.label.set_color('#888780')
+                    cbar2.ax.tick_params(colors='#888780')
+                    vmin2, vmax2 = cbar2.mappable.get_clim()
+                    cbar2.set_ticks([vmin2, (vmin2+vmax2)/2, vmax2])
+                    cbar2.ax.yaxis.set_major_formatter(mticker.FormatStrFormatter('%.2f'))
+                else:
+                    ax2.text(0.5, 0.5, "No disponible", ha='center', va='center', fontsize=11, color='#888780', transform=ax2.transAxes)
+                for spine in ax2.spines.values(): spine.set_edgecolor('#333')
+    
+            else:
+                ax = fig.add_subplot(111)
+                ax.axis('off')
+                ax.set_facecolor('#111111')
+                ax.text(0.5, 0.5, "Heatmaps no disponibles.\nTF diario o sin datos horarios.",
+                        ha='center', va='center', fontsize=12, color='#888780', transform=ax.transAxes)
+    
+            pdf.savefig(fig, facecolor=fig.get_facecolor(), dpi=150)
+            plt.close()
+            print(f"Generado página {PRIMERA_PAG_NO_METRICAS + 7}/{TOTAL_PAGINAS} — Heatmaps Semanal + Mensual...")
+    
+        except Exception as e:
+            print(f"ERROR EN PÁGINA 9: {e}")
+            plt.close()
+    
+    # endregion
+    # region ── PÁGINA 10 — Correlograma (ACF/PACF) ────────
+        fig = plt.figure(figsize=(11.69, 8.27))
+        gs = gridspec.GridSpec(3, 3, height_ratios=[1, 1, 1])
+    
+        # 1. Heatmap (top-left)
+        ax1 = fig.add_subplot(gs[0, 0])
+        data = {p: _pacf1(stats) for p, stats in stats_temporales.items() if 'pacf_vals' in stats}
+        df_heat = pd.DataFrame(data, index=['PACF Lag 1']).T
+        sns.heatmap(df_heat, annot=True, cmap='coolwarm', center=0, vmin=-0.5, vmax=0.5, ax=ax1)
+        ax1.set_title("Mapa de Calor: Dependencia por Escala")
+    
+        # 2. Correlograma (top-center and top-right)
+        ax2 = fig.add_subplot(gs[0, 1])
+        plot_acf(series_temporales['dia'], ax=ax2, lags=15, title='ACF Diario')
+        ax3 = fig.add_subplot(gs[0, 2])
+        plot_pacf(series_temporales['dia'], ax=ax3, lags=15, title='PACF Diario')
+    
+        # 3. Comparativa Aleatoria (middle, full width)
+        ax4 = fig.add_subplot(gs[1, :])
+        serie = series_temporales['dia']
+        rw = np.random.normal(loc=serie.mean(), scale=serie.std(), size=len(serie))
+        ax4.plot(np.cumsum(serie), label='Activo Real', alpha=0.7)
+        ax4.plot(np.cumsum(rw), label='Random Walk (Ruido)', alpha=0.5, linestyle='--')
+        ax4.legend()
+        ax4.set_title("Estructura vs. Ruido Aleatorio")
+    
+        # 4. ACF de retornos al cuadrado (bottom, full width)
+        ax5 = fig.add_subplot(gs[2, :])
+        if not np.isnan(clustering_lag1) and len(r_sq_clean) > 30:
+            lags_sq_plot = min(20, len(r_sq_clean) // 4 - 1)
+            if lags_sq_plot >= 2:
+                # Usar ACF precalculado en PASO 15 (evita recalcular sobre millones de filas)
+                lags_arr = np.arange(len(acf_sq_full))
+                markerline, stemlines, baseline = ax5.stem(lags_arr, acf_sq_full)
+                plt.setp(stemlines, color='#185FA5', linewidth=1.2)
+                plt.setp(markerline, color='#185FA5', marker='o', markersize=4)
+                plt.setp(baseline, color='#444', linewidth=0.5)
+                ax5.axhline(0, color='#888780', linewidth=0.5)
+                ci = 1.96 / np.sqrt(len(r_sq_clean))
+                ax5.axhline(ci, color='#E24B4A', linewidth=0.8, linestyle='--')
+                ax5.axhline(-ci, color='#E24B4A', linewidth=0.8, linestyle='--')
+                ax5.set_title('ACF Retornos² — Volatility Clustering')
+                ax5.text(0.98, 0.95, f'LB p-valor: {clustering_lb_p:.4f}  {"✓" if clustering_presente else "✗"}',
+                         transform=ax5.transAxes, ha='right', va='top', fontsize=8,
+                         color='#1D9E75' if clustering_presente else '#E24B4A')
+        else:
+            ax5.axis('off')
+            ax5.text(0.5, 0.5, "No hay suficientes datos para ACF de retornos²",
+                     ha='center', va='center', fontsize=11, color='#888780', transform=ax5.transAxes)
+    
+        plt.tight_layout(pad=3.0)
+        pdf.savefig(fig)
+        plt.close(fig)
+    print(f"Generado página {PRIMERA_PAG_NO_METRICAS + 8}/{TOTAL_PAGINAS} — Análisis de Dependencia(ACF/PACF)")
+    # endregion
+    # endregion
+    # ── FINALIZACIÓN ──────────────────────────────────────────────────────────────
+    print(f"{'='*60}")
+    print(f"✅ Analisis completado con exito.")
+    print(f"📁 Guardado en: {OUTPUT_PDF}")
+    print(f"{'='*60}")
 
-# endregion
-# region ── PÁGINA 9 — Correlograma (ACF/PACF) ────────
-    fig = plt.figure(figsize=(8.27, 11.69))
-    gs = gridspec.GridSpec(3, 2, height_ratios=[1, 1, 1])
-
-    # 1. Heatmap (Arriba, ocupando todo el ancho)
-    ax1 = fig.add_subplot(gs[0, :])
-    data = {p: stats['pacf_vals'][1] for p, stats in stats_temporales.items() if 'pacf_vals' in stats}
-    df_heat = pd.DataFrame(data, index=['PACF Lag 1']).T
-    sns.heatmap(df_heat, annot=True, cmap='coolwarm', center=0, vmin=-0.5, vmax=0.5, ax=ax1)
-    ax1.set_title("Mapa de Calor: Dependencia por Escala")
-
-    # 2. Correlograma (Centro, izquierda y derecha)
-    ax2 = fig.add_subplot(gs[1, 0])
-    plot_acf(series_temporales['dia'], ax=ax2, lags=15, title='ACF Diario')
-    ax3 = fig.add_subplot(gs[1, 1])
-    plot_pacf(series_temporales['dia'], ax=ax3, lags=15, title='PACF Diario')
-
-    # 3. Comparativa Aleatoria (Abajo, ocupando todo el ancho)
-    ax4 = fig.add_subplot(gs[2, :])
-    serie = series_temporales['dia']
-    rw = np.random.normal(loc=serie.mean(), scale=serie.std(), size=len(serie))
-    ax4.plot(np.cumsum(serie), label='Activo Real', alpha=0.7)
-    ax4.plot(np.cumsum(rw), label='Random Walk (Ruido)', alpha=0.5, linestyle='--')
-    ax4.legend()
-    ax4.set_title("Estructura vs. Ruido Aleatorio")
-
-    plt.tight_layout(pad=3.0)
-    pdf.savefig(fig)
-    plt.close(fig)
-print("Generado página 9/9 — Análisis de Dependencia(ACF/PACF)")
-# endregion
-# endregion
-# ── FINALIZACIÓN ──────────────────────────────────────────────────────────────
-print(f"{'='*60}")
-print(f"✅ Analisis completado con exito.")
-print(f"📁 Guardado en: {OUTPUT_PDF}")
-print(f"{'='*60}")
-
-carpeta_contenedora = os.path.dirname(OUTPUT_PDF)
-subprocess.Popen(f'explorer "{carpeta_contenedora}"')
+    if 'GUI_METRICS_OUTPUT' in os.environ:
+        import json
+        metrics_serializable = {}
+        for cat, items in metricas.items():
+            metrics_serializable[cat] = {}
+            for k, v in items.items():
+                if k.strip() == '':
+                    continue
+                metrics_serializable[cat][k] = str(v) if not isinstance(v, (str, int, float, bool, type(None))) else v
+        with open(os.environ['GUI_METRICS_OUTPUT'], 'w', encoding='utf-8') as f:
+            json.dump(metrics_serializable, f, indent=2, ensure_ascii=False)
+    if 'GUI_PDF_OUTPUT' in os.environ:
+        with open(os.environ['GUI_PDF_OUTPUT'], 'w', encoding='utf-8') as f:
+            json.dump({'pdf_path': OUTPUT_PDF}, f)
+    
+    if 'GUI_METRICS_OUTPUT' not in os.environ:
+        carpeta_contenedora = os.path.dirname(OUTPUT_PDF)
+        subprocess.Popen(f'explorer "{carpeta_contenedora}"')
