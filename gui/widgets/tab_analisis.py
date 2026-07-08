@@ -356,6 +356,18 @@ class TabAnalisis(QWidget):
                         '13. Vida Media de Reversión (Half-Life OU)'):
                 metricas.pop(key, None)
 
+        # Filter NATR category 14 items by horizon
+        if '14. NATR, correlación Multi-TF' in metricas:
+            natr_items = metricas['14. NATR, correlación Multi-TF']
+            filtered = {}
+            for k, v in natr_items.items():
+                if not k.startswith('['):
+                    filtered[k] = v
+                elif horizon != 'General' and k.startswith(f'[{horizon}]'):
+                    clean_k = k.replace(f'[{horizon}] ', '')
+                    filtered[clean_k] = v
+            metricas['14. NATR Inter-TF'] = filtered
+
         period = self.metrics_scroll.populate(metricas)
         if period:
             self.lbl_period.setText(period)

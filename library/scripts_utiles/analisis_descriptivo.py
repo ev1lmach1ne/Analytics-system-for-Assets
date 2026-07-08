@@ -14,12 +14,15 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from core.config import CONFIG_PATH, INFORMES_DIR, LIMPIADOS_DIR, BASE_DATA
 from scipy import stats
 from statsmodels.tsa.stattools import adfuller, kpss
+from statsmodels.tools.sm_exceptions import InterpolationWarning
 import json
 import subprocess
 import re
 import math
 import sys
+import warnings
 import seaborn as sns
+warnings.filterwarnings('ignore', category=InterpolationWarning)
 from matplotlib.widgets import SpanSelector
 from matplotlib.dates import num2date, date2num
 from matplotlib.widgets import RangeSlider, TextBox, Button
@@ -611,10 +614,13 @@ if __name__ == "__main__":
         else:
             print(f"      Rf rate: 0.00% (sin tasa libre de riesgo)")
         sharpe     = (ret_anual - rf_anual) / vol_anual if (vol_anual is not None and vol_anual != 0 and vol_anual != 0.0) else 0
+        excess_ret = r - (rf_anual / dias_ano_regimen)
+        downside_std = excess_ret[excess_ret < 0].std() * np.sqrt(dias_ano_regimen)
+        sortino = (ret_anual - rf_anual) / downside_std if downside_std != 0 else 0.0
         calmar_disponible = True
     else:
         # AQUÍ ESTÁ EL CAMBIO: Asignamos 0.0 en lugar de None
-        vol_anual = vol_diaria = ret_anual = ret_diario = sharpe = 0.0
+        vol_anual = vol_diaria = ret_anual = ret_diario = sharpe = sortino = 0.0
         calmar_disponible = False
         
     # endregion
@@ -1012,6 +1018,275 @@ if __name__ == "__main__":
     # endregion
     # ==========================================================================
     # endregion
+    # ==========================================================================
+    # region PASO 16: Estimadores de Volatilidad OHLC
+    df_ohlc = df[['open', 'high', 'low', 'close']].replace(0, np.nan).dropna()
+
+    log_hl = np.log(df_ohlc['high'] / df_ohlc['low'])
+    log_co = np.log(df_ohlc['close'] / df_ohlc['open'])
+    log_oc_prev = np.log(df_ohlc['open'] / df_ohlc['close'].shift(1))
+    log_ho = np.log(df_ohlc['high'] / df_ohlc['open'])
+    log_lo = np.log(df_ohlc['low'] / df_ohlc['open'])
+
+    factor_park = 1 / (4 * np.log(2))
+    parkinson_var = factor_park * (log_hl ** 2)
+    parkinson_vol_periodo = np.sqrt(parkinson_var.mean())
+
+    gk_var = 0.5 * (log_hl ** 2) - (2 * np.log(2) - 1) * (log_co ** 2)
+    gk_var = gk_var.clip(lower=0)
+    gk_vol_periodo = np.sqrt(gk_var.mean())
+
+    rs_var = log_ho * (log_ho - log_co) + log_lo * (log_lo - log_co)
+    rs_var = rs_var.clip(lower=0)
+    rs_vol_periodo = np.sqrt(rs_var.mean())
+
+    ctc_vol_periodo = r.std()
+
+    if velas_por_anio is not None:
+        try:
+            factor_anual_ohlc = get_factores(CONFIG['activo'], CONFIG['tf'])['anual']
+        except (ValueError, KeyError, TypeError):
+            factor_anual_ohlc = velas_por_anio
+        parkinson_vol_anual = parkinson_vol_periodo * np.sqrt(factor_anual_ohlc)
+        gk_vol_anual       = gk_vol_periodo * np.sqrt(factor_anual_ohlc)
+        rs_vol_anual        = rs_vol_periodo * np.sqrt(factor_anual_ohlc)
+        ctc_vol_anual        = ctc_vol_periodo * np.sqrt(factor_anual_ohlc)
+    else:
+        parkinson_vol_anual = gk_vol_anual = rs_vol_anual = ctc_vol_anual = None
+
+    eficiencia_parkinson = (ctc_vol_periodo / parkinson_vol_periodo) ** 2 if parkinson_vol_periodo > 0 else None
+    eficiencia_gk        = (ctc_vol_periodo / gk_vol_periodo) ** 2 if gk_vol_periodo > 0 else None
+    eficiencia_rs         = (ctc_vol_periodo / rs_vol_periodo) ** 2 if rs_vol_periodo > 0 else None
+    # endregion
+    # ==========================================================================
+    # region PASO 17: Tests de Estacionariedad (ADF/KPSS)
+    MAX_OBS_STATIONARITY = 20000
+    precio_test = df_ohlc['close']
+    if len(precio_test) > MAX_OBS_STATIONARITY:
+        paso_stat = len(precio_test) // MAX_OBS_STATIONARITY
+        precio_test_sample = precio_test.iloc[::paso_stat]
+        r_test_sample       = r.iloc[::paso_stat] if len(r) > MAX_OBS_STATIONARITY else r
+    else:
+        precio_test_sample = precio_test
+        r_test_sample       = r
+
+    try:
+        adf_precio_stat, adf_precio_p, *_ = adfuller(precio_test_sample, autolag='AIC')
+    except Exception:
+        adf_precio_stat, adf_precio_p = np.nan, np.nan
+
+    try:
+        adf_ret_stat, adf_ret_p, *_ = adfuller(r_test_sample, autolag='AIC')
+    except Exception:
+        adf_ret_stat, adf_ret_p = np.nan, np.nan
+
+    try:
+        with np.errstate(all='ignore'):
+            kpss_precio_stat, kpss_precio_p, *_ = kpss(precio_test_sample, regression='c', nlags='auto')
+    except Exception:
+        kpss_precio_stat, kpss_precio_p = np.nan, np.nan
+
+    try:
+        with np.errstate(all='ignore'):
+            kpss_ret_stat, kpss_ret_p, *_ = kpss(r_test_sample, regression='c', nlags='auto')
+    except Exception:
+        kpss_ret_stat, kpss_ret_p = np.nan, np.nan
+
+    def diagnostico_estacionariedad(adf_p, kpss_p):
+        if np.isnan(adf_p) or np.isnan(kpss_p):
+            return "N/A"
+        adf_estacionaria  = adf_p < 0.05
+        kpss_estacionaria = kpss_p > 0.05
+        if adf_estacionaria and kpss_estacionaria:
+            return "ESTACIONARIA (consenso)"
+        elif not adf_estacionaria and not kpss_estacionaria:
+            return "NO ESTACIONARIA (consenso)"
+        else:
+            return "AMBIGUA (tests discrepan)"
+
+    veredicto_precio   = diagnostico_estacionariedad(adf_precio_p, kpss_precio_p)
+    veredicto_retornos = diagnostico_estacionariedad(adf_ret_p, kpss_ret_p)
+    # endregion
+    # ==========================================================================
+    # region PASO 18: Vida Media de Reversión (Half-Life OU)
+    precio_log = np.log(df_ohlc['close'])
+    delta_p    = precio_log.diff().dropna()
+    p_lag      = precio_log.shift(1).dropna()
+
+    idx_comun   = delta_p.index.intersection(p_lag.index)
+    delta_p_hl  = delta_p.loc[idx_comun].values
+    p_lag_hl    = p_lag.loc[idx_comun].values
+
+    try:
+        p_lag_mean   = p_lag_hl.mean()
+        cov_hl       = np.mean((p_lag_hl - p_lag_mean) * (delta_p_hl - delta_p_hl.mean()))
+        var_hl       = np.var(p_lag_hl)
+        beta_hl      = cov_hl / var_hl if var_hl != 0 else 0.0
+
+        if -1 < beta_hl < 0:
+            half_life_velas = -np.log(2) / np.log(1 + beta_hl)
+        else:
+            half_life_velas = None
+
+        if half_life_velas is not None and velas_por_dia is not None and velas_por_dia > 0:
+            half_life_dias = half_life_velas / velas_por_dia
+        else:
+            half_life_dias = None
+    except Exception:
+        beta_hl = None
+        half_life_velas = None
+        half_life_dias = None
+    # endregion
+    # ==========================================================================
+    # region PASO 19: Análisis de Volatilidad Relativa Inter-Temporal (NATR/ATR)
+    # ==========================================================================
+
+    TF_RULES = {
+        '1min': '1min', '5min': '5min', '15min': '15min',
+        '1h': '1h', '4h': '4h', '1d': '1D',
+        '1w': '1W', '1mo': '1ME',
+    }
+
+    HORIZON_PAIRS = {
+        'General': [],
+        'Scalping': [('1min', '15min'), ('1min', '1h')],
+        'Daytrading': [('5min', '4h'), ('15min', '1d')],
+        'Swingtrading': [('1h', '1d'), ('4h', '1w')],
+        'Position': [('1d', '1w'), ('1d', '1mo')],
+    }
+
+    MAX_LAGS = {
+        'General': 20,
+        'Scalping': 80,
+        'Daytrading': 40,
+        'Swingtrading': 20,
+        'Position': 12,
+    }
+
+    _NATR_DATA = {}
+    _NATR_CORR = None
+    _NATR_PAIRS = {}
+
+    def _tf_to_minutes(tf):
+        m = re.match(r'(\d+)(min|mo|m|h|d|w)', tf)
+        if not m: return None
+        val, unit = int(m.group(1)), m.group(2)
+        if unit in ('min', 'm'): return val
+        if unit == 'h': return val * 60
+        if unit == 'd': return val * 1440
+        if unit == 'w': return val * 10080
+        if unit == 'mo': return val * 43200
+        return None
+
+    def _resample_ohlc(df, rule):
+        return df.resample(rule).agg({
+            'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'
+        }).dropna()
+
+    def _calcular_atr_natr(df, period=14):
+        d = df.copy()
+        d['TR'] = np.maximum(
+            d['high'] - d['low'],
+            np.maximum(
+                (d['high'] - d['close'].shift(1)).abs(),
+                (d['low'] - d['close'].shift(1)).abs()
+            )
+        )
+        d['ATR'] = d['TR'].rolling(window=period, min_periods=period).mean()
+        d['NATR'] = d['ATR'] / d['close'] * 100
+        return d
+
+    base_tf = CONFIG['tf']
+    base_min = _tf_to_minutes(base_tf)
+
+    # 1. Compute base NATR
+    try:
+        df_natr = _calcular_atr_natr(df)
+        _NATR_DATA[base_tf] = df_natr['NATR'].dropna()
+
+        # 2. Determine which TFs to resample (all standard TFs >= base TF)
+        all_tfs = ['1min', '5min', '15min', '1h', '4h', '1d', '1w', '1mo']
+        _tf_min_used = {_tf_to_minutes(base_tf): base_tf}
+        available_tfs = [base_tf]
+
+        for tf in all_tfs:
+            if tf == base_tf:
+                continue
+            tf_min = _tf_to_minutes(tf)
+            if tf_min is None:
+                continue
+            # Skip if a TF with same minute value already exists (e.g. '1min' when base is '1m')
+            if tf_min in _tf_min_used:
+                continue
+            if base_min and tf_min >= base_min:
+                rule = TF_RULES.get(tf)
+                if rule:
+                    try:
+                        df_resampled = _resample_ohlc(df, rule)
+                        if len(df_resampled) >= 20:
+                            df_res_natr = _calcular_atr_natr(df_resampled)
+                            _NATR_DATA[tf] = df_res_natr['NATR'].dropna()
+                            _tf_min_used[tf_min] = tf
+                            available_tfs.append(tf)
+                    except Exception:
+                        pass
+
+        available_tfs.sort(key=lambda x: _tf_to_minutes(x) or 0)
+
+        # 3. Build correlation matrix
+        if len(available_tfs) >= 2:
+            natr_aligned = pd.DataFrame({tf: _NATR_DATA[tf] for tf in available_tfs}).dropna()
+            if len(natr_aligned) > 1:
+                _NATR_CORR = natr_aligned.corr(method='pearson')
+
+        # 4. Compute pairs for ALL horizons
+        for horizon_name, pairs in HORIZON_PAIRS.items():
+            max_lag = MAX_LAGS.get(horizon_name, 20)
+            horizon_results = []
+            for tf_a, tf_b in pairs:
+                if tf_a not in _NATR_DATA or tf_b not in _NATR_DATA:
+                    continue
+                both = pd.DataFrame({tf_a: _NATR_DATA[tf_a], tf_b: _NATR_DATA[tf_b]}).dropna()
+                if len(both) < 20:
+                    continue
+
+                # Lead-lag cross-correlation
+                ser_a = both[tf_a].values
+                ser_b = both[tf_b].values
+                mean_a, mean_b = ser_a.mean(), ser_b.mean()
+                ccorr = np.correlate(ser_a - mean_a, ser_b - mean_b, mode='full')
+                denom = np.sqrt(np.sum((ser_a - mean_a)**2) * np.sum((ser_b - mean_b)**2))
+                if denom > 0:
+                    ccorr /= denom
+                lags = np.arange(-len(ser_a) + 1, len(ser_a))
+                pos_mask = (lags >= 0) & (lags <= max_lag)
+                if pos_mask.any():
+                    valid_ccorr = ccorr[pos_mask]
+                    valid_lags = lags[pos_mask]
+                    best_idx = np.argmax(valid_ccorr)
+                    opt_lag = int(valid_lags[best_idx])
+                    max_corr = float(valid_ccorr[best_idx])
+                else:
+                    opt_lag = 0
+                    max_corr = 0.0
+
+                horizon_results.append({
+                    'pair': f'{tf_a}/{tf_b}',
+                    'natr_base': float(_NATR_DATA[tf_a].mean()),
+                    'natr_target': float(_NATR_DATA[tf_b].mean()),
+                    'ratio': float((both[tf_a] / both[tf_b]).mean()),
+                    'lag': opt_lag,
+                    'lag_unit': tf_b,
+                    'max_lag': max_lag,
+                    'corr': max_corr,
+                })
+            _NATR_PAIRS[horizon_name] = horizon_results
+
+    except Exception as e:
+        print(f"  ⚠ PASO 19: Error en cálculo NATR: {e}")
+    # endregion
+    # ==========================================================================
+    # endregion
     # region ── 9. 📊 ESTRUCTURACIÓN Y PRESENTACIÓN DE MÉTRICAS FINANCIERAS EN TERMINAL
     # ── CONFIGURACIÓN DE ETIQUETAS DINÁMICAS (Para Ticks o Tiempo Fijo) ──────────
     if tipo_muestreo == 'tiempo_fijo':
@@ -1085,11 +1360,18 @@ if __name__ == "__main__":
         'Volatilidad anualizada': fmt_pct(vol_anual),
         'Volatilidad diaria': fmt_pct(vol_diaria),
         'Desv. estandar': f"{r.std()*100:.6f}%",
-        'Ratio Sharpe (Rf=T-Bill 3m)': fmt_num(sharpe),
+        f'Ratio Sharpe (Rf=T-Bill 3m) [{rf_anual:.2%}]': (f"{'\033[92m' + f'{sharpe:.4f}' + '\033[0m'}" if sharpe and sharpe > 1
+                                                           else f"{'\033[93m' + f'{sharpe:.4f}' + '\033[0m'}" if sharpe and sharpe > 0.5
+                                                           else f"{'\033[91m' + f'{sharpe:.4f}' + '\033[0m'}" if sharpe is not None
+                                                           else "N/A"),
         'Calmar Ratio': (f"{'\033[92m' + f'{calmar_ratio:.4f}' + '\033[0m'}" if calmar_ratio and calmar_ratio > 1
                          else f"{'\033[93m' + f'{calmar_ratio:.4f}' + '\033[0m'}" if calmar_ratio and calmar_ratio > 0.5
                          else f"{'\033[91m' + f'{calmar_ratio:.4f}' + '\033[0m'}" if calmar_ratio is not None
-                         else "N/A (TICKS)")
+                         else "N/A (TICKS)"),
+        'Sortino Ratio': (f"{'\033[92m' + f'{sortino:.4f}' + '\033[0m'}" if sortino and sortino > 1
+                          else f"{'\033[93m' + f'{sortino:.4f}' + '\033[0m'}" if sortino and sortino > 0.5
+                          else f"{'\033[91m' + f'{sortino:.4f}' + '\033[0m'}" if sortino is not None
+                          else "N/A"),
     })
 
     _mostrar_categoria('5. Drawdown Analysis', {
@@ -1184,124 +1466,7 @@ if __name__ == "__main__":
     print(f"\n{'═'*70}\n")
     
     # endregion
-    # region ── 16. ESTIMADORES DE VOLATILIDAD OHLC ────────────────────────────────────
-    df_ohlc = df[['open', 'high', 'low', 'close']].replace(0, np.nan).dropna()
 
-    log_hl = np.log(df_ohlc['high'] / df_ohlc['low'])
-    log_co = np.log(df_ohlc['close'] / df_ohlc['open'])
-    log_oc_prev = np.log(df_ohlc['open'] / df_ohlc['close'].shift(1))
-    log_ho = np.log(df_ohlc['high'] / df_ohlc['open'])
-    log_lo = np.log(df_ohlc['low'] / df_ohlc['open'])
-
-    factor_park = 1 / (4 * np.log(2))
-    parkinson_var = factor_park * (log_hl ** 2)
-    parkinson_vol_periodo = np.sqrt(parkinson_var.mean())
-
-    gk_var = 0.5 * (log_hl ** 2) - (2 * np.log(2) - 1) * (log_co ** 2)
-    gk_var = gk_var.clip(lower=0)
-    gk_vol_periodo = np.sqrt(gk_var.mean())
-
-    rs_var = log_ho * (log_ho - log_co) + log_lo * (log_lo - log_co)
-    rs_var = rs_var.clip(lower=0)
-    rs_vol_periodo = np.sqrt(rs_var.mean())
-
-    ctc_vol_periodo = r.std()
-
-    if velas_por_anio is not None:
-        try:
-            factor_anual_ohlc = get_factores(CONFIG['activo'], CONFIG['tf'])['anual']
-        except (ValueError, KeyError, TypeError):
-            factor_anual_ohlc = velas_por_anio
-        parkinson_vol_anual = parkinson_vol_periodo * np.sqrt(factor_anual_ohlc)
-        gk_vol_anual       = gk_vol_periodo * np.sqrt(factor_anual_ohlc)
-        rs_vol_anual        = rs_vol_periodo * np.sqrt(factor_anual_ohlc)
-        ctc_vol_anual        = ctc_vol_periodo * np.sqrt(factor_anual_ohlc)
-    else:
-        parkinson_vol_anual = gk_vol_anual = rs_vol_anual = ctc_vol_anual = None
-
-    eficiencia_parkinson = (ctc_vol_periodo / parkinson_vol_periodo) ** 2 if parkinson_vol_periodo > 0 else None
-    eficiencia_gk        = (ctc_vol_periodo / gk_vol_periodo) ** 2 if gk_vol_periodo > 0 else None
-    eficiencia_rs         = (ctc_vol_periodo / rs_vol_periodo) ** 2 if rs_vol_periodo > 0 else None
-    # endregion
-
-    # region ── 17. TESTS DE ESTACIONARIEDAD (ADF / KPSS) ──────────────────────────────
-    MAX_OBS_STATIONARITY = 20000
-    precio_test = df_ohlc['close']
-    if len(precio_test) > MAX_OBS_STATIONARITY:
-        paso_stat = len(precio_test) // MAX_OBS_STATIONARITY
-        precio_test_sample = precio_test.iloc[::paso_stat]
-        r_test_sample       = r.iloc[::paso_stat] if len(r) > MAX_OBS_STATIONARITY else r
-    else:
-        precio_test_sample = precio_test
-        r_test_sample       = r
-
-    try:
-        adf_precio_stat, adf_precio_p, *_ = adfuller(precio_test_sample, autolag='AIC')
-    except Exception:
-        adf_precio_stat, adf_precio_p = np.nan, np.nan
-
-    try:
-        adf_ret_stat, adf_ret_p, *_ = adfuller(r_test_sample, autolag='AIC')
-    except Exception:
-        adf_ret_stat, adf_ret_p = np.nan, np.nan
-
-    try:
-        with np.errstate(all='ignore'):
-            kpss_precio_stat, kpss_precio_p, *_ = kpss(precio_test_sample, regression='c', nlags='auto')
-    except Exception:
-        kpss_precio_stat, kpss_precio_p = np.nan, np.nan
-
-    try:
-        with np.errstate(all='ignore'):
-            kpss_ret_stat, kpss_ret_p, *_ = kpss(r_test_sample, regression='c', nlags='auto')
-    except Exception:
-        kpss_ret_stat, kpss_ret_p = np.nan, np.nan
-
-    def diagnostico_estacionariedad(adf_p, kpss_p):
-        if np.isnan(adf_p) or np.isnan(kpss_p):
-            return "N/A"
-        adf_estacionaria  = adf_p < 0.05
-        kpss_estacionaria = kpss_p > 0.05
-        if adf_estacionaria and kpss_estacionaria:
-            return "ESTACIONARIA (consenso)"
-        elif not adf_estacionaria and not kpss_estacionaria:
-            return "NO ESTACIONARIA (consenso)"
-        else:
-            return "AMBIGUA (tests discrepan)"
-
-    veredicto_precio   = diagnostico_estacionariedad(adf_precio_p, kpss_precio_p)
-    veredicto_retornos = diagnostico_estacionariedad(adf_ret_p, kpss_ret_p)
-    # endregion
-
-    # region ── 18. VIDA MEDIA DE REVERSIÓN (HALF-LIFE OU) ────────────────────────────
-    precio_log = np.log(df_ohlc['close'])
-    delta_p    = precio_log.diff().dropna()
-    p_lag      = precio_log.shift(1).dropna()
-
-    idx_comun   = delta_p.index.intersection(p_lag.index)
-    delta_p_hl  = delta_p.loc[idx_comun].values
-    p_lag_hl    = p_lag.loc[idx_comun].values
-
-    try:
-        p_lag_mean   = p_lag_hl.mean()
-        cov_hl       = np.mean((p_lag_hl - p_lag_mean) * (delta_p_hl - delta_p_hl.mean()))
-        var_hl       = np.var(p_lag_hl)
-        beta_hl      = cov_hl / var_hl if var_hl != 0 else 0.0
-
-        if -1 < beta_hl < 0:
-            half_life_velas = -np.log(2) / np.log(1 + beta_hl)
-        else:
-            half_life_velas = None
-
-        if half_life_velas is not None and velas_por_dia is not None and velas_por_dia > 0:
-            half_life_dias = half_life_velas / velas_por_dia
-        else:
-            half_life_dias = None
-    except Exception:
-        beta_hl = None
-        half_life_velas = None
-        half_life_dias = None
-    # endregion
 
     _mostrar_categoria('11. Estimadores de Volatilidad OHLC', {
         'Contexto': "Parkinson / Garman-Klass / Rogers-Satchell vs Close-to-Close",
@@ -1341,6 +1506,20 @@ if __name__ == "__main__":
             else "Sin reversión detectada (random walk / tendencia)"
         )
     })
+
+    # ── 14. NATR, correlación Multi-TF ──
+    natr_cat = {}
+    for tf_name in sorted(_NATR_DATA.keys(), key=lambda x: _tf_to_minutes(x) or 0):
+        natr_cat[f'NATR({tf_name})'] = f'{_NATR_DATA[tf_name].mean():.4f}'
+    for horizon_name in ['Scalping', 'Daytrading', 'Swingtrading', 'Position']:
+        results = _NATR_PAIRS.get(horizon_name, [])
+        for r in results:
+            prefix = f'[{horizon_name}] Par {r["pair"]}'
+            natr_cat[f'{prefix} - NATR base'] = f'{r["natr_base"]:.4f}'
+            natr_cat[f'{prefix} - NATR target'] = f'{r["natr_target"]:.4f}'
+            natr_cat[f'{prefix} - Ratio'] = f'{r["ratio"]:.4f}'
+            natr_cat[f'{prefix} - Lead-Lag'] = f'~{r["lag"]} velas ({r["lag_unit"]}) [max: {r["max_lag"]} lags]'
+    _mostrar_categoria('14. NATR, correlación Multi-TF', natr_cat)
 
     print()
     print(f"\n{'═'*70}\n")
@@ -1395,7 +1574,7 @@ if __name__ == "__main__":
         # Configuración de diseño: Máximo de categorías por página (2 por columna)
         CATS_POR_PAGINA = 6
         dy = 0.020
-        TOTAL_PAGINAS = math.ceil(len(categorias_reales) / CATS_POR_PAGINA) + 9
+        TOTAL_PAGINAS = math.ceil(len(categorias_reales) / CATS_POR_PAGINA) + 10
         PRIMERA_PAG_NO_METRICAS = math.ceil(len(categorias_reales) / CATS_POR_PAGINA) + 1
         
         for pag_num, i in enumerate(range(0, len(categorias_reales), CATS_POR_PAGINA), start=1):
@@ -1506,7 +1685,7 @@ if __name__ == "__main__":
             print(f"Generado página {pag_num}/{TOTAL_PAGINAS} — Métricas")
             
         # endregion
-    # region ── PÁGINA 2 — Precio, Equity Curve y Underwater Drawdown ─────
+    # region ── PÁGINA 3 — Precio, Equity Curve y Underwater Drawdown ─────
         fig = plt.figure(figsize=(11.69, 8.27))
         fig.patch.set_facecolor('#0f0f0f')
         gs  = gridspec.GridSpec(3, 1, hspace=0.50, height_ratios=[1.2, 1, 1])
@@ -2170,7 +2349,92 @@ if __name__ == "__main__":
             plt.close()
     
     # endregion
-    # region ── PÁGINA 10 — Correlograma (ACF/PACF) ────────
+    # region ── PÁGINA 10 — NATR, correlación Multi-TF ─────
+        try:
+            fig = plt.figure(figsize=(11.69, 8.27))
+            fig.patch.set_facecolor('#0f0f0f')
+            gs = gridspec.GridSpec(2, 1, hspace=0.30, height_ratios=[1.5, 1])
+
+            if _NATR_CORR is not None and not _NATR_CORR.empty and _NATR_CORR.shape[0] >= 2:
+                ax_top = fig.add_subplot(gs[0])
+                ax_top.set_facecolor('#111111')
+                mask = np.zeros_like(_NATR_CORR, dtype=bool)
+                mask[np.triu_indices_from(mask, k=1)] = True
+                sns.heatmap(_NATR_CORR, mask=mask, annot=False, cmap='coolwarm',
+                            center=0, vmin=-1, vmax=1, square=True, ax=ax_top,
+                            linewidths=0.3, linecolor='#333',
+                            cbar_kws={'label': 'Correlación de NATR', 'shrink': 0.8})
+                for i in range(_NATR_CORR.shape[0]):
+                    for j in range(_NATR_CORR.shape[1]):
+                        if mask[i, j]:
+                            continue
+                        val = _NATR_CORR.iloc[i, j]
+                        color = 'white' if abs(val) >= 0.5 else '#000'
+                        fs = max(4.5, min(9, 36 // _NATR_CORR.shape[0]))
+                        ax_top.text(j + 0.5, i + 0.5, f'{val:.2f}',
+                                    ha='center', va='center', fontsize=fs, color=color,
+                                    fontweight='bold' if abs(val) >= 0.5 else 'normal')
+                ax_top.set_title(f"{CONFIG['nombre']} ({CONFIG['tf']}) — NATR, correlación Multi-TF",
+                                 color='white', fontsize=12, pad=15)
+                ax_top.set_xlabel('Timeframe', color='#888780')
+                ax_top.set_ylabel('Timeframe', color='#888780')
+                ax_top.tick_params(colors='#888780', labelsize=8)
+                for spine in ax_top.spines.values():
+                    spine.set_edgecolor('#333')
+                cbar = ax_top.collections[0].colorbar
+                cbar.ax.yaxis.label.set_color('#888780')
+                cbar.ax.tick_params(colors='#888780')
+                cbar.ax.set_yticklabels([f'{x:.2f}' for x in cbar.get_ticks()])
+            else:
+                ax_top = fig.add_subplot(gs[0])
+                ax_top.axis('off')
+                ax_top.set_facecolor('#111111')
+                ax_top.text(0.5, 0.5, "Matriz de correlación NATR no disponible.",
+                            ha='center', va='center', fontsize=12, color='#888780', transform=ax_top.transAxes)
+
+            ax_bot = fig.add_subplot(gs[1])
+            ax_bot.axis('off')
+            ax_bot.set_facecolor('#111111')
+            all_pairs = []
+            for h_name in ['Scalping', 'Daytrading', 'Swingtrading', 'Position']:
+                for r in _NATR_PAIRS.get(h_name, []):
+                    all_pairs.append((h_name, r))
+            if all_pairs:
+                ax_bot.text(0.04, 0.92, 'Pares de volatilidad por horizonte:', fontsize=9,
+                            color='#ff9900', fontweight='bold', va='center')
+                headers = ['Horizonte', 'Par', 'NATR base', 'NATR target', 'Ratio', 'Lead-Lag']
+                col_x = [0.04, 0.18, 0.32, 0.44, 0.56, 0.68]
+                for ci, hdr in enumerate(headers):
+                    ax_bot.text(col_x[ci], 0.86, hdr, fontsize=7, color='#4fc3f7',
+                                fontweight='bold', va='center')
+                y = 0.80
+                for h_name, r in all_pairs:
+                    vals = [
+                        h_name,
+                        r['pair'],
+                        f'{r["natr_base"]:.4f}',
+                        f'{r["natr_target"]:.4f}',
+                        f'{r["ratio"]:.4f}',
+                        f'~{r["lag"]} velas ({r["lag_unit"]}) [max: {r["max_lag"]} lags]',
+                    ]
+                    for ci, v in enumerate(vals):
+                        ax_bot.text(col_x[ci], y, v, fontsize=6.5, color='white', va='center')
+                    y -= 0.055
+                    if y < 0.05:
+                        break
+            else:
+                ax_bot.text(0.5, 0.5, "No hay pares disponibles para el TF base actual.",
+                            ha='center', va='center', fontsize=10, color='#888780', transform=ax_bot.transAxes)
+
+            plt.subplots_adjust(left=0.08, right=0.95, top=0.94, bottom=0.06)
+            pdf.savefig(fig, facecolor=fig.get_facecolor(), dpi=150)
+            plt.close()
+            print(f"Generado página {PRIMERA_PAG_NO_METRICAS + 8}/{TOTAL_PAGINAS} — NATR, correlación Multi-TF")
+        except Exception as e:
+            print(f"ERROR EN PÁGINA NATR: {e}")
+            plt.close()
+    # endregion
+    # region ── PÁGINA 11 — Correlograma (ACF/PACF) ────────
         fig = plt.figure(figsize=(11.69, 8.27))
         gs = gridspec.GridSpec(3, 3, height_ratios=[1, 1, 1])
     
@@ -2223,7 +2487,7 @@ if __name__ == "__main__":
         plt.tight_layout(pad=3.0)
         pdf.savefig(fig)
         plt.close(fig)
-    print(f"Generado página {PRIMERA_PAG_NO_METRICAS + 8}/{TOTAL_PAGINAS} — Análisis de Dependencia(ACF/PACF)")
+    print(f"Generado página {PRIMERA_PAG_NO_METRICAS + 9}/{TOTAL_PAGINAS} — Análisis de Dependencia(ACF/PACF)")
     # endregion
     # endregion
     # ── FINALIZACIÓN ──────────────────────────────────────────────────────────────

@@ -72,7 +72,7 @@ class HeaderBar(QFrame):
         subtitle.setStyleSheet("color: #3a5a7a; font-size: 11px;")
         subtitle.setContentsMargins(6, 0, 0, 0)
 
-        version = QLabel("v0.5.2")
+        version = QLabel("v0.5.3.3-alpha")
         version.setStyleSheet("color: #2a4a6a; font-size: 10px; padding-left: 8px;")
 
         layout.addWidget(title)
