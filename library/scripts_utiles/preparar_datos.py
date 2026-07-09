@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 import requests
+import psycopg2
 import json
 from pathlib import Path
 import os
@@ -9,7 +10,8 @@ import sys
 import tkinter as tk
 from tkinter import filedialog
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
-from core.config import CONFIG_PATH, QUESTDB_HOST, QUESTDB_HTTP_PORT
+from core.config import CONFIG_PATH, QUESTDB_HOST, QUESTDB_HTTP_PORT, DB_CONFIG
+from core.parsing import parse_numero_flexible
 import customtkinter as ctk
 import re
 sys.stdout.reconfigure(encoding='utf-8')
@@ -348,51 +350,58 @@ print(f"✅ Archivo listo: {CSV_OUTPUT}")
 # [5/5] Subir a QuestDB via HTTP /imp
 print(f"\n[5/5] Subiendo {len(df):,} filas a QuestDB — Tabla: {TABLA_DESTINO} ...")
 try:
-    SUFIJOS = {'K': 1_000, 'M': 1_000_000, 'B': 1_000_000_000}
-    def _parse_num(v):
-        if pd.isna(v):
-            return 0.0
-        s = str(v).strip().replace(' ', '')
-        if not s or s.lower() in ('nan', 'null', 'none', ''):
-            return 0.0
-        # Detectar formato europeo (punto= miles, coma=decimal)
-        if ',' in s and '.' in s:
-            if s.rfind(',') > s.rfind('.'):
-                s = s.replace('.', '')
-                s = s.replace(',', '.')
-            else:
-                s = s.replace(',', '')
-        elif ',' in s:
-            parts = s.split(',')
-            if len(parts) == 2:
-                last_clean = parts[1].rstrip('KkMmBb')
-                if last_clean.isdigit() and len(last_clean) <= 2:
-                    s = s.replace(',', '.')
-        suf = s[-1].upper()
-        if suf in SUFIJOS:
-            try:
-                return float(s[:-1]) * SUFIJOS[suf]
-            except ValueError:
-                return 0.0
-        try:
-            return float(s)
-        except ValueError:
-            return 0.0
-
+    fallos_parseo = {}
     for c in df.columns:
         if c != 'timestamp':
-            df[c] = df[c].apply(_parse_num)
+            resultado = df[c].apply(parse_numero_flexible)
+            df[c] = resultado.apply(lambda t: t[0])
+            motivos = resultado.apply(lambda t: t[1])
+            n_fallo = int((motivos == 'fallo').sum())
+            if n_fallo > 0:
+                fallos_parseo[c] = n_fallo
             if c == 'volume':
                 df[c] = df[c].astype(int)
-    csv_buffer = df.to_csv(index=False, encoding='utf-8')
-    cols_schema = ','.join([f'{c}:INT' if c == 'volume' else f'{c}:DOUBLE' for c in df.columns if c != 'timestamp'])
-    url = f"http://{QUESTDB_HOST}:{QUESTDB_HTTP_PORT}/imp?name={TABLA_DESTINO}&overwrite=true&types=timestamp:TIMESTAMP,{cols_schema}"
-    resp = requests.post(url, files={'data': ('data.csv', csv_buffer.encode('utf-8'), 'text/csv')}, timeout=120)
-    if resp.status_code == 200:
-        print(f"      ↳ {resp.text.strip()}")
-        print(f"✅ Subida completada — {len(df):,} filas en {TABLA_DESTINO}")
+
+    if fallos_parseo:
+        total_fallos = sum(fallos_parseo.values())
+        print(f"⚠️  Celdas no parseables convertidas a 0.0 ({total_fallos:,} en total):")
+        for col, n in fallos_parseo.items():
+            print(f"      - {col}: {n:,} celdas")
     else:
-        print(f"⚠️  HTTP {resp.status_code}: {resp.text.strip()}")
+        print("      Todas las celdas numéricas se parsearon correctamente.")
+
+    # ── Comprobación de overwrite: ¿la tabla destino ya tiene datos? ──
+    filas_existentes = 0
+    try:
+        _conn_chk = psycopg2.connect(**DB_CONFIG)
+        _chk = pd.read_sql(f"SELECT count(*) AS n FROM {TABLA_DESTINO}", _conn_chk)
+        _conn_chk.close()
+        filas_existentes = int(_chk['n'].iloc[0])
+    except Exception:
+        filas_existentes = 0  # tabla inexistente o no consultable → se trata como vacía
+
+    proceder_subida = True
+    if filas_existentes > 0:
+        if sys.stdin.isatty() and not CONFIG_SKIP:
+            print(f"⚠️  La tabla '{TABLA_DESTINO}' ya existe con {filas_existentes:,} filas.")
+            respuesta = input("   ¿Sobrescribir todos los datos existentes? [s/N]: ").strip().lower()
+            proceder_subida = respuesta in ('s', 'si', 'sí', 'y', 'yes')
+            if not proceder_subida:
+                print("⚠️  Subida cancelada por el usuario. El CSV preparado ya está guardado en disco.")
+        else:
+            print(f"⚠️  La tabla '{TABLA_DESTINO}' ya existe con {filas_existentes:,} filas — "
+                  f"se sobrescribirá automáticamente (modo no interactivo).")
+
+    if proceder_subida:
+        csv_buffer = df.to_csv(index=False, encoding='utf-8')
+        cols_schema = ','.join([f'{c}:INT' if c == 'volume' else f'{c}:DOUBLE' for c in df.columns if c != 'timestamp'])
+        url = f"http://{QUESTDB_HOST}:{QUESTDB_HTTP_PORT}/imp?name={TABLA_DESTINO}&overwrite=true&types=timestamp:TIMESTAMP,{cols_schema}"
+        resp = requests.post(url, files={'data': ('data.csv', csv_buffer.encode('utf-8'), 'text/csv')}, timeout=120)
+        if resp.status_code == 200:
+            print(f"      ↳ {resp.text.strip()}")
+            print(f"✅ Subida completada — {len(df):,} filas en {TABLA_DESTINO}")
+        else:
+            print(f"⚠️  HTTP {resp.status_code}: {resp.text.strip()}")
 except Exception as e:
     print(f"⚠️  Error al subir a QuestDB: {e}")
     print("   El archivo preparado se ha guardado igualmente.")

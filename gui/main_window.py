@@ -207,6 +207,9 @@ class MainWindow(QMainWindow):
             lambda *a: self.tabs.setCurrentIndex(2)
         )
 
+        # File selected in Limpiados -> preview horizon disabling by TF
+        self.tab_limpiados.file_selected.connect(self.tab_analisis.preview_horizon_for)
+
         # Refresh explorer when switching to limpiados tab
         self.tabs.currentChanged.connect(self._on_tab_changed)
 

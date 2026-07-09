@@ -6,11 +6,11 @@ import json
 import os
 import warnings
 warnings.filterwarnings('ignore')
-from numba import njit
 import sys
 sys.stdout.reconfigure(encoding='utf-8')
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 from core.config import CONFIG_PATH, LIMPIADOS_DIR, DB_CONFIG
+from core.metrics import calcular_umbrales_er, contar_regimen_hurst, hurst_rs_numba, calcular_hurst_array
 
 
 # ----------COLORES-----------
@@ -261,18 +261,13 @@ df['ER'] = (movimiento_neto / movimiento_total).round(6)
 df['ER'] = df['ER'].fillna(0)
 
 # ------------------------------------------------------------------------------
-# CÁLCULO DE UMBRALES DINÁMICOS (1ª Desviación Estándar)
+# CÁLCULO DE UMBRALES DINÁMICOS (1ª Desviación Estándar) — core.metrics
 # ------------------------------------------------------------------------------
-er_medio = df['ER'].mean()
-er_std   = df['ER'].std()
-
-# Definimos los límites sumando y restando una desviación estándar (1 sigma)
-umbral_tendencia = er_medio + er_std
-umbral_ruido     = er_medio - er_std
-
-# Acotamos los umbrales para que no se desborden del rango teórico [0, 1]
-umbral_tendencia = min(0.95, umbral_tendencia)
-umbral_ruido     = max(0.05, umbral_ruido)
+_umbrales_er = calcular_umbrales_er(df['ER'])
+er_medio         = _umbrales_er['er_medio']
+er_std           = _umbrales_er['er_std']
+umbral_tendencia = _umbrales_er['umbral_tendencia']
+umbral_ruido     = _umbrales_er['umbral_ruido']
 
 # Conteo de periodos forzados a enteros (int)
 total_tendencia = int((df['ER'] > umbral_tendencia).sum())
@@ -305,104 +300,7 @@ elif FRECUENCIA.endswith('w'):
 
 print(f"\n[8/8] Calculando Exponente de Hurst (Numba) utilizando ventana de {NEON}{VENTANA_HURST}{RESET} periodos y paso de {NEON}{PASO}{RESET} periodos...")
 
-@njit
-def hurst_rs_numba(series, lags):
-    """
-    Calcula el Exponente de Hurst aplicando la corrección de Anis-Lloyd 
-    calibrada para la curtosis y ruido real de activos financieros.
-    """
-    n = len(series)
-    n_lags = len(lags)
-    
-    log_lags = np.empty(n_lags)
-    log_rs   = np.empty(n_lags)
-
-    # Factor de ajuste cuantitativo para corregir colas pesadas en mercados reales
-    CALIBRACION_RUIDO = 0.915 
-
-    for k in range(n_lags):
-        lag = lags[k]
-        n_chunks = n // lag
-        
-        rs_sum = 0.0
-        count  = 0
-        
-        for c in range(n_chunks):
-            chunk = series[c * lag : (c + 1) * lag]
-            
-            m = 0.0
-            for v in chunk:
-                m += v
-            m /= lag
-
-            cumsum = 0.0
-            c_min  = 0.0
-            c_max  = 0.0
-            s_sq   = 0.0
-            
-            for v in chunk:
-                cumsum += (v - m)
-                if cumsum < c_min: c_min = cumsum
-                if cumsum > c_max: c_max = cumsum
-                s_sq += (v - m) ** 2
-
-            if lag > 1:
-                s = (s_sq / (lag - 1)) ** 0.5
-            else:
-                s = 0.0
-                
-            if s > 0.0:
-                rs_sum += (c_max - c_min) / s
-                count += 1
-
-        rs_observado = rs_sum / count if count > 0 else 0.0
-        
-        # Ecuación base de Anis-Lloyd
-        rs_teorico = ((lag - 0.5) / lag) * (1.0 / (2.0 * np.pi * lag))**(-0.5)
-        for i in range(1, lag):
-            rs_teorico += ((lag - i) / (lag * i))**0.5
-
-        # Aplicamos el multiplicador de calibración al modelo teórico
-        rs_teorico_ajustado = rs_teorico * CALIBRACION_RUIDO
-
-        log_lags[k] = np.log(lag)
-        if rs_observado > 0.0 and rs_teorico_ajustado > 0.0:
-            log_rs[k] = np.log(rs_observado) - np.log(rs_teorico_ajustado) + np.log(lag) * 0.5
-        else:
-            log_rs[k] = np.log(lag) * 0.5
-
-    # Regresión lineal manual (OLS)
-    mean_x = 0.0
-    mean_y = 0.0
-    for i in range(n_lags):
-        mean_x += log_lags[i]
-        mean_y += log_rs[i]
-    mean_x /= n_lags
-    mean_y /= n_lags
-
-    num = 0.0
-    den = 0.0
-    for i in range(n_lags):
-        num += (log_lags[i] - mean_x) * (log_rs[i] - mean_y)
-        den += (log_lags[i] - mean_x) ** 2
-
-    if den == 0.0:
-        return 0.5
-
-    h = num / den
-    
-    if h < 0.0: h = 0.0
-    if h > 1.0: h = 1.0
-    return h
-
-@njit
-def calcular_hurst_array(retornos, ventana, paso, lags):
-    n         = len(retornos)
-    resultado = np.full(n, np.nan)
-    for i in range(ventana, n, paso):
-        resultado[i] = hurst_rs_numba(retornos[i - ventana:i], lags)
-    return resultado
-
+# hurst_rs_numba y calcular_hurst_array viven en core.metrics (importadas arriba)
 retornos_puros = np.array(df['retorno_log'].fillna(0.0).values, dtype=np.float64, copy=True)
 
 hurst_vals = calcular_hurst_array(retornos_puros, VENTANA_HURST, PASO, lags_estandar)
@@ -414,12 +312,13 @@ df['hurst'] = hurst_series.round(4)
 df['hurst'] = df['hurst'].fillna(0.5)
 
 # ==============================================================================
-# AJUSTE DE UMBRALES EMPÍRICOS (Adaptados al sesgo estructural de tu activo)
+# AJUSTE DE UMBRALES EMPÍRICOS (Adaptados al sesgo estructural de tu activo) — core.metrics
 # ==============================================================================
 # Dado que el Hurst medio se sitúa en ~0.56, calibramos los límites de régimen:
-total_tendencia = int((df['hurst'] > 0.58).sum())
-total_aleatorio = int(((df['hurst'] >= 0.52) & (df['hurst'] <= 0.58)).sum())
-total_reversion = int((df['hurst'] < 0.52).sum())
+_regimen_hurst  = contar_regimen_hurst(df['hurst'])
+total_tendencia = _regimen_hurst['total_tendencia']
+total_aleatorio = _regimen_hurst['total_aleatorio']
+total_reversion = _regimen_hurst['total_reversion']
 
 # Métricas en consola limpias, en texto estándar (sin colores ANSI en los datos)
 print(f"      Hurst medio:                          {df['hurst'].mean():.4f}")

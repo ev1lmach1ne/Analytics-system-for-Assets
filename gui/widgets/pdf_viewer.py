@@ -1,7 +1,8 @@
 import os
+import gc
 from PyQt6.QtWidgets import (QWidget, QScrollArea, QVBoxLayout, QHBoxLayout,
                              QLabel, QPushButton, QToolButton, QSizePolicy)
-from PyQt6.QtCore import Qt, QSize, QObject
+from PyQt6.QtCore import Qt, QSize
 from PyQt6.QtGui import QPixmap
 from PyQt6.QtPdf import QPdfDocument, QPdfDocumentRenderOptions
 
@@ -89,6 +90,17 @@ class PdfViewer(QWidget):
         self._pdf_path = pdf_path
         self._current_page = 0
 
+        # Cerrar el documento anterior explícitamente: si no, el archivo PDF
+        # queda con el handle abierto y no se puede borrar ni sobrescribir en
+        # Windows. Importante: el documento se crea SIN padre Qt (más abajo,
+        # `QPdfDocument(None)`) — si se parenta al widget, Qt le transfiere el
+        # ownership a C++ y ni `close()` ni `del` desde Python logran liberar
+        # el archivo hasta que el propio widget se destruye.
+        if self._doc is not None:
+            self._doc.close()
+            self._doc = None
+            gc.collect()
+
         for w in self._pages:
             self.gallery_layout.removeWidget(w)
             w.deleteLater()
@@ -101,8 +113,7 @@ class PdfViewer(QWidget):
             self.lbl_page.setText("Sin PDF")
             return
 
-        parent = QObject(self)
-        doc = QPdfDocument(parent)
+        doc = QPdfDocument(None)
         doc.load(pdf_path)
         self._doc = doc
 
@@ -161,6 +172,13 @@ class PdfViewer(QWidget):
             self._current_page = index
             self.scroll.ensureWidgetVisible(self._pages[index], 0, 0)
             self._update_nav()
+
+    @property
+    def page_count(self):
+        return self._page_count
+
+    def go_to_page(self, index):
+        self._scroll_to_page(index)
 
     def _prev_page(self):
         if self._current_page > 0:

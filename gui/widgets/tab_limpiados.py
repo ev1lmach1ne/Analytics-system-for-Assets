@@ -1,4 +1,4 @@
-import os, json
+import os, json, re
 import pandas as pd
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                              QLabel, QLineEdit, QFrame, QTableWidget, QTableWidgetItem,
@@ -7,6 +7,7 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
 from PyQt6.QtCore import Qt, pyqtSignal
 from gui.widgets.file_explorer import FileExplorer
 from gui.widgets.console_widget import ConsoleWidget
+from gui.widgets.rango_dialog import RangoAnalisisDialog
 
 from core.config import BASE_DATA, LIMPIADOS_DIR, SCRIPTS_DIR, TF_PATTERN
 
@@ -63,7 +64,8 @@ QFrame#sep { background-color: #253a60; max-height: 1px; }
 """
 
 class TabLimpiados(QWidget):
-    analysis_completed = pyqtSignal(str, str, str, str)
+    analysis_completed = pyqtSignal(str, str, str, str, str)
+    file_selected = pyqtSignal(str, str)
 
     def set_analisis_tab(self, tab):
         self._analisis_tab = tab
@@ -80,6 +82,8 @@ class TabLimpiados(QWidget):
         self._analisis_tab = None
         self._grid_mode = True
         self._rf_rate = 0.0
+        self._rango_inicio = None
+        self._rango_fin = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
@@ -354,6 +358,8 @@ class TabLimpiados(QWidget):
         self._selected_tf = tf
         self._selected_activo = activo
         self.lbl_info.setText(f"{nombre} {tf} ({activo})")
+        print(f"[DEBUG tab_limpiados] file_selected emit -> nombre={nombre!r} tf={tf!r}", flush=True)
+        self.file_selected.emit(nombre or '', tf or '')
 
     # ── Preview, Delete ──
 
@@ -422,13 +428,21 @@ class TabLimpiados(QWidget):
         if not self._selected_path:
             return
 
-        # Use cache if available
-        if self._cached_pdf and self._cached_metrics:
+        dialog = RangoAnalisisDialog(self._selected_path, self)
+        if dialog.exec() != dialog.DialogCode.Accepted:
+            return
+        rango_inicio, rango_fin = dialog.get_rango()
+        self._rango_inicio = rango_inicio
+        self._rango_fin = rango_fin
+
+        # Use cache if available (solo aplica para "todo el histórico")
+        if rango_inicio is None and self._cached_pdf and self._cached_metrics:
             self.analysis_completed.emit(
                 self._cached_pdf,
                 self._cached_metrics,
                 self._selected_nombre or '',
-                self._selected_tf or ''
+                self._selected_tf or '',
+                self._selected_path or ''
             )
             return
 
@@ -481,6 +495,9 @@ class TabLimpiados(QWidget):
             'GUI_PDF_OUTPUT': pdf_path_file,
             'USERPROFILE': os.environ.get('USERPROFILE', ''),
         }
+        if rango_inicio is not None:
+            env['GUI_RANGO_INICIO'] = rango_inicio.strftime('%Y-%m-%d')
+            env['GUI_RANGO_FIN'] = rango_fin.strftime('%Y-%m-%d')
 
         self._metrics_path = metrics_path
         self._pdf_path_file = pdf_path_file
@@ -520,17 +537,30 @@ class TabLimpiados(QWidget):
 
         # Cache to sidecar files
         if pdf_path and self._selected_path:
-            pdf_cache = self._selected_path + '.analysis.pdf'
-            metrics_cache = self._selected_path + '.analysis.metrics.json'
             import shutil
+
+            m = re.search(r'_(\d{4}-\d{2}-\d{2})_to_(\d{4}-\d{2}-\d{2})\.pdf$',
+                          os.path.basename(pdf_path))
+            rango_suffix = f"{m.group(1)}_to_{m.group(2)}" if m else None
+
             try:
-                shutil.copy2(pdf_path, pdf_cache)
-                if metrics_path:
-                    shutil.copy2(metrics_path, metrics_cache)
-                self._cached_pdf = pdf_cache
-                self._cached_metrics = metrics_cache
-                self.btn_reanalyze.setVisible(True)
-                self.btn_reanalyze.setEnabled(True)
+                if rango_suffix:
+                    pdf_cache_h = self._selected_path + f'.analysis.{rango_suffix}.pdf'
+                    metrics_cache_h = self._selected_path + f'.analysis.{rango_suffix}.metrics.json'
+                    shutil.copy2(pdf_path, pdf_cache_h)
+                    if metrics_path:
+                        shutil.copy2(metrics_path, metrics_cache_h)
+
+                if self._rango_inicio is None:
+                    pdf_cache = self._selected_path + '.analysis.pdf'
+                    metrics_cache = self._selected_path + '.analysis.metrics.json'
+                    shutil.copy2(pdf_path, pdf_cache)
+                    if metrics_path:
+                        shutil.copy2(metrics_path, metrics_cache)
+                    self._cached_pdf = pdf_cache
+                    self._cached_metrics = metrics_cache
+                    self.btn_reanalyze.setVisible(True)
+                    self.btn_reanalyze.setEnabled(True)
             except Exception as e:
                 import traceback
                 traceback.print_exc()
@@ -539,7 +569,8 @@ class TabLimpiados(QWidget):
             pdf_path or '',
             metrics_path or '',
             self._selected_nombre or '',
-            self._selected_tf or ''
+            self._selected_tf or '',
+            self._selected_path or ''
         )
 
     def _on_progress(self, pct):

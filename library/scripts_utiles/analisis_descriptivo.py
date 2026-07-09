@@ -11,7 +11,7 @@ from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 import os
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
-from core.config import CONFIG_PATH, INFORMES_DIR, LIMPIADOS_DIR, BASE_DATA
+from core.config import CONFIG_PATH, INFORMES_DIR, LIMPIADOS_DIR, BASE_DATA, tf_to_minutes
 from scipy import stats
 from statsmodels.tsa.stattools import adfuller, kpss
 from statsmodels.tools.sm_exceptions import InterpolationWarning
@@ -1168,15 +1168,7 @@ if __name__ == "__main__":
     _NATR_PAIRS = {}
 
     def _tf_to_minutes(tf):
-        m = re.match(r'(\d+)(min|mo|m|h|d|w)', tf)
-        if not m: return None
-        val, unit = int(m.group(1)), m.group(2)
-        if unit in ('min', 'm'): return val
-        if unit == 'h': return val * 60
-        if unit == 'd': return val * 1440
-        if unit == 'w': return val * 10080
-        if unit == 'mo': return val * 43200
-        return None
+        return tf_to_minutes(tf)
 
     def _resample_ohlc(df, rule):
         return df.resample(rule).agg({
@@ -1286,6 +1278,55 @@ if __name__ == "__main__":
         print(f"  ⚠ PASO 19: Error en cálculo NATR: {e}")
     # endregion
     # ==========================================================================
+    # ── PASO 19.5: Z-score, Ratio por horizonte (NATR) ──
+    HORIZON_NAMES = list(HORIZON_PAIRS.keys())
+    WINDOW_ZSCORE_DAYS = {'General': 252, 'Scalping': 30, 'Daytrading': 90, 'Swingtrading': 180, 'Position': 252}
+    _NATR_Z_SERIES = {h: {} for h in HORIZON_NAMES}
+    _NATR_Z_CURRENT = {h: {} for h in HORIZON_NAMES}
+    _NATR_RATIO_SERIES = {h: {} for h in HORIZON_NAMES}
+    _NATR_RATIO_BB = {h: {} for h in HORIZON_NAMES}
+    _NATR_THEORETICAL = {}
+    if _NATR_DATA:
+        tfs_sorted = sorted(_NATR_DATA.keys(), key=lambda x: _tf_to_minutes(x) or 0)
+        base_tf_teo = tfs_sorted[0]
+        base_natr = float(_NATR_DATA[base_tf_teo].mean())
+        base_min = _tf_to_minutes(base_tf_teo) or 1
+        for tf in tfs_sorted:
+            tf_min = _tf_to_minutes(tf) or 1
+            _NATR_THEORETICAL[tf] = base_natr * np.sqrt(base_min / tf_min)
+
+    for horizon_name, pairs in HORIZON_PAIRS.items():
+        window_days = WINDOW_ZSCORE_DAYS.get(horizon_name, 252)
+        for tf in _NATR_DATA:
+            s = _NATR_DATA[tf].dropna()
+            if len(s) < 30:
+                continue
+            w = min(window_days, len(s) // 2)
+            mu, sigma = s.mean(), s.std()
+            if sigma > 0:
+                _NATR_Z_CURRENT[horizon_name][tf] = (s.iloc[-1] - mu) / sigma
+                _NATR_Z_SERIES[horizon_name][tf] = s.rolling(w, min_periods=w).apply(
+                    lambda x: (x.iloc[-1] - x.mean()) / x.std() if x.std() > 0 else 0)
+            else:
+                _NATR_Z_CURRENT[horizon_name][tf] = 0.0
+                _NATR_Z_SERIES[horizon_name][tf] = pd.Series(0.0, index=s.index)
+        for tf_a, tf_b in pairs:
+            if tf_a not in _NATR_DATA or tf_b not in _NATR_DATA:
+                continue
+            both = pd.DataFrame({tf_a: _NATR_DATA[tf_a], tf_b: _NATR_DATA[tf_b]}).dropna()
+            if len(both) < 30:
+                continue
+            ratio_s = (both[tf_a] / both[tf_b]).dropna()
+            if len(ratio_s) < 30:
+                continue
+            _NATR_RATIO_SERIES[horizon_name][(tf_a, tf_b)] = ratio_s
+            mu_r, sigma_r = ratio_s.mean(), ratio_s.std()
+            _NATR_RATIO_BB[horizon_name][(tf_a, tf_b)] = {
+                'mean': pd.Series(mu_r, index=ratio_s.index),
+                'upper': pd.Series(mu_r + 2 * sigma_r, index=ratio_s.index),
+                'lower': pd.Series(mu_r - 2 * sigma_r, index=ratio_s.index),
+                'current': float(ratio_s.iloc[-1]),
+            }
     # endregion
     # region ── 9. 📊 ESTRUCTURACIÓN Y PRESENTACIÓN DE MÉTRICAS FINANCIERAS EN TERMINAL
     # ── CONFIGURACIÓN DE ETIQUETAS DINÁMICAS (Para Ticks o Tiempo Fijo) ──────────
@@ -1513,13 +1554,29 @@ if __name__ == "__main__":
         natr_cat[f'NATR({tf_name})'] = f'{_NATR_DATA[tf_name].mean():.4f}'
     for horizon_name in ['Scalping', 'Daytrading', 'Swingtrading', 'Position']:
         results = _NATR_PAIRS.get(horizon_name, [])
-        for r in results:
-            prefix = f'[{horizon_name}] Par {r["pair"]}'
-            natr_cat[f'{prefix} - NATR base'] = f'{r["natr_base"]:.4f}'
-            natr_cat[f'{prefix} - NATR target'] = f'{r["natr_target"]:.4f}'
-            natr_cat[f'{prefix} - Ratio'] = f'{r["ratio"]:.4f}'
-            natr_cat[f'{prefix} - Lead-Lag'] = f'~{r["lag"]} velas ({r["lag_unit"]}) [max: {r["max_lag"]} lags]'
+        for result_item in results:
+            prefix = f'[{horizon_name}] Par {result_item["pair"]}'
+            natr_cat[f'{prefix} - NATR base'] = f'{result_item["natr_base"]:.4f}'
+            natr_cat[f'{prefix} - NATR target'] = f'{result_item["natr_target"]:.4f}'
+            natr_cat[f'{prefix} - Ratio'] = f'{result_item["ratio"]:.4f}'
+            natr_cat[f'{prefix} - Lead-Lag'] = f'~{result_item["lag"]} velas ({result_item["lag_unit"]}) [max: {result_item["max_lag"]} lags]'
     _mostrar_categoria('14. NATR, correlación Multi-TF', natr_cat)
+
+    # ── 14.5. NATR Z-score, Régimen, Ratio por horizonte ──
+    natr_zr = {}
+    for horizon_name in HORIZON_NAMES:
+        prefix = f'[{horizon_name}]' if horizon_name != 'General' else ''
+        zs = _NATR_Z_CURRENT.get(horizon_name, {})
+        for tf in sorted(zs.keys(), key=lambda x: _tf_to_minutes(x) or 0):
+            natr_zr[f'{prefix}Z-score({tf})'] = f'{zs[tf]:+.3f}'
+        pairs = HORIZON_PAIRS.get(horizon_name, [])
+        for tf_a, tf_b in pairs:
+            k = (tf_a, tf_b)
+            bb = _NATR_RATIO_BB.get(horizon_name, {}).get(k, {})
+            natr_zr[f'{prefix}Ratio({tf_a}/{tf_b})'] = f'{bb.get("current", 0):.4f}'
+            natr_zr[f'{prefix}Ratio BB sup({tf_a}/{tf_b})'] = f'{bb.get("upper", pd.Series([0])).iloc[0]:.4f}'
+            natr_zr[f'{prefix}Ratio BB inf({tf_a}/{tf_b})'] = f'{bb.get("lower", pd.Series([0])).iloc[0]:.4f}'
+    _mostrar_categoria('14.5. NATR Z-score, Ratio por horizonte', natr_zr)
 
     print()
     print(f"\n{'═'*70}\n")
@@ -1574,7 +1631,7 @@ if __name__ == "__main__":
         # Configuración de diseño: Máximo de categorías por página (2 por columna)
         CATS_POR_PAGINA = 6
         dy = 0.020
-        TOTAL_PAGINAS = math.ceil(len(categorias_reales) / CATS_POR_PAGINA) + 10
+        TOTAL_PAGINAS = math.ceil(len(categorias_reales) / CATS_POR_PAGINA) + 15
         PRIMERA_PAG_NO_METRICAS = math.ceil(len(categorias_reales) / CATS_POR_PAGINA) + 1
         
         for pag_num, i in enumerate(range(0, len(categorias_reales), CATS_POR_PAGINA), start=1):
@@ -2062,7 +2119,10 @@ if __name__ == "__main__":
             print(f"Generado página {PRIMERA_PAG_NO_METRICAS + 4}/{TOTAL_PAGINAS} — Riesgo Intradiario + Rolling VaR...")
     
         except Exception as e:
+            import traceback
             print(f"ERROR EN PÁGINA 6: {e}")
+            traceback.print_exc()
+            print(f"  TIPOS: r={type(r).__name__}, velas_por_dia={type(velas_por_dia).__name__}, vol_por_hora={type(vol_por_hora).__name__}")
             plt.close()
     
     # endregion
@@ -2397,8 +2457,8 @@ if __name__ == "__main__":
             ax_bot.set_facecolor('#111111')
             all_pairs = []
             for h_name in ['Scalping', 'Daytrading', 'Swingtrading', 'Position']:
-                for r in _NATR_PAIRS.get(h_name, []):
-                    all_pairs.append((h_name, r))
+                for pair_data in _NATR_PAIRS.get(h_name, []):
+                    all_pairs.append((h_name, pair_data))
             if all_pairs:
                 ax_bot.text(0.04, 0.92, 'Pares de volatilidad por horizonte:', fontsize=9,
                             color='#ff9900', fontweight='bold', va='center')
@@ -2408,14 +2468,14 @@ if __name__ == "__main__":
                     ax_bot.text(col_x[ci], 0.86, hdr, fontsize=7, color='#4fc3f7',
                                 fontweight='bold', va='center')
                 y = 0.80
-                for h_name, r in all_pairs:
+                for h_name, pair_data in all_pairs:
                     vals = [
                         h_name,
-                        r['pair'],
-                        f'{r["natr_base"]:.4f}',
-                        f'{r["natr_target"]:.4f}',
-                        f'{r["ratio"]:.4f}',
-                        f'~{r["lag"]} velas ({r["lag_unit"]}) [max: {r["max_lag"]} lags]',
+                        pair_data['pair'],
+                        f'{pair_data["natr_base"]:.4f}',
+                        f'{pair_data["natr_target"]:.4f}',
+                        f'{pair_data["ratio"]:.4f}',
+                        f'~{pair_data["lag"]} velas ({pair_data["lag_unit"]}) [max: {pair_data["max_lag"]} lags]',
                     ]
                     for ci, v in enumerate(vals):
                         ax_bot.text(col_x[ci], y, v, fontsize=6.5, color='white', va='center')
@@ -2487,8 +2547,173 @@ if __name__ == "__main__":
         plt.tight_layout(pad=3.0)
         pdf.savefig(fig)
         plt.close(fig)
-    print(f"Generado página {PRIMERA_PAG_NO_METRICAS + 9}/{TOTAL_PAGINAS} — Análisis de Dependencia(ACF/PACF)")
-    # endregion
+        print(f"Generado página {PRIMERA_PAG_NO_METRICAS + 9}/{TOTAL_PAGINAS} — Análisis de Dependencia(ACF/PACF)")
+        # endregion
+        # region ── PÁGINA 12-16 — Dashboard NATR (5 horizontes) ─────
+        for hi, horizon_name in enumerate(HORIZON_NAMES):
+            try:
+                fig = plt.figure(figsize=(11.69, 8.27))
+                fig.patch.set_facecolor('#0f0f0f')
+                window_z_days = WINDOW_ZSCORE_DAYS.get(horizon_name, 252)
+                fig.suptitle(
+                    f"{CONFIG['nombre']} ({CONFIG['tf']}) — Dashboard NATR {horizon_name} — Ventana Z: {window_z_days}d",
+                    color='white', fontsize=13, y=0.975
+                )
+                tfs_disp = sorted(_NATR_DATA.keys(), key=lambda x: _tf_to_minutes(x) or 0)
+                gs = gridspec.GridSpec(2, 2, hspace=0.40, wspace=0.25,
+                                       height_ratios=[1.0, 1.0], left=0.07, right=0.96,
+                                       top=0.91, bottom=0.06)
+    
+                ax_a = fig.add_subplot(gs[0, 0])
+                ax_a.set_facecolor('#111111')
+                try:
+                    if tfs_disp and _NATR_THEORETICAL:
+                        mins = [_tf_to_minutes(tf) or 1 for tf in tfs_disp]
+                        natrs_actual = [float(_NATR_DATA[tf].mean()) for tf in tfs_disp]
+                        natrs_teo = [_NATR_THEORETICAL.get(tf, 0) for tf in tfs_disp]
+                        ax_a.plot(mins, natrs_actual, 'o-', color='#4fc3f7', linewidth=1.4,
+                                  markersize=5, label='NATR actual', zorder=3)
+                        ax_a.plot(mins, natrs_teo, 'x--', color='#ff9900', linewidth=1.0,
+                                  markersize=4, alpha=0.7, label='Te\u00f3rico \u221aT', zorder=2)
+                        ax_a.set_xscale('log')
+                        ax_a.set_yscale('log')
+                        ax_a.set_xticks(mins)
+                        ax_a.set_xticklabels(tfs_disp, rotation=30, ha='right', fontsize=7, color='#888780')
+                        ax_a.tick_params(colors='#888780', labelsize=7)
+                        ax_a.legend(loc='upper left', fontsize=7, framealpha=0.3, labelcolor='#888780')
+                        if len(natrs_actual) >= 2 and natrs_actual[0] > natrs_teo[0] * 1.1:
+                            ax_a.text(0.98, 0.05, 'BACKWARDACI\u00d3N', transform=ax_a.transAxes,
+                                      ha='right', va='bottom', color='#e24b4a', fontsize=8, fontweight='bold')
+                        else:
+                            ax_a.text(0.98, 0.05, 'CONTANGO', transform=ax_a.transAxes,
+                                      ha='right', va='bottom', color='#1d9e75', fontsize=8, fontweight='bold')
+                    else:
+                        ax_a.text(0.5, 0.5, "Sin datos para term structure.", ha='center', va='center',
+                                  color='#888780', transform=ax_a.transAxes)
+                except Exception:
+                    ax_a.text(0.5, 0.5, "Error Panel A", ha='center', va='center', color='#888780',
+                              transform=ax_a.transAxes)
+                ax_a.set_title('A \u2500 Term Structure NATR', color='white', fontsize=10, pad=6)
+                ax_a.set_xlabel('Timeframe', color='#888780', fontsize=8)
+                ax_a.set_ylabel('NATR (%)', color='#888780', fontsize=8)
+                for spine in ax_a.spines.values():
+                    spine.set_edgecolor('#333')
+                ax_a.grid(True, alpha=0.15, color='#333', which='both')
+    
+                ax_b = fig.add_subplot(gs[0, 1])
+                ax_b.set_facecolor('#111111')
+                try:
+                    z_current_h = _NATR_Z_CURRENT.get(horizon_name, {})
+                    if z_current_h:
+                        tfs_z = sorted(z_current_h.keys(), key=lambda x: _tf_to_minutes(x) or 0)
+                        z_vals = [z_current_h.get(tf, 0) for tf in tfs_z]
+                        colors_z = ['#e24b4a' if z > 2 else '#1d9e75' if z < -2 else '#f1c40f' if abs(z) > 1 else '#2a4a6a'
+                                    for z in z_vals]
+                        y_pos = np.arange(len(tfs_z))
+                        ax_b.barh(y_pos, z_vals, color=colors_z, edgecolor='#333', height=0.6)
+                        ax_b.set_yticks(y_pos)
+                        ax_b.set_yticklabels(tfs_z, fontsize=7, color='#888780')
+                        ax_b.axvline(2, color='#e24b4a', linestyle='--', alpha=0.6, linewidth=0.8)
+                        ax_b.axvline(-2, color='#1d9e75', linestyle='--', alpha=0.6, linewidth=0.8)
+                        ax_b.axvline(0, color='#888780', linestyle='-', alpha=0.4, linewidth=0.5)
+                        for i, (tf, z) in enumerate(zip(tfs_z, z_vals)):
+                            ax_b.text(max(z + 0.1, 0.15) if z >= 0 else min(z - 0.1, -0.15),
+                                      i, f'{z:+.2f}', va='center', fontsize=6.5, color='white',
+                                      ha='left' if z >= 0 else 'right')
+                    else:
+                        ax_b.text(0.5, 0.5, "Sin Z-scores.", ha='center', va='center',
+                                  color='#888780', transform=ax_b.transAxes)
+                except Exception:
+                    ax_b.text(0.5, 0.5, "Error Panel B", ha='center', va='center',
+                              color='#888780', transform=ax_b.transAxes)
+                ax_b.set_title('B \u2500 Z-score NATR por TF', color='white', fontsize=10, pad=6)
+                ax_b.set_xlabel('Z-score', color='#888780', fontsize=8)
+                ax_b.tick_params(colors='#888780', labelsize=7)
+                for spine in ax_b.spines.values():
+                    spine.set_edgecolor('#333')
+                ax_b.grid(True, alpha=0.15, color='#333', axis='x')
+                ax_b.set_xlim(-4, 4)
+    
+                ax_c = fig.add_subplot(gs[1, 0])
+                ax_c.set_facecolor('#111111')
+                try:
+                    z_series_h = _NATR_Z_SERIES.get(horizon_name, {})
+                    if z_series_h:
+                        cmap_colors = plt.cm.tab10(np.linspace(0, 1, len(z_series_h)))
+                        sorted_tfs = sorted(z_series_h.keys(), key=lambda x: _tf_to_minutes(x) or 0)
+                        tf_colors = {tf: cmap_colors[i] for i, tf in enumerate(sorted_tfs)}
+                        for tf in sorted_tfs:
+                            zs = z_series_h[tf]
+                            if len(zs) > 0:
+                                step = max(1, len(zs) // 500)
+                                ax_c.plot(zs.index[::step], zs.values[::step],
+                                          color=tf_colors[tf], linewidth=0.7, alpha=0.75, label=tf)
+                        ax_c.axhline(2, color='#e24b4a', linestyle='--', alpha=0.5, linewidth=0.8)
+                        ax_c.axhline(-2, color='#1d9e75', linestyle='--', alpha=0.5, linewidth=0.8)
+                        ax_c.legend(loc='upper right', fontsize=6, framealpha=0.3, ncol=2, labelcolor='#888780')
+                    else:
+                        ax_c.text(0.5, 0.5, "Sin series temporales.", ha='center', va='center',
+                                  color='#888780', transform=ax_c.transAxes)
+                except Exception:
+                    ax_c.text(0.5, 0.5, "Error Panel C", ha='center', va='center',
+                              color='#888780', transform=ax_c.transAxes)
+                ax_c.set_title('C \u2500 Serie temporal Z-score Multi-TF', color='white', fontsize=10, pad=6)
+                ax_c.set_ylabel('Z-score', color='#888780', fontsize=8)
+                ax_c.tick_params(colors='#888780', labelsize=6)
+                for spine in ax_c.spines.values():
+                    spine.set_edgecolor('#333')
+                ax_c.grid(True, alpha=0.15, color='#333')
+    
+                ax_d = fig.add_subplot(gs[1, 1])
+                ax_d.set_facecolor('#111111')
+                try:
+                    ratio_series_h = _NATR_RATIO_SERIES.get(horizon_name, {})
+                    ratio_bb_h = _NATR_RATIO_BB.get(horizon_name, {})
+                    if ratio_series_h:
+                        ratio_colors = ['#4fc3f7', '#ff9900']
+                        for i, ((tf_a, tf_b), ratio_s) in enumerate(ratio_series_h.items()):
+                            bb = ratio_bb_h.get((tf_a, tf_b), {})
+                            step = max(1, len(ratio_s) // 500)
+                            x = ratio_s.index[::step]
+                            y = ratio_s.values[::step]
+                            color_r = ratio_colors[i % len(ratio_colors)]
+                            ax_d.plot(x, y, color=color_r, linewidth=0.9, alpha=0.85,
+                                      label=f'{tf_a}/{tf_b}')
+                            if bb.get('upper') is not None and len(bb['upper']) > 0:
+                                mu_b = bb['mean'].dropna()
+                                up = bb['upper'].dropna()
+                                lo = bb['lower'].dropna()
+                                step_bb = max(1, len(mu_b) // 500)
+                                ax_d.fill_between(mu_b.index[::step_bb],
+                                                  lo.values[::step_bb], up.values[::step_bb],
+                                                  color=color_r, alpha=0.10)
+                                ax_d.plot(mu_b.index[::step_bb], mu_b.values[::step_bb],
+                                          color=color_r, linestyle=':', linewidth=0.6, alpha=0.5)
+                            curr_val = bb.get('current', 0)
+                            ax_d.scatter([ratio_s.index[-1]], [curr_val], color=color_r, s=25, zorder=5)
+                        ax_d.legend(loc='upper right', fontsize=6, framealpha=0.3, labelcolor='#888780')
+                    else:
+                        ax_d.text(0.5, 0.5, "Sin ratios Short/Long disponibles.",
+                                  ha='center', va='center', color='#888780', transform=ax_d.transAxes)
+                except Exception:
+                    ax_d.text(0.5, 0.5, "Error Panel D", ha='center', va='center',
+                              color='#888780', transform=ax_d.transAxes)
+                ax_d.set_title('D \u2500 Ratio Short/Long (Bandas Bollinger \u00b12\u03c3)', color='white', fontsize=10, pad=6)
+                ax_d.set_ylabel('Ratio NATR fast/slow', color='#888780', fontsize=8)
+                ax_d.tick_params(colors='#888780', labelsize=6)
+                for spine in ax_d.spines.values():
+                    spine.set_edgecolor('#333')
+                ax_d.grid(True, alpha=0.15, color='#333')
+    
+                pdf.savefig(fig, facecolor=fig.get_facecolor(), dpi=150)
+                plt.close()
+                print(f"Generado p\u00e1gina {PRIMERA_PAG_NO_METRICAS + 10 + hi}/{TOTAL_PAGINAS} \u2500 Dashboard NATR ({horizon_name})")
+            except Exception as e:
+                import traceback
+                print(f"ERROR EN P\u00e1gina NATR {horizon_name}: {e}")
+                traceback.print_exc()
+                plt.close()
+        # endregion
     # endregion
     # ── FINALIZACIÓN ──────────────────────────────────────────────────────────────
     print(f"{'='*60}")

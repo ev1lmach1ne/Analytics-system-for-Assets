@@ -1,10 +1,11 @@
-import os, json, re
+import os, json, re, glob
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                              QLabel, QComboBox, QFrame, QFileDialog, QTextBrowser,
-                             QTabWidget, QProgressBar, QScrollArea, QSizePolicy)
+                             QTabWidget, QProgressBar, QScrollArea, QSizePolicy, QMessageBox)
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QFont, QColor
 from gui.widgets.pdf_viewer import PdfViewer
+from core.config import tf_to_minutes
 
 STYLE_ANALISIS = """
 QWidget { background-color: #141e30; }
@@ -18,6 +19,10 @@ QPushButton:disabled { background-color: #1a2a45; color: #3a5a7a; }
 QPushButton#export { background-color: #0f2a1a; color: #2ecc71; }
 QPushButton#export:hover { background-color: #1a3a2a; }
 QPushButton#export:pressed { padding-top: 10px; padding-bottom: 6px; }
+QPushButton#periodo_del {
+    background-color: #3a1a1a; color: #e74c3c; padding: 6px 10px; font-size: 12px; min-width: 0;
+}
+QPushButton#periodo_del:hover { background-color: #4a2525; }
 QComboBox {
     background-color: #1a2a45; color: #c8d6e5; border: none;
     padding: 6px 10px; border-radius: 4px; font-size: 12px; min-width: 140px;
@@ -27,6 +32,12 @@ QComboBox::down-arrow { border: none; }
 QComboBox QAbstractItemView {
     background-color: #1a2a45; color: #c8d6e5; selection-background-color: #2a4a6a;
     border: 1px solid #253a60; outline: none;
+}
+QComboBox QAbstractItemView::item:disabled {
+    background-color: #0d1424; color: #3a5a7a;
+}
+QComboBox QAbstractItemView::item:disabled:hover {
+    background-color: #0d1424;
 }
 QProgressBar {
     background-color: #1a2a45; border: none;
@@ -64,6 +75,8 @@ ANSI_COLORS = {
 }
 
 BAR_RE = re.compile(r'^([█░]{12})\s+(.*)$')
+
+RANGO_RE = re.compile(r'\.analysis\.(\d{4}-\d{2}-\d{2})_to_(\d{4}-\d{2}-\d{2})\.pdf$')
 
 HORIZONTES = [
     ('General',     'Todas las metricas'),
@@ -248,6 +261,7 @@ class TabAnalisis(QWidget):
         self._all_metrics = None
         self._ticker = ''
         self._tf = ''
+        self._csv_path = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
@@ -273,7 +287,24 @@ class TabAnalisis(QWidget):
         self.horizon = QComboBox()
         self.horizon.addItems(["General", "Scalping", "Daytrading", "Swingtrading", "Position"])
         self.horizon.setToolTip("Horizonte de analisis")
+        self.horizon.currentIndexChanged.connect(self._on_horizon_changed)
         toolbar.addWidget(self.horizon)
+
+        lbl_periodo_combo = QLabel("Periodo")
+        lbl_periodo_combo.setStyleSheet("color: #aabbcc; font-size: 11px; font-weight: bold; padding-right: 4px; padding-left: 12px;")
+        toolbar.addWidget(lbl_periodo_combo)
+
+        self.periodo_combo = QComboBox()
+        self.periodo_combo.setToolTip("Periodo analizado disponible para este activo")
+        self.periodo_combo.currentIndexChanged.connect(self._on_periodo_combo_changed)
+        toolbar.addWidget(self.periodo_combo)
+
+        self.btn_periodo_del = QPushButton("✕")
+        self.btn_periodo_del.setObjectName("periodo_del")
+        self.btn_periodo_del.setFixedWidth(28)
+        self.btn_periodo_del.setToolTip("Eliminar este periodo analizado")
+        self.btn_periodo_del.clicked.connect(self._eliminar_periodo_actual)
+        toolbar.addWidget(self.btn_periodo_del)
 
         self.btn_apply = QPushButton("Aplicar")
         self.btn_apply.clicked.connect(self._render_metrics)
@@ -307,32 +338,156 @@ class TabAnalisis(QWidget):
         return self.horizon.currentText()
 
     def _update_horizon_items(self, tf):
+        print(f"[DEBUG tab_analisis] _update_horizon_items(tf={tf!r})", flush=True)
         for i in range(self.horizon.count()):
-            self.horizon.model().item(i).setEnabled(True)
-        if tf:
-            m = re.match(r'(\d+)([smhd])', tf)
-            if m:
-                num, unit = int(m.group(1)), m.group(2)
-                seconds = {'s': 1, 'm': 60, 'h': 3600, 'd': 86400}[unit] * num
-                if seconds >= 3600:
-                    self.horizon.model().item(1).setEnabled(False)
-                    if self.horizon.currentIndex() == 1:
-                        self.horizon.setCurrentIndex(0)
+            item = self.horizon.model().item(i)
+            item.setEnabled(True)
+            item.setData(QColor('#c8d6e5'), Qt.ItemDataRole.ForegroundRole)
+        if not tf:
+            print("[DEBUG tab_analisis] tf vacio, sin deshabilitar", flush=True)
+            return
+        tf_minutos = tf_to_minutes(tf)
+        if tf_minutos is None:
+            try:
+                tf_minutos = float(tf)
+            except (ValueError, TypeError):
+                print(f"[DEBUG tab_analisis] tf={tf!r} no convertible a minutos, sin deshabilitar", flush=True)
+                return
+        print(f"[DEBUG tab_analisis] tf_minutos={tf_minutos}", flush=True)
 
-    def load_results(self, pdf_path, metrics_path, ticker, tf):
-        self._pdf_path = pdf_path if pdf_path and os.path.exists(pdf_path) else None
-        self._metrics_path = metrics_path if metrics_path and os.path.exists(metrics_path) else None
+        # Thresholds por horizonte segun TF base:
+        # 0=General(siempre), 1=Scalping(>=5min prohibido),
+        # 2=Daytrading(>=4h prohibido), 3=Swingtrading(>=1d prohibido),
+        # 4=Position(siempre disponible)
+        umbrales = {1: 5, 2: 240, 3: 1440}
+        for idx, umbral in umbrales.items():
+            if tf_minutos >= umbral:
+                item = self.horizon.model().item(idx)
+                item.setEnabled(False)
+                item.setData(QColor('#3a5a7a'), Qt.ItemDataRole.ForegroundRole)
+                print(f"[DEBUG tab_analisis] deshabilitado idx={idx} (>= {umbral} min)", flush=True)
+                if self.horizon.currentIndex() == idx:
+                    self.horizon.setCurrentIndex(0)
+                    print(f"[DEBUG tab_analisis] fallback a General (idx 0)", flush=True)
+
+    def _on_horizon_changed(self, idx):
+        if self._pdf_path:
+            pc = self.graphs_viewer.page_count
+            if pc >= 5:
+                target = pc - 5 + idx
+                self.graphs_viewer.go_to_page(target)
+
+    def preview_horizon_for(self, nombre, tf):
+        print(f"[DEBUG tab_analisis] preview_horizon_for(nombre={nombre!r} tf={tf!r})", flush=True)
+        self._ticker = nombre or ''
+        self._tf = tf or ''
+        self.lbl_asset.setText(f"{nombre} {tf}" if nombre and tf else "Sin activo")
+        self._update_horizon_items(tf)
+
+    def load_results(self, pdf_path, metrics_path, ticker, tf, csv_path=None):
+        print(f"[DEBUG tab_analisis] load_results(ticker={ticker!r} tf={tf!r})", flush=True)
         self._ticker = ticker or ''
         self._tf = tf or ''
+        self._csv_path = csv_path or None
 
         self.lbl_asset.setText(f"{ticker} {tf}" if ticker and tf else "Sin activo")
-        self.btn_export.setEnabled(self._pdf_path is not None)
         self._update_horizon_items(tf)
+
+        self._poblar_periodo_combo(pdf_path)
+        self._aplicar_resultado(pdf_path, metrics_path)
+
+    def _poblar_periodo_combo(self, pdf_path_actual):
+        self.periodo_combo.blockSignals(True)
+        self.periodo_combo.clear()
+
+        entries = []
+        if self._csv_path:
+            for pdf_cand in sorted(glob.glob(self._csv_path + '.analysis.*_to_*.pdf')):
+                m = RANGO_RE.search(pdf_cand)
+                if not m:
+                    continue
+                inicio, fin = m.group(1), m.group(2)
+                metrics_cand = self._csv_path + f'.analysis.{inicio}_to_{fin}.metrics.json'
+                label = f"{inicio} → {fin}"
+                entries.append((label, pdf_cand, metrics_cand if os.path.exists(metrics_cand) else None))
+
+        if not entries and pdf_path_actual:
+            entries.append(("Actual", pdf_path_actual, self._metrics_path))
+
+        selected_idx = 0
+        for i, (label, pdf_cand, metrics_cand) in enumerate(entries):
+            self.periodo_combo.addItem(label, (pdf_cand, metrics_cand))
+            if pdf_cand == pdf_path_actual:
+                selected_idx = i
+
+        if entries:
+            self.periodo_combo.setCurrentIndex(selected_idx)
+        self.periodo_combo.blockSignals(False)
+        self._actualizar_estado_btn_periodo_del()
+
+    def _on_periodo_combo_changed(self, idx):
+        data = self.periodo_combo.itemData(idx)
+        if not data:
+            return
+        pdf_cand, metrics_cand = data
+        self._aplicar_resultado(pdf_cand, metrics_cand)
+        self._actualizar_estado_btn_periodo_del()
+
+    def _actualizar_estado_btn_periodo_del(self):
+        data = self.periodo_combo.currentData()
+        puede_eliminar = bool(data and data[0] and RANGO_RE.search(data[0]))
+        self.btn_periodo_del.setEnabled(puede_eliminar)
+
+    def _eliminar_periodo_actual(self):
+        idx = self.periodo_combo.currentIndex()
+        if idx < 0:
+            return
+        data = self.periodo_combo.itemData(idx)
+        if not data:
+            return
+        pdf_cand, metrics_cand = data
+        if not pdf_cand or not RANGO_RE.search(pdf_cand):
+            return
+
+        label = self.periodo_combo.itemText(idx)
+        reply = QMessageBox.question(
+            self, "Confirmar eliminación",
+            f"¿Eliminar el análisis del periodo {label}?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        # Liberar el PDF actual del visor ANTES de borrarlo: en Windows el
+        # archivo queda bloqueado mientras el visor lo tiene abierto.
+        self.graphs_viewer.load(None)
+
+        for f in (pdf_cand, metrics_cand):
+            if f and os.path.exists(f):
+                try:
+                    os.remove(f)
+                except Exception:
+                    pass
+
+        self._poblar_periodo_combo(None)
+        siguiente = self.periodo_combo.currentData()
+        if siguiente:
+            self._aplicar_resultado(*siguiente)
+        else:
+            self._aplicar_resultado(None, None)
+
+    def _aplicar_resultado(self, pdf_path, metrics_path):
+        self._pdf_path = pdf_path if pdf_path and os.path.exists(pdf_path) else None
+        self._metrics_path = metrics_path if metrics_path and os.path.exists(metrics_path) else None
+
+        self.btn_export.setEnabled(self._pdf_path is not None)
 
         try:
             if self._metrics_path:
                 with open(self._metrics_path, 'r', encoding='utf-8') as f:
                     self._all_metrics = json.load(f)
+            else:
+                self._all_metrics = None
         except Exception:
             self._all_metrics = None
 
@@ -348,25 +503,24 @@ class TabAnalisis(QWidget):
             return
 
         horizon = self.horizon.currentText() if self.horizon else 'General'
-        metricas = dict(self._all_metrics)
+        metricas = {}
+
+        for cat, items in self._all_metrics.items():
+            filtered = {}
+            for k, v in items.items():
+                if not k.startswith('['):
+                    filtered[k] = v
+                elif k.startswith(f'[{horizon}]'):
+                    clean_k = k[len(f'[{horizon}]'):].lstrip()
+                    filtered[clean_k] = v
+            if filtered:
+                metricas[cat] = filtered
 
         if horizon not in ('General', 'Scalping', 'Daytrading'):
             for key in ('11. Estimadores de Volatilidad OHLC',
                         '12. Test de Estacionariedad (ADF / KPSS)',
                         '13. Vida Media de Reversión (Half-Life OU)'):
                 metricas.pop(key, None)
-
-        # Filter NATR category 14 items by horizon
-        if '14. NATR, correlación Multi-TF' in metricas:
-            natr_items = metricas['14. NATR, correlación Multi-TF']
-            filtered = {}
-            for k, v in natr_items.items():
-                if not k.startswith('['):
-                    filtered[k] = v
-                elif horizon != 'General' and k.startswith(f'[{horizon}]'):
-                    clean_k = k.replace(f'[{horizon}] ', '')
-                    filtered[clean_k] = v
-            metricas['14. NATR Inter-TF'] = filtered
 
         period = self.metrics_scroll.populate(metricas)
         if period:
