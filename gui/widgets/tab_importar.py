@@ -112,6 +112,17 @@ class TabImportar(QWidget):
         sep.setObjectName("sep")
         layout.addWidget(sep)
 
+        # ── Buscador ──
+        search_layout = QHBoxLayout()
+        search_layout.setSpacing(8)
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Buscar archivo...")
+        self.search_input.setMaximumWidth(300)
+        self.search_input.textChanged.connect(self._filter_files)
+        search_layout.addWidget(self.search_input)
+        search_layout.addStretch()
+        layout.addLayout(search_layout)
+
         # ── Splitter: FileExplorer (left) + Console (right) ──
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
@@ -134,6 +145,9 @@ class TabImportar(QWidget):
             self._selected_file = path
             self.path_label.setText(os.path.basename(path))
             self.btn_config.setEnabled(True)
+
+    def _filter_files(self, text: str):
+        self.explorer.set_search_text(text)
 
     def _select_file(self):
         path, _ = QFileDialog.getOpenFileName(

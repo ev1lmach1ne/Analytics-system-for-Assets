@@ -120,10 +120,10 @@ class TabDescargar(QWidget):
             QPushButton {
                 background-color: #1a4a2a; color: #2ecc71;
                 border: none; border-radius: 4px;
-                font-size: 18px; padding: 2px 0px 0px 0px; margin: 0px;
+                font-size: 18px; padding: 0px 0px 0px 1px; margin: 0px;
             }
             QPushButton:hover { background-color: #2a5a3a; }
-            QPushButton:pressed { padding: 4px 0px 0px 1px; }
+            QPushButton:pressed { padding: 2px 0px 0px 2px; }
         """)
         self.btn_connector.clicked.connect(self._on_connector_clicked)
         toolbar.addWidget(self.btn_connector)

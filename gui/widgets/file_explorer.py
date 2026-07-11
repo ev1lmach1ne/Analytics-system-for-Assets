@@ -1,6 +1,6 @@
 import os
 from PyQt6.QtWidgets import (QListView, QWidget, QVBoxLayout, QPushButton,
-                             QHBoxLayout, QToolButton)
+                             QHBoxLayout, QToolButton, QStyle)
 from PyQt6.QtGui import QFileSystemModel, QPixmap, QPainter, QPen, QBrush, QColor, QFont, QIcon
 from PyQt6.QtCore import QSortFilterProxyModel, Qt, QSize, QPoint
 
@@ -8,6 +8,7 @@ class CsvFilterModel(QSortFilterProxyModel):
     def __init__(self, exclude_patterns=None, parent=None):
         super().__init__(parent)
         self._exclude_patterns = exclude_patterns or ['_preparado', '_limpiado', '_preparado_preparado']
+        self._search_text = ''
 
     def filterAcceptsRow(self, source_row, source_parent):
         model = self.sourceModel()
@@ -22,12 +23,15 @@ class CsvFilterModel(QSortFilterProxyModel):
         for pat in self._exclude_patterns:
             if pat in file_name:
                 return False
+        if self._search_text and self._search_text not in file_name:
+            return False
         return True
 
 class IncludeFilterModel(QSortFilterProxyModel):
     def __init__(self, include_patterns=None, parent=None):
         super().__init__(parent)
         self._include_patterns = include_patterns or ['_limpiado', '_limpio']
+        self._search_text = ''
 
     def filterAcceptsRow(self, source_row, source_parent):
         model = self.sourceModel()
@@ -42,9 +46,15 @@ class IncludeFilterModel(QSortFilterProxyModel):
         for pat in self._include_patterns:
             if pat in file_name:
                 return True
+        if self._search_text and self._search_text not in file_name:
+            return False
         return False
 
 class NoFilterModel(QSortFilterProxyModel):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._search_text = ''
+
     def filterAcceptsRow(self, source_row, source_parent):
         model = self.sourceModel()
         if not model:
@@ -54,6 +64,8 @@ class NoFilterModel(QSortFilterProxyModel):
         if model.isDir(index):
             return True
         if not (file_name.endswith('.csv') or file_name.endswith('.txt')):
+            return False
+        if self._search_text and self._search_text not in file_name:
             return False
         return True
 
@@ -111,6 +123,13 @@ QPushButton:disabled, QToolButton:disabled { background-color: #1a2a45; color: #
         self.btn_up.setEnabled(False)
         self.btn_up.setFixedSize(30, 28)
         nav.addWidget(self.btn_up)
+
+        self.btn_reload = QPushButton()
+        self.btn_reload.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload))
+        self.btn_reload.setToolTip("Recargar explorador")
+        self.btn_reload.clicked.connect(self.refresh)
+        self.btn_reload.setFixedSize(30, 28)
+        nav.addWidget(self.btn_reload)
 
         nav.addStretch()
         layout.addLayout(nav)
@@ -185,3 +204,7 @@ QPushButton:disabled, QToolButton:disabled { background-color: #1a2a45; color: #
         self.model.setRootPath(root)
         self.list_view.setRootIndex(self.filter_model.mapFromSource(self.model.index(root)))
         self.btn_up.setEnabled(False)
+
+    def set_search_text(self, text: str):
+        self.filter_model._search_text = text.strip().lower()
+        self.filter_model.invalidateFilter()

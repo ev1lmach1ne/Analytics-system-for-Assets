@@ -61,6 +61,10 @@ QComboBox QAbstractItemView {
     background-color: #1a2a45; color: #c8d6e5; selection-background-color: #2a4a6a;
     border: 1px solid #253a60; outline: none; margin: 0px;
 }
+QLineEdit {
+    background-color: #1a2a45; color: #c8d6e5; border: none;
+    padding: 6px 10px; border-radius: 4px; font-size: 11px;
+}
 QFrame#sep { background-color: #253a60; max-height: 1px; }
 """
 
@@ -121,6 +125,17 @@ class TabLimpiados(QWidget):
         sep = QFrame()
         sep.setObjectName("sep")
         layout.addWidget(sep)
+
+        # ── Buscador ──
+        search_layout = QHBoxLayout()
+        search_layout.setSpacing(8)
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Buscar archivo o activo...")
+        self.search_input.setMaximumWidth(300)
+        self.search_input.textChanged.connect(self._filter_files)
+        search_layout.addWidget(self.search_input)
+        search_layout.addStretch()
+        layout.addLayout(search_layout)
 
         # ── Splitter ──
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -211,6 +226,30 @@ class TabLimpiados(QWidget):
 
         # Initial scan for table mode
         self._scan_assets()
+
+    # ── Search filter ──
+
+    def _filter_files(self, text: str):
+        if self._grid_mode:
+            self.explorer.set_search_text(text)
+        else:
+            self._filter_table(text)
+
+    def _filter_table(self, text: str):
+        text = text.strip().lower()
+        for row in range(self.asset_table.rowCount()):
+            match = True
+            if text:
+                tf_item = self.asset_table.item(row, 0)
+                per_item = self.asset_table.item(row, 1)
+                tipo_item = self.asset_table.item(row, 2)
+                row_text = ' '.join([
+                    (tf_item.text() if tf_item else ''),
+                    (per_item.text() if per_item else ''),
+                    (tipo_item.text() if tipo_item else ''),
+                ]).lower()
+                match = text in row_text
+            self.asset_table.setRowHidden(row, not match)
 
     # ── Mode toggle ──
 
