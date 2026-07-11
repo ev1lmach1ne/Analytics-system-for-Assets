@@ -28,11 +28,12 @@ QLineEdit, QComboBox {
     background-color: #1a2a45; color: #c8d6e5; border: none;
     padding: 6px 10px; border-radius: 4px; font-size: 11px; min-width: 90px;
 }
+QComboBox { combobox-popup: 0; }
 QComboBox::drop-down { border: none; background: transparent; width: 20px; }
 QComboBox::down-arrow { border: none; }
 QComboBox QAbstractItemView {
     background-color: #1a2a45; color: #c8d6e5; selection-background-color: #2a4a6a;
-    border: 1px solid #253a60; outline: none;
+    border: 1px solid #253a60; outline: none; margin: 0px;
 }
 QFrame#sep { background-color: #253a60; max-height: 1px; }
 """

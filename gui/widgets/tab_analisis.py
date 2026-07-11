@@ -26,12 +26,13 @@ QPushButton#periodo_del:hover { background-color: #4a2525; }
 QComboBox {
     background-color: #1a2a45; color: #c8d6e5; border: none;
     padding: 6px 10px; border-radius: 4px; font-size: 12px; min-width: 140px;
+    combobox-popup: 0;
 }
 QComboBox::drop-down { border: none; background: transparent; width: 22px; }
 QComboBox::down-arrow { border: none; }
 QComboBox QAbstractItemView {
     background-color: #1a2a45; color: #c8d6e5; selection-background-color: #2a4a6a;
-    border: 1px solid #253a60; outline: none;
+    border: 1px solid #253a60; outline: none; margin: 0px;
 }
 QComboBox QAbstractItemView::item:disabled {
     background-color: #0d1424; color: #3a5a7a;
@@ -72,6 +73,7 @@ ANSI_COLORS = {
     94:  '#3498db',
     95:  '#9b59b6',
     96:  '#1abc9c',
+    97:  '#e0e0e0',
 }
 
 BAR_RE = re.compile(r'^([█░]{12})\s+(.*)$')
@@ -341,11 +343,33 @@ class TabAnalisis(QWidget):
         print(f"[DEBUG tab_analisis] _update_horizon_items(tf={tf!r})", flush=True)
         for i in range(self.horizon.count()):
             item = self.horizon.model().item(i)
+            if item is None:
+                continue
             item.setEnabled(True)
             item.setData(QColor('#c8d6e5'), Qt.ItemDataRole.ForegroundRole)
         if not tf:
             print("[DEBUG tab_analisis] tf vacio, sin deshabilitar", flush=True)
             return
+
+        try:
+            self._aplicar_umbrales_horizon(tf)
+        except Exception:
+            import traceback
+            print(f"[ERROR tab_analisis] fallo al aplicar umbrales de horizonte para tf={tf!r}:", flush=True)
+            traceback.print_exc()
+
+    def _deshabilitar_horizon_item(self, idx):
+        item = self.horizon.model().item(idx)
+        if item is None:
+            print(f"[DEBUG tab_analisis] idx={idx} sin item en el modelo, se ignora", flush=True)
+            return
+        item.setEnabled(False)
+        item.setData(QColor('#3a5a7a'), Qt.ItemDataRole.ForegroundRole)
+        if self.horizon.currentIndex() == idx:
+            self.horizon.setCurrentIndex(0)
+            print(f"[DEBUG tab_analisis] fallback a General (idx 0)", flush=True)
+
+    def _aplicar_umbrales_horizon(self, tf):
         tf_minutos = tf_to_minutes(tf)
         if tf_minutos is None:
             try:
@@ -355,20 +379,17 @@ class TabAnalisis(QWidget):
                 return
         print(f"[DEBUG tab_analisis] tf_minutos={tf_minutos}", flush=True)
 
-        # Thresholds por horizonte segun TF base:
-        # 0=General(siempre), 1=Scalping(>=5min prohibido),
-        # 2=Daytrading(>=4h prohibido), 3=Swingtrading(>=1d prohibido),
-        # 4=Position(siempre disponible)
-        umbrales = {1: 5, 2: 240, 3: 1440}
+        umbrales = {1: 6, 2: 120, 3: 300}
+        excepciones = {3: {1440}}  # 1d sigue disponible en Swingtrading
         for idx, umbral in umbrales.items():
-            if tf_minutos >= umbral:
-                item = self.horizon.model().item(idx)
-                item.setEnabled(False)
-                item.setData(QColor('#3a5a7a'), Qt.ItemDataRole.ForegroundRole)
+            if tf_minutos >= umbral and tf_minutos not in excepciones.get(idx, ()):
                 print(f"[DEBUG tab_analisis] deshabilitado idx={idx} (>= {umbral} min)", flush=True)
-                if self.horizon.currentIndex() == idx:
-                    self.horizon.setCurrentIndex(0)
-                    print(f"[DEBUG tab_analisis] fallback a General (idx 0)", flush=True)
+                self._deshabilitar_horizon_item(idx)
+
+        UMBRAL_POSITION_MIN = 43200  # 1 mes
+        if tf_minutos > UMBRAL_POSITION_MIN:
+            print(f"[DEBUG tab_analisis] deshabilitado idx=4 (> {UMBRAL_POSITION_MIN} min)", flush=True)
+            self._deshabilitar_horizon_item(4)
 
     def _on_horizon_changed(self, idx):
         if self._pdf_path:
@@ -507,14 +528,20 @@ class TabAnalisis(QWidget):
 
         for cat, items in self._all_metrics.items():
             filtered = {}
+            tiene_horizonte = False
             for k, v in items.items():
                 if not k.startswith('['):
                     filtered[k] = v
                 elif k.startswith(f'[{horizon}]'):
                     clean_k = k[len(f'[{horizon}]'):].lstrip()
+                    suffix = f'({horizon})'
+                    if clean_k.endswith(suffix):
+                        clean_k = clean_k[:-len(suffix)].rstrip()
                     filtered[clean_k] = v
+                    tiene_horizonte = True
             if filtered:
-                metricas[cat] = filtered
+                titulo = f'{cat} — {horizon}' if (tiene_horizonte and horizon != 'General') else cat
+                metricas[titulo] = filtered
 
         if horizon not in ('General', 'Scalping', 'Daytrading'):
             for key in ('11. Estimadores de Volatilidad OHLC',

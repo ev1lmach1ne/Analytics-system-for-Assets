@@ -11,7 +11,7 @@ import tkinter as tk
 from tkinter import filedialog
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 from core.config import CONFIG_PATH, QUESTDB_HOST, QUESTDB_HTTP_PORT, DB_CONFIG
-from core.parsing import parse_numero_flexible
+from core.parsing import parse_columna_flexible
 import customtkinter as ctk
 import re
 sys.stdout.reconfigure(encoding='utf-8')
@@ -353,9 +353,8 @@ try:
     fallos_parseo = {}
     for c in df.columns:
         if c != 'timestamp':
-            resultado = df[c].apply(parse_numero_flexible)
-            df[c] = resultado.apply(lambda t: t[0])
-            motivos = resultado.apply(lambda t: t[1])
+            vals, motivos = parse_columna_flexible(df[c])
+            df[c] = vals
             n_fallo = int((motivos == 'fallo').sum())
             if n_fallo > 0:
                 fallos_parseo[c] = n_fallo

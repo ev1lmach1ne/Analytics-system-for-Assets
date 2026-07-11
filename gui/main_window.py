@@ -2,6 +2,7 @@ from PyQt6.QtWidgets import (QMainWindow, QTabWidget, QWidget, QVBoxLayout,
                              QLabel, QPushButton, QHBoxLayout, QFrame, QSizePolicy)
 from PyQt6.QtCore import Qt, QPoint
 from PyQt6.QtGui import QFont, QPixmap
+from gui.widgets.tab_descargar import TabDescargar
 from gui.widgets.tab_importar import TabImportar
 from gui.widgets.tab_analisis import TabAnalisis
 from gui.widgets.tab_limpiados import TabLimpiados
@@ -72,7 +73,7 @@ class HeaderBar(QFrame):
         subtitle.setStyleSheet("color: #3a5a7a; font-size: 11px;")
         subtitle.setContentsMargins(6, 0, 0, 0)
 
-        version = QLabel("v0.5.3.3-alpha")
+        version = QLabel("v0.5.4")
         version.setStyleSheet("color: #2a4a6a; font-size: 10px; padding-left: 8px;")
 
         layout.addWidget(title)
@@ -187,12 +188,14 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.tabs.setDocumentMode(True)
 
+        self.tab_descargar = TabDescargar()
         self.tab_importar = TabImportar()
         self.tab_limpiados = TabLimpiados()
         self.tab_analisis = TabAnalisis()
 
         self.tab_limpiados.set_analisis_tab(self.tab_analisis)
 
+        self.tabs.addTab(self.tab_descargar, u"   Descargar   ")
         self.tabs.addTab(self.tab_importar, u"   Importar   ")
         self.tabs.addTab(self.tab_limpiados, u"   Limpiados   ")
         self.tabs.addTab(self.tab_analisis, u"   Analizador   ")
@@ -204,7 +207,7 @@ class MainWindow(QMainWindow):
         # Analysis completed → load results in Analisis tab and switch to it
         self.tab_limpiados.analysis_completed.connect(self.tab_analisis.load_results)
         self.tab_limpiados.analysis_completed.connect(
-            lambda *a: self.tabs.setCurrentIndex(2)
+            lambda *a: self.tabs.setCurrentIndex(3)
         )
 
         # File selected in Limpiados -> preview horizon disabling by TF
@@ -217,7 +220,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(StatusBar())
 
     def _on_tab_changed(self, index):
-        if index == 1:
+        if index == 2:
             self.tab_limpiados.explorer.refresh()
             self.tab_limpiados._scan_assets()
 

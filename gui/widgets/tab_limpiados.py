@@ -53,12 +53,13 @@ QHeaderView::section {
 QComboBox {
     background-color: #1a2a45; color: #c8d6e5; border: none;
     padding: 6px 10px; border-radius: 4px; font-size: 12px; min-width: 140px;
+    combobox-popup: 0;
 }
 QComboBox::drop-down { border: none; background: transparent; width: 22px; }
 QComboBox::down-arrow { border: none; }
 QComboBox QAbstractItemView {
     background-color: #1a2a45; color: #c8d6e5; selection-background-color: #2a4a6a;
-    border: 1px solid #253a60; outline: none;
+    border: 1px solid #253a60; outline: none; margin: 0px;
 }
 QFrame#sep { background-color: #253a60; max-height: 1px; }
 """
@@ -501,6 +502,13 @@ class TabLimpiados(QWidget):
 
         self._metrics_path = metrics_path
         self._pdf_path_file = pdf_path_file
+
+        # Liberar el PDF actualmente cargado en el visor ANTES de lanzar el análisis:
+        # si el nuevo informe reutiliza el mismo nombre de archivo (mismo activo/tf/
+        # rango), QPdfDocument sigue reteniendo el handle del PDF anterior durante
+        # toda la corrida y el script no puede sobrescribirlo (PermissionError).
+        if self._analisis_tab is not None:
+            self._analisis_tab.graphs_viewer.load(None)
 
         self.console.run(
             os.path.join(SCRIPTS_DIR, "analisis_descriptivo.py"),

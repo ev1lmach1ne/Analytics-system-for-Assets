@@ -167,15 +167,16 @@ else:
     min_obs = max(3, len(df_orig) * 0.001)
     dow_activos = sorted(obs_por_dow[obs_por_dow >= min_obs].index)
 
-    # Horas activas (>80% de los días con datos)
-    horas_por_dia = df_orig.groupby(df_orig.index.date)['_time'].apply(set)
-    if len(horas_por_dia) >= 3:
-        todas_las_horas = set().union(*horas_por_dia)
-        recuento = {h: sum(1 for s in horas_por_dia if h in s) for h in todas_las_horas}
-        umbral = len(horas_por_dia) * 0.8
-        horas_activas = sorted([h for h, c in recuento.items() if c >= umbral])
+    # Horas activas (>80% de los días con datos) — vectorizado con unstack
+    _fecha_idx = pd.Index(df_orig.index.date)
+    _horas_matriz = df_orig.groupby([_fecha_idx, '_time']).size().unstack(fill_value=0)
+    _presencia = _horas_matriz > 0
+    if len(_presencia) >= 3:
+        _recuento = _presencia.sum()
+        _umbral = len(_presencia) * 0.8
+        horas_activas = sorted([h for h in _presencia.columns if _recuento[h] >= _umbral])
     else:
-        horas_activas = sorted(set().union(*horas_por_dia)) if horas_por_dia else []
+        horas_activas = sorted(_presencia.columns.tolist()) if len(_presencia) > 0 else []
 
     if horas_activas and dow_activos:
         # Todos los días del rango, filtrados por días activos
