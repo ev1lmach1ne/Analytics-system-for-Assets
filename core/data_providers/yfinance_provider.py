@@ -55,6 +55,33 @@ class YFinanceProvider(BaseProvider):
         return _CATALOG.copy()
 
     @staticmethod
+    def search_symbols(query: str, max_results: int = 15) -> List[AssetInfo]:
+        """Busca simbolos en el autocompletado real de Yahoo Finance.
+
+        A diferencia de get_catalog() (lista fija precargada), esto golpea
+        la API de Yahoo en vivo y cubre cualquier accion/indice/forex/
+        commodity que Yahoo conozca, sin tener que mantener un catalogo
+        manual.
+        """
+        import yfinance as yf
+        query = query.strip()
+        if not query:
+            return []
+        try:
+            s = yf.Search(query, max_results=max_results, news_count=0, lists_count=0)
+        except Exception:
+            return []
+        return [
+            AssetInfo(
+                q['symbol'],
+                q.get('shortname') or q.get('longname') or q['symbol'],
+                q.get('quoteType', ''),
+                None,
+            )
+            for q in s.quotes if q.get('symbol')
+        ]
+
+    @staticmethod
     def get_available_range(symbol: str, progress_callback=None) -> Optional[tuple]:
         for asset in _CATALOG:
             if asset.symbol == symbol and asset.max_history_start:
@@ -63,7 +90,15 @@ class YFinanceProvider(BaseProvider):
                 if progress_callback:
                     progress_callback(f"  Rango estimado: {start_dt.date()} -> {end_dt.date()}")
                 return (start_dt, end_dt)
-        return None
+        # Simbolo no catalogado (ticker personalizado): Yahoo no falla con
+        # fechas anteriores al inicio real de cotizacion, simplemente
+        # devuelve datos desde que existan. Se usa un inicio generico amplio
+        # para que 'Historial Completo' funcione tambien con tickers libres.
+        start_dt = datetime(1970, 1, 1, tzinfo=timezone.utc)
+        end_dt = datetime.now(timezone.utc)
+        if progress_callback:
+            progress_callback(f"  Simbolo no catalogado: se pedira historial desde {start_dt.date()} (Yahoo recortara al inicio real)")
+        return (start_dt, end_dt)
 
     @staticmethod
     def download_ohlc(symbol: str, tf: str,
@@ -91,15 +126,19 @@ class YFinanceProvider(BaseProvider):
 
         fetch_tf = YF_TF_MAP.get(tf, '1h')
 
+        # El limite de Yahoo depende del intervalo real solicitado a su API
+        # (fetch_tf), no del tf logico pedido por el usuario: '4h' se pide
+        # como '1h' y luego se resamplea, asi que el limite de 730 dias de
+        # '1h' aplica igual.
         _MAX_INTRADAY_DAYS = {'1m': 7, '5m': 60, '15m': 60, '1h': 730}
-        max_days = _MAX_INTRADAY_DAYS.get(tf)
+        max_days = _MAX_INTRADAY_DAYS.get(fetch_tf)
         if max_days and end is not None:
             earliest = end - timedelta(days=max_days)
             if start is None or start < earliest:
                 if progress_callback:
                     old_start = start.date() if start else 'inicio'
                     progress_callback(
-                        f"  Yahoo limita datos {tf} a {max_days} dias. "
+                        f"  Yahoo limita datos {fetch_tf} a {max_days} dias. "
                         f"Ajustando inicio: {old_start} -> {earliest.date()}"
                     )
                 start = earliest

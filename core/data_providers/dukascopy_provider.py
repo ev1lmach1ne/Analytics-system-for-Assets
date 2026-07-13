@@ -6,14 +6,18 @@ gratis a traves de https://datafeed.dukascopy.com/datafeed/.  Este modulo
 descarga los archivos horarios, los descomprime y resamplea a velas OHLC.
 """
 
+import glob
 import lzma
+import os
+import tempfile
 import time
 import struct
 import requests
 import numpy as np
 import pandas as pd
-from datetime import datetime, timezone, timedelta,date
+from datetime import datetime, timezone, timedelta, date
 from typing import List, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .base_provider import BaseProvider, AssetInfo, TF_TO_PANDAS
 
@@ -21,11 +25,65 @@ from .base_provider import BaseProvider, AssetInfo, TF_TO_PANDAS
 
 BASE_URL = "https://datafeed.dukascopy.com/datafeed/"
 HEADERS = {'User-Agent': 'Mozilla/5.0'}
-REQUEST_TIMEOUT = 60
-RETRY_ATTEMPTS = 4
+REQUEST_TIMEOUT = 30
 RETRY_BASE_DELAY = 2.0
-REQUEST_POLITE_DELAY = 0.05   # small delay between requests to avoid rate-limit
-BATCH_SIZE = 500              # flush ticks to OHLC every N chunks (streaming)
+RETRY_MAX_DELAY = 60.0        # techo de backoff: un hueco de datos por
+                              # rate-limit es peor que tardar mas, asi que
+                              # los fallos transitorios se reintentan sin
+                              # limite de intentos (solo 404 = sin datos
+                              # real se acepta sin reintentar)
+_PARALLEL_WORKERS = 8         # conexiones simultáneas (Dukascopy es restrictivo).
+                              # El pacing ya no es un sleep fijo entre requests
+                              # (no escala para 2 décadas de datos): se logra
+                              # acotando la concurrencia a este valor y
+                              # dejando que _fetch_chunk reintente con backoff
+                              # exponencial ante 429/503.
+_BATCH_HOURS = 500            # horas por lote (control de memoria + progreso).
+                              # Cada lote se descarga en paralelo pero se
+                              # resamplea completo y en orden antes de pasar
+                              # al siguiente, para que cada vela OHLC se
+                              # calcule siempre sobre un rango horario
+                              # contiguo (nunca sobre ticks mezclados fuera
+                              # de orden entre lotes distintos).
+
+# --- Checkpoint / resume -------------------------------------------------------
+# Descargas de decadas en 1m pueden tardar dias reales (Dukascopy limita la
+# concurrencia). Cada lote ya resampleado se guarda en disco segun se
+# completa; si el proceso se corta a mitad, relanzar la misma descarga
+# (mismo simbolo/tf/rango) reanuda desde el ultimo lote guardado en vez de
+# volver a empezar.
+_CHECKPOINT_DIR = os.path.join(tempfile.gettempdir(), 'analytics_cache', 'dukascopy_checkpoints')
+_CHECKPOINT_MAX_AGE_DAYS = 7  # limpieza de checkpoints huerfanos muy viejos
+
+
+def _checkpoint_key(symbol: str, tf: str, start: datetime, end: datetime) -> str:
+    safe_symbol = symbol.replace('/', '_').replace(':', '_')
+    return f"{safe_symbol}_{tf}_{start.strftime('%Y%m%dT%H')}_{end.strftime('%Y%m%dT%H')}"
+
+
+def _checkpoint_batch_path(key: str, batch_idx: int) -> str:
+    return os.path.join(_CHECKPOINT_DIR, f"{key}__batch{batch_idx:05d}.pkl")
+
+
+def _cleanup_old_checkpoints():
+    """Borra checkpoints huerfanos de descargas abandonadas hace mas de
+    _CHECKPOINT_MAX_AGE_DAYS. No afecta a la descarga en curso (distinto key)."""
+    try:
+        cutoff = time.time() - _CHECKPOINT_MAX_AGE_DAYS * 86400
+        for path in glob.glob(os.path.join(_CHECKPOINT_DIR, '*.pkl')):
+            if os.path.getmtime(path) < cutoff:
+                os.remove(path)
+    except Exception:
+        pass
+
+
+def _cleanup_checkpoints_for_key(key: str):
+    try:
+        for path in glob.glob(os.path.join(_CHECKPOINT_DIR, f"{key}__batch*.pkl")):
+            os.remove(path)
+    except Exception:
+        pass
+
 
 PIPET_SIZE_REGISTRY = {
     'EURUSD': 1e-5, 'GBPUSD': 1e-5, 'AUDUSD': 1e-5,
@@ -99,35 +157,33 @@ def _decode_bi5(content: bytes, hour_start: datetime, pipet_scale: float) -> np.
 
 
 def _fetch_chunk(url: str, progress_callback=None) -> Optional[bytes]:
-    """Descarga un chunk .bi5 con reintentos."""
-    for attempt in range(RETRY_ATTEMPTS + 1):
+    """Descarga un chunk .bi5.
+
+    404 = Dukascopy confirma que no hay datos en esa hora (fin de semana,
+    festivo...): respuesta legitima, no se reintenta.
+    Cualquier otro resultado (429/503, HTTP inesperado, timeout, conexion
+    cortada) se considera transitorio y se reintenta indefinidamente con
+    backoff exponencial acotado a RETRY_MAX_DELAY, para no dejar huecos
+    falsos en el historico por un rate-limit temporal.
+    """
+    attempt = 0
+    while True:
         try:
             r = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
             if r.status_code == 200 and r.content:
                 return r.content
             elif r.status_code == 404:
-                return None  # No hay datos en esa hora
-            elif r.status_code in (429, 503):
-                delay = RETRY_BASE_DELAY * (2 ** attempt)
-                if progress_callback:
-                    progress_callback(f"   Rate-limited ({r.status_code}), esperando {delay:.0f}s...")
-                time.sleep(delay)
-                continue
-            else:
-                if progress_callback:
-                    progress_callback(f"   HTTP {r.status_code} en {url}")
-                return None
-        except (requests.Timeout, requests.ConnectionError) as e:
-            if attempt < RETRY_ATTEMPTS:
-                delay = RETRY_BASE_DELAY * (2 ** attempt)
-                if progress_callback:
-                    progress_callback(f"   Timeout, reintentando en {delay:.0f}s (intento {attempt + 1}/{RETRY_ATTEMPTS})...")
-                time.sleep(delay)
-                continue
+                return None  # No hay datos en esa hora (legitimo)
+            delay = min(RETRY_BASE_DELAY * (2 ** attempt), RETRY_MAX_DELAY)
             if progress_callback:
-                progress_callback(f"   Error final tras {RETRY_ATTEMPTS} intentos: {e}")
-            return None
-    return None
+                progress_callback(f"   HTTP {r.status_code}, reintentando en {delay:.0f}s (intento {attempt + 1})...")
+            time.sleep(delay)
+        except (requests.Timeout, requests.ConnectionError) as e:
+            delay = min(RETRY_BASE_DELAY * (2 ** attempt), RETRY_MAX_DELAY)
+            if progress_callback:
+                progress_callback(f"   Error de red ({e.__class__.__name__}), reintentando en {delay:.0f}s (intento {attempt + 1})...")
+            time.sleep(delay)
+        attempt = min(attempt + 1, 10)  # evita crecer sin limite el exponente en fallos muy largos
 
 
 def _generate_hourly_datetimes(start: datetime, end: datetime) -> List[datetime]:
@@ -251,57 +307,119 @@ class DukascopyProvider(BaseProvider):
             progress_callback(f"Total chunks horarios: {total}")
             progress_callback(f"Timeframe objetivo: {tf}")
 
-        batch_ticks = []
         ohlc_chunks = []
         downloaded = 0
         no_data = 0
         errors = 0
         tick_count = 0
+        completed = 0
 
-        for i, hour_dt in enumerate(hours):
-            if i % 25 == 0 or i == total - 1:
-                if progress_callback:
-                    pct = (i + 1) / total * 100
-                    progress_callback(f"  [{i+1}/{total}] {pct:.2f}% - "
-                                       f"OK:{downloaded} NoData:{no_data} Err:{errors}")
+        _SENTINEL_ERROR = object()
+        _SENTINEL_NODATA = object()
 
-            if i > 0:
-                time.sleep(REQUEST_POLITE_DELAY)
-
+        def _process_hour(hour_dt):
             url = _build_url(symbol, hour_dt)
             content = _fetch_chunk(url, progress_callback)
             if content is None:
-                no_data += 1
-                continue
-
+                return _SENTINEL_NODATA
             try:
                 arr = _decode_bi5(content, hour_dt, pipet)
-                if len(arr) > 0:
-                    batch_ticks.append(arr)
-                    downloaded += 1
+                return arr if len(arr) > 0 else _SENTINEL_NODATA
             except Exception as e:
-                errors += 1
                 if progress_callback:
                     progress_callback(f"   Error decode {hour_dt}: {e}")
+                return _SENTINEL_ERROR
 
-            should_flush = len(batch_ticks) >= BATCH_SIZE or (i == total - 1 and batch_ticks)
-            if should_flush:
-                combined = np.concatenate(batch_ticks)
-                batch_df = pd.DataFrame({
-                    'time': combined['time'],
-                    'ask': combined['ask'],
-                    'bid': combined['bid'],
-                    'ask_volume': combined['ask_volume'],
-                    'bid_volume': combined['bid_volume'],
-                })
-                batch_df['time'] = batch_df['time'].astype('datetime64[ns]')
-                batch_df = batch_df.drop_duplicates(subset='time').set_index('time').sort_index()
-                tick_count += len(batch_df)
+        def _flush_batch(batch_ticks):
+            nonlocal tick_count
+            if not batch_ticks:
+                return None
+            combined = np.concatenate(batch_ticks)
+            batch_df = pd.DataFrame({
+                'time': combined['time'],
+                'ask': combined['ask'],
+                'bid': combined['bid'],
+                'ask_volume': combined['ask_volume'],
+                'bid_volume': combined['bid_volume'],
+            })
+            batch_df['time'] = batch_df['time'].astype('datetime64[ns]')
+            batch_df = batch_df.drop_duplicates(subset='time').set_index('time').sort_index()
+            tick_count += len(batch_df)
+            ohlc_batch = _resample_to_ohlc(batch_df, tf)
+            return ohlc_batch if len(ohlc_batch) > 0 else None
 
-                ohlc_batch = _resample_to_ohlc(batch_df, tf)
-                if len(ohlc_batch) > 0:
-                    ohlc_chunks.append(ohlc_batch)
-                batch_ticks = []
+        # Se descarga por lotes cronológicos de _BATCH_HOURS horas: dentro de
+        # cada lote las horas se piden en paralelo (rápido), pero el batch
+        # completo se resamplea a OHLC de una sola vez y en orden antes de
+        # pasar al siguiente lote. Así cada vela se calcula siempre sobre un
+        # rango horario contiguo, nunca sobre ticks de horas dispersas que
+        # llegaron mezcladas por el orden de respuesta de la red.
+        batches = [hours[i:i + _BATCH_HOURS] for i in range(0, total, _BATCH_HOURS)]
+
+        _cleanup_old_checkpoints()
+        checkpoint_key = _checkpoint_key(symbol, tf, start, end)
+        os.makedirs(_CHECKPOINT_DIR, exist_ok=True)
+        resumed_batches = 0
+
+        for batch_idx, batch in enumerate(batches):
+            cp_path = _checkpoint_batch_path(checkpoint_key, batch_idx)
+            if os.path.exists(cp_path):
+                try:
+                    saved_chunk = pd.read_pickle(cp_path)
+                    if saved_chunk is not None and len(saved_chunk) > 0:
+                        ohlc_chunks.append(saved_chunk)
+                    resumed_batches += 1
+                    completed += len(batch)
+                    if progress_callback:
+                        progress_callback(
+                            f"  [{completed}/{total}] {completed/total*100:.2f}% - "
+                            f"(lote {batch_idx + 1}/{len(batches)} recuperado de checkpoint)"
+                        )
+                    continue
+                except Exception as e:
+                    if progress_callback:
+                        progress_callback(
+                            f"  ⚠ Checkpoint del lote {batch_idx + 1}/{len(batches)} corrupto o ilegible "
+                            f"({e.__class__.__name__}): se volvera a descargar"
+                        )
+
+            batch_ticks = []
+            with ThreadPoolExecutor(max_workers=_PARALLEL_WORKERS) as executor:
+                futures = [executor.submit(_process_hour, h) for h in batch]
+                for f in as_completed(futures):
+                    arr = f.result()
+                    completed += 1
+                    if arr is _SENTINEL_ERROR:
+                        errors += 1
+                    elif arr is _SENTINEL_NODATA:
+                        no_data += 1
+                    else:
+                        batch_ticks.append(arr)
+                        downloaded += 1
+                    if progress_callback and (completed % 10 == 0 or completed == total):
+                        progress_callback(
+                            f"  [{completed}/{total}] {completed/total*100:.2f}% - "
+                            f"OK:{downloaded} NoData:{no_data} Err:{errors}"
+                        )
+            batch_chunk = _flush_batch(batch_ticks)
+            if batch_chunk is not None:
+                ohlc_chunks.append(batch_chunk)
+            try:
+                (batch_chunk if batch_chunk is not None else pd.DataFrame()).to_pickle(cp_path)
+            except Exception as e:
+                # No bloquear la descarga si falla el guardado del checkpoint
+                # (ej. disco lleno o sin permisos), pero avisar: si se
+                # interrumpe la descarga a partir de aqui, este lote no se
+                # podra recuperar y habra que re-descargarlo.
+                if progress_callback:
+                    progress_callback(
+                        f"  ⚠ No se pudo guardar el checkpoint del lote {batch_idx + 1}/{len(batches)} "
+                        f"({e.__class__.__name__}): si la descarga se corta a partir de aqui, "
+                        f"este lote habra que re-descargarlo"
+                    )
+
+        if resumed_batches and progress_callback:
+            progress_callback(f"  Checkpoint: {resumed_batches}/{len(batches)} lotes recuperados de una descarga anterior")
 
         if not ohlc_chunks:
             raise RuntimeError(f"No se descargaron datos para {symbol}")
@@ -318,6 +436,9 @@ class DukascopyProvider(BaseProvider):
         ohlc = ohlc.reset_index()
         ohlc.rename(columns={'time': 'timestamp'}, inplace=True)
         ohlc['timestamp'] = ohlc['timestamp'].dt.tz_localize('UTC')
+
+        # Descarga completa: los checkpoints de esta clave ya no hacen falta.
+        _cleanup_checkpoints_for_key(checkpoint_key)
 
         if progress_callback:
             progress_callback(f"Velas {tf} generadas: {len(ohlc):,}")

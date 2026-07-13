@@ -319,7 +319,7 @@ if 'timestamp' not in df.columns:
 ts_raw = df['timestamp'].astype(str).str.strip().str.replace('\ufeff', '', regex=False)
 ts_raw = ts_raw.str.replace(r'[^\x20-\x7E]', '', regex=True)
 antes = len(df)
-df['timestamp'] = pd.to_datetime(ts_raw, errors='coerce', dayfirst=True)
+df['timestamp'] = pd.to_datetime(ts_raw, errors='coerce', format='ISO8601')
 nat_count = df['timestamp'].isna().sum()
 print(f"      ⚠️ Timestamps NaT tras parseo: {nat_count:,} de {antes:,} filas ({nat_count/antes:.1%})")
 df = df.dropna(subset=['timestamp'])

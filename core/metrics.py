@@ -29,6 +29,56 @@ def calcular_umbrales_er(er_series):
     }
 
 
+def calcular_er_series(retorno_log, periodo):
+    """
+    Efficiency Ratio (ER) rodante sobre retornos log:
+    |movimiento neto| / movimiento total en `periodo` velas.
+    Misma fórmula que la limpieza (PERIODO_ER), parametrizada por ventana.
+    """
+    movimiento_neto  = retorno_log.rolling(periodo).sum().abs()
+    movimiento_total = retorno_log.abs().rolling(periodo).sum()
+    er = (movimiento_neto / movimiento_total).round(6)
+    return er.fillna(0)
+
+
+@njit
+def calcular_kama_numba(close, er, fast, slow):
+    """
+    Kaufman Adaptive Moving Average: suaviza `close` con una constante
+    SC = (ER*(2/(fast+1) - 2/(slow+1)) + 2/(slow+1))^2 que se adapta al ER.
+    ER en NaN se trata como 0 (suavizado lento).
+    """
+    n = len(close)
+    kama = np.full(n, np.nan)
+    if n == 0:
+        return kama
+
+    sc_fast = 2.0 / (fast + 1.0)
+    sc_slow = 2.0 / (slow + 1.0)
+
+    # Arrancar en el primer precio válido; los NaN de close (p.ej. velas de
+    # calentamiento de la limpieza) mantienen el último KAMA en vez de propagarse.
+    inicio = -1
+    for i in range(n):
+        if not np.isnan(close[i]):
+            inicio = i
+            break
+    if inicio == -1:
+        return kama
+
+    kama[inicio] = close[inicio]
+    for i in range(inicio + 1, n):
+        if np.isnan(close[i]):
+            kama[i] = kama[i - 1]
+            continue
+        e = er[i]
+        if np.isnan(e):
+            e = 0.0
+        sc = (e * (sc_fast - sc_slow) + sc_slow) ** 2
+        kama[i] = kama[i - 1] + sc * (close[i] - kama[i - 1])
+    return kama
+
+
 # ── Régimen de Hurst ────────────────────────────────────────────────
 def contar_regimen_hurst(hurst_series):
     """

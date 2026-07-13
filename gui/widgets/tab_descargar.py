@@ -16,13 +16,14 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                               QLabel, QLineEdit, QComboBox, QListWidget,
                               QListWidgetItem, QFrame, QGroupBox, QButtonGroup,
                               QRadioButton, QProgressBar, QDateEdit, QCheckBox)
-from PyQt6.QtCore import Qt, pyqtSignal, QDate
+from PyQt6.QtCore import Qt, pyqtSignal, QDate, QThread, QTimer
 from gui.widgets.console_widget import ConsoleWidget
 from core.config import SCRIPTS_DIR
 from core.data_providers.dukascopy_provider import DukascopyProvider
 from core.data_providers.yfinance_provider import YFinanceProvider
 from core.data_providers.ccxt_provider import CCXTProvider
 from core.data_providers.hyperliquid_provider import HyperliquidProvider
+from core.data_providers.base_provider import AssetInfo
 from core.connectors import load_connectors, provider_class_for_type
 
 STYLE_DOWNLOAD = """
@@ -88,6 +89,30 @@ _PROVIDERS = {
     'Hyperliquid': HyperliquidProvider,
 }
 
+_SEARCH_DEBOUNCE_MS = 350
+_SEARCH_MIN_CHARS = 2
+
+
+class _SymbolSearchThread(QThread):
+    """Ejecuta provider.search_symbols(query) fuera del hilo de la UI.
+
+    Se usa para providers (como yfinance) que resuelven el buscador contra
+    una API en vivo en vez de filtrar un catalogo ya cargado en memoria.
+    """
+    results_ready = pyqtSignal(str, list)
+
+    def __init__(self, provider, query, parent=None):
+        super().__init__(parent)
+        self._provider = provider
+        self._query = query
+
+    def run(self):
+        try:
+            results = self._provider.search_symbols(self._query)
+        except Exception:
+            results = []
+        self.results_ready.emit(self._query, results)
+
 
 class TabDescargar(QWidget):
     download_completed = pyqtSignal(str)  # emite ruta del CSV
@@ -99,6 +124,10 @@ class TabDescargar(QWidget):
         self._selected_symbol = None
         self._catalog = []
         self._connector_configs = {}
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.timeout.connect(self._run_live_search)
+        self._search_thread = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
@@ -135,9 +164,10 @@ class TabDescargar(QWidget):
         toolbar.addStretch()
 
         self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("Buscar activo...")
-        self.search_input.setMaximumWidth(200)
-        self.search_input.textChanged.connect(self._filter_list)
+        self.search_input.setPlaceholderText("Buscar activo o escribir ticker + Enter...")
+        self.search_input.setMaximumWidth(260)
+        self.search_input.textChanged.connect(self._on_search_text_changed)
+        self.search_input.returnPressed.connect(self._on_search_return_pressed)
         toolbar.addWidget(self.search_input)
 
         layout.addLayout(toolbar)
@@ -348,15 +378,66 @@ class TabDescargar(QWidget):
             name_lower = asset.name.lower()
             if search and search not in symbol_lower and search not in name_lower:
                 continue
-            text = f"  {asset.symbol}    {asset.name}"
-            if asset.category:
-                text += f"   [{asset.category}]"
-            item = QListWidgetItem(text)
-            item.setData(Qt.ItemDataRole.UserRole, asset)
-            self.asset_list.addItem(item)
+            self._add_asset_item(asset)
 
-    def _filter_list(self):
-        self._populate_list()
+    def _add_asset_item(self, asset):
+        text = f"  {asset.symbol}    {asset.name}"
+        if asset.category:
+            text += f"   [{asset.category}]"
+        item = QListWidgetItem(text)
+        item.setData(Qt.ItemDataRole.UserRole, asset)
+        self.asset_list.addItem(item)
+
+    # --- Busqueda -------------------------------------------------------------
+
+    def _on_search_text_changed(self, text):
+        """Decide entre filtrar el catalogo local o disparar busqueda en vivo.
+
+        yfinance (y cualquier provider futuro con search_symbols) resuelve
+        el buscador contra la API real en vez de la lista precargada, para
+        no depender de tener miles de simbolos en memoria de antemano.
+        """
+        provider = self._current_provider()
+        supports_live_search = provider is not None and hasattr(provider, 'search_symbols')
+        query = text.strip()
+
+        if not supports_live_search or len(query) < _SEARCH_MIN_CHARS:
+            self._search_timer.stop()
+            self._populate_list()
+            return
+
+        self._search_timer.start(_SEARCH_DEBOUNCE_MS)
+
+    def _run_live_search(self):
+        provider = self._current_provider()
+        query = self.search_input.text().strip()
+        if not provider or not hasattr(provider, 'search_symbols') or len(query) < _SEARCH_MIN_CHARS:
+            return
+
+        self.asset_list.clear()
+        placeholder = QListWidgetItem("  Buscando...")
+        placeholder.setFlags(Qt.ItemFlag.NoItemFlags)
+        self.asset_list.addItem(placeholder)
+
+        if self._search_thread is not None and self._search_thread.isRunning():
+            self._search_thread.results_ready.disconnect(self._on_search_results)
+        self._search_thread = _SymbolSearchThread(provider, query, parent=self)
+        self._search_thread.results_ready.connect(self._on_search_results)
+        self._search_thread.start()
+
+    def _on_search_results(self, query, results):
+        # Descartar respuestas obsoletas si el usuario siguio escribiendo
+        # mientras la busqueda estaba en vuelo.
+        if query != self.search_input.text().strip():
+            return
+        self.asset_list.clear()
+        if not results:
+            empty = QListWidgetItem("  Sin resultados")
+            empty.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.asset_list.addItem(empty)
+            return
+        for asset in results:
+            self._add_asset_item(asset)
 
     # --- Seleccion de activo -------------------------------------------------
 
@@ -379,6 +460,25 @@ class TabDescargar(QWidget):
             )
         else:
             self.label_range.setText("Historial disponible: desconocido")
+
+    def _on_search_return_pressed(self):
+        """Al pulsar Enter en el buscador: usa el texto tal cual como simbolo,
+        exista o no en la lista de resultados actual (catalogo o busqueda en
+        vivo). Cubre simbolos que Yahoo/el provider no indexa por nombre pero
+        si acepta directamente (ej. tickers poco comunes)."""
+        symbol = self.search_input.text().strip()
+        if not symbol:
+            return
+        self._search_timer.stop()
+        self.asset_list.clearSelection()
+        asset = AssetInfo(symbol, symbol, 'Personalizado', None)
+        self._selected_symbol = asset
+        self.btn_download.setEnabled(True)
+        self.label_symbol.setText(f"{asset.symbol}  -  Ticker personalizado")
+        self.label_range.setText(
+            "Historial disponible: desconocido (se pedira el maximo posible;\n"
+            "el provider recortara al inicio real de cotizacion)"
+        )
 
     def _on_full_history_toggled(self, checked):
         self.date_start.setEnabled(not checked)

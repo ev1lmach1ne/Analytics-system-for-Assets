@@ -33,8 +33,10 @@ class PdfViewer(QWidget):
         self._pdf_path = None
         self._pages = []
         self._page_images = []
+        self._page_titles = []
         self._current_page = 0
         self._page_count = 0
+        self._visible_pages = None  # None = todas; si no, lista ordenada de índices visibles
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
         layout = QVBoxLayout(self)
@@ -89,6 +91,7 @@ class PdfViewer(QWidget):
     def load(self, pdf_path):
         self._pdf_path = pdf_path
         self._current_page = 0
+        self._visible_pages = None
 
         # Cerrar el documento anterior explícitamente: si no, el archivo PDF
         # queda con el handle abierto y no se puede borrar ni sobrescribir en
@@ -106,6 +109,7 @@ class PdfViewer(QWidget):
             w.deleteLater()
         self._pages.clear()
         self._page_images.clear()
+        self._page_titles.clear()
 
         if not pdf_path or not os.path.exists(pdf_path):
             self._doc = None
@@ -121,11 +125,13 @@ class PdfViewer(QWidget):
         self.lbl_page.setText(f"{self._page_count} paginas")
 
         for i in range(self._page_count):
-            pw, img = self._create_page_widget(i)
+            pw, img, title = self._create_page_widget(i)
             self._pages.append(pw)
             self._page_images.append(img)
+            self._page_titles.append(title)
             self.gallery_layout.addWidget(pw)
 
+        self._update_page_titles()
         self._update_nav()
         self._render_pages()
 
@@ -135,7 +141,13 @@ class PdfViewer(QWidget):
         w_layout.setContentsMargins(0, 0, 0, 0)
         w_layout.setSpacing(4)
 
-        title = QLabel(f"Pagina {index + 1}")
+        # El texto se rellena en _update_page_titles(): el indice absoluto
+        # dentro del PDF no sirve de titulo, porque con paginas cacheadas
+        # por Ventana (Metricas/Regimen ER/Dashboard NATR se generan una vez
+        # por cada Ventana) la posicion absoluta de una pagina visible puede
+        # ser cualquiera (ej. la 7) aunque sea la primera que se ve al
+        # filtrar por la Ventana seleccionada.
+        title = QLabel("")
         title.setObjectName("pageTitle")
         w_layout.addWidget(title)
 
@@ -145,7 +157,15 @@ class PdfViewer(QWidget):
         img.setText("(cargando...)")
         w_layout.addWidget(img)
 
-        return w, img
+        return w, img, title
+
+    def _update_page_titles(self):
+        """Numera cada pagina VISIBLE por su posicion relativa dentro del
+        filtro de Ventana actual (1, 2, 3...), no por su indice absoluto en
+        el PDF completo."""
+        vis = self._indices_visibles()
+        for pos, idx in enumerate(vis):
+            self._page_titles[idx].setText(f"Pagina {pos + 1} / {len(vis)}")
 
     def _target_size(self):
         avail = self.width() - 40
@@ -162,10 +182,40 @@ class PdfViewer(QWidget):
             pix = QPixmap.fromImage(rendered)
             img_label.setPixmap(pix)
 
+    def _indices_visibles(self):
+        if self._visible_pages is None:
+            return list(range(self._page_count))
+        return self._visible_pages
+
+    def set_visible_pages(self, indices):
+        """Filtra qué páginas se muestran (None = todas).
+
+        `indices` son índices 0-based del documento. Las páginas ocultas no se
+        destruyen, solo se esconden: el cambio de Ventana es instantáneo.
+        """
+        if indices is None:
+            self._visible_pages = None
+        else:
+            self._visible_pages = sorted(i for i in set(indices) if 0 <= i < self._page_count)
+        vis = set(self._indices_visibles())
+        for i, w in enumerate(self._pages):
+            w.setVisible(i in vis)
+        if vis and self._current_page not in vis:
+            self._current_page = min(vis)
+        self._update_page_titles()
+        self._update_nav()
+
     def _update_nav(self):
-        self.lbl_page.setText(f"{self._current_page + 1} / {self._page_count}")
-        self.btn_prev.setEnabled(self._current_page > 0)
-        self.btn_next.setEnabled(self._current_page < self._page_count - 1)
+        vis = self._indices_visibles()
+        if not vis:
+            self.lbl_page.setText("0 / 0")
+            self.btn_prev.setEnabled(False)
+            self.btn_next.setEnabled(False)
+            return
+        pos = vis.index(self._current_page) if self._current_page in vis else 0
+        self.lbl_page.setText(f"{pos + 1} / {len(vis)}")
+        self.btn_prev.setEnabled(pos > 0)
+        self.btn_next.setEnabled(pos < len(vis) - 1)
 
     def _scroll_to_page(self, index):
         if 0 <= index < len(self._pages):
@@ -181,12 +231,22 @@ class PdfViewer(QWidget):
         self._scroll_to_page(index)
 
     def _prev_page(self):
-        if self._current_page > 0:
-            self._scroll_to_page(self._current_page - 1)
+        vis = self._indices_visibles()
+        if self._current_page in vis:
+            pos = vis.index(self._current_page)
+            if pos > 0:
+                self._scroll_to_page(vis[pos - 1])
+        elif vis:
+            self._scroll_to_page(vis[0])
 
     def _next_page(self):
-        if self._current_page < self._page_count - 1:
-            self._scroll_to_page(self._current_page + 1)
+        vis = self._indices_visibles()
+        if self._current_page in vis:
+            pos = vis.index(self._current_page)
+            if pos < len(vis) - 1:
+                self._scroll_to_page(vis[pos + 1])
+        elif vis:
+            self._scroll_to_page(vis[0])
 
     def _open_pdf(self):
         if self._pdf_path and os.path.exists(self._pdf_path):

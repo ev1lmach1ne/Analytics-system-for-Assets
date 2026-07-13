@@ -145,7 +145,7 @@ class TabLimpiados(QWidget):
 
         # Page 0: FileExplorer
         self.explorer = FileExplorer(LIMPIADOS_DIR, mode='csv')
-        self.explorer.list_view.clicked.connect(self._on_file_click)
+        self.explorer.file_chosen.connect(self._on_file_click)
         self.mode_stack.addWidget(self.explorer)
 
         # Page 1: Table mode (combo + asset TF table)
@@ -337,12 +337,8 @@ class TabLimpiados(QWidget):
 
     # ── File selection (shared by both modes) ──
 
-    def _on_file_click(self, index):
-        model = self.explorer.filter_model
-        source_index = model.mapToSource(index)
-        path = self.explorer.model.filePath(source_index)
-        if path and not os.path.isdir(path):
-            self._select_file(path)
+    def _on_file_click(self, path):
+        self._select_file(path)
 
     def _select_file(self, path):
         self._selected_path = path
@@ -468,15 +464,13 @@ class TabLimpiados(QWidget):
         if not self._selected_path:
             return
 
-        dialog = RangoAnalisisDialog(self._selected_path, self)
-        if dialog.exec() != dialog.DialogCode.Accepted:
-            return
-        rango_inicio, rango_fin = dialog.get_rango()
-        self._rango_inicio = rango_inicio
-        self._rango_fin = rango_fin
-
-        # Use cache if available (solo aplica para "todo el histórico")
-        if rango_inicio is None and self._cached_pdf and self._cached_metrics:
+        # Si ya hay un analisis cacheado (todo el historico) listo, "Analizar"
+        # va directo a metricas sin preguntar rango — el detector de rango
+        # solo tiene sentido para volver a analizar (primera vez o
+        # "Re-analizar", que limpia la cache antes de llamar aqui).
+        if self._cached_pdf and self._cached_metrics:
+            self._rango_inicio = None
+            self._rango_fin = None
             self.analysis_completed.emit(
                 self._cached_pdf,
                 self._cached_metrics,
@@ -485,6 +479,13 @@ class TabLimpiados(QWidget):
                 self._selected_path or ''
             )
             return
+
+        dialog = RangoAnalisisDialog(self._selected_path, self)
+        if dialog.exec() != dialog.DialogCode.Accepted:
+            return
+        rango_inicio, rango_fin = dialog.get_rango()
+        self._rango_inicio = rango_inicio
+        self._rango_fin = rango_fin
 
         self.btn_analyze.setEnabled(False)
         self.btn_preview.setEnabled(False)

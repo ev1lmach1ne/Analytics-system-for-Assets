@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 import tempfile
+import threading
 import time
 
 from .base_provider import BaseProvider, AssetInfo
@@ -174,11 +175,57 @@ def _fetch_catalog():
         return []
 
 
-def _fetch_first_candle(symbol: str) -> datetime:
+# load_markets() de Hyperliquid dispara una ráfaga de POSTs a /info (meta de
+# perps, spot, mercados HIP-3...). Repetirla en cada worker paralelo supera el
+# rate limit por IP y la API responde 429. Se carga UNA vez por proceso y se
+# inyecta a los workers con set_markets() (operación offline, sin peticiones).
+_MARKETS_CACHE = None
+_MARKETS_LOCK = threading.Lock()
+
+_MAX_REINTENTOS = 5
+
+
+def _obtener_markets():
+    global _MARKETS_CACHE
+    with _MARKETS_LOCK:
+        if _MARKETS_CACHE is None:
+            import ccxt
+            exchange = ccxt.hyperliquid({'enableRateLimit': True})
+            for intento in range(_MAX_REINTENTOS):
+                try:
+                    exchange.load_markets()
+                    break
+                except ccxt.RateLimitExceeded:
+                    if intento == _MAX_REINTENTOS - 1:
+                        raise
+                    time.sleep(2 ** (intento + 1))
+            _MARKETS_CACHE = exchange.markets
+        return _MARKETS_CACHE
+
+
+def _crear_exchange():
     import ccxt
+    exchange = ccxt.hyperliquid({'enableRateLimit': True})
+    exchange.set_markets(_obtener_markets())
+    return exchange
+
+
+def _fetch_ohlcv_con_reintentos(exchange, symbol, ccxt_tf, since_ms, limit=1000):
+    """fetch_ohlcv con backoff exponencial ante 429 (2s, 4s, 8s...)."""
+    import ccxt
+    for intento in range(_MAX_REINTENTOS):
+        try:
+            return exchange.fetch_ohlcv(symbol, ccxt_tf, since=since_ms, limit=limit)
+        except ccxt.RateLimitExceeded:
+            if intento == _MAX_REINTENTOS - 1:
+                raise
+            time.sleep(2 ** (intento + 1))
+
+
+def _fetch_first_candle(symbol: str) -> datetime:
     try:
-        exchange = ccxt.hyperliquid({'enableRateLimit': True})
-        first = exchange.fetch_ohlcv(symbol, '1d', since=0, limit=1)
+        exchange = _crear_exchange()
+        first = _fetch_ohlcv_con_reintentos(exchange, symbol, '1d', 0, limit=1)
         if first:
             return datetime.fromtimestamp(first[0][0] / 1000, tz=timezone.utc)
     except Exception:
@@ -188,16 +235,14 @@ def _fetch_first_candle(symbol: str) -> datetime:
 
 def _fetch_range(symbol: str, ccxt_tf: str, range_start_ms: int,
                  range_end_ms: int) -> list:
-    import ccxt
-    exchange = ccxt.hyperliquid({'enableRateLimit': True})
-    exchange.load_markets()
+    exchange = _crear_exchange()
 
     all_data = []
     since_ms = range_start_ms
 
     while since_ms < range_end_ms:
         try:
-            data = exchange.fetch_ohlcv(symbol, ccxt_tf, since=since_ms, limit=1000)
+            data = _fetch_ohlcv_con_reintentos(exchange, symbol, ccxt_tf, since_ms)
         except Exception as e:
             raise RuntimeError(f"Error fetch_ohlcv: {e}")
 
@@ -284,16 +329,35 @@ class HyperliquidProvider(BaseProvider):
         ccxt_tf = HL_TF_MAP[tf]
         start_ms = int(start.timestamp() * 1000)
         end_ms = int(end.timestamp() * 1000)
+        minutes_per_candle = _TF_MINUTES.get(tf, 60)
+
+        # La API de Hyperliquid solo conserva las ~5.000 velas más recientes por
+        # timeframe: pedir más atrás no devuelve histórico antiguo (los workers
+        # de esos rangos traerían duplicados de velas recientes). Se ajusta el
+        # inicio al lookback real y se informa al usuario.
+        max_lookback_ms = 5000 * minutes_per_candle * 60000
+        earliest_ms = int(datetime.now(timezone.utc).timestamp() * 1000) - max_lookback_ms
+        if start_ms < earliest_ms:
+            start_ms = earliest_ms
+            start = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc)
+            if progress_callback:
+                progress_callback(
+                    f"  ⚠ Hyperliquid solo conserva ~5.000 velas por timeframe: "
+                    f"en {tf} el histórico disponible empieza el {start.date()}"
+                )
+
         total_span = end_ms - start_ms
 
         if total_span <= 0:
             raise RuntimeError("Rango de fechas invalido.")
 
-        minutes_per_candle = _TF_MINUTES.get(tf, 60)
         est_candles = int(total_span / (minutes_per_candle * 60000))
 
         if progress_callback:
             progress_callback(f"Conectando a Hyperliquid...")
+        # Cargar mercados una vez ANTES de lanzar los workers (evita 429)
+        _obtener_markets()
+        if progress_callback:
             progress_callback(f"Descargando {symbol}: {start.date()} -> {end.date()}")
             progress_callback(f"Timeframe: {tf}  |  ~{est_candles:,} velas estimadas")
             if _PARALLEL_WORKERS > 1:

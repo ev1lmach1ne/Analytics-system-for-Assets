@@ -55,7 +55,8 @@ def _determine_output_path(provider_name: str, symbol: str, tf: str, df) -> str:
     Construye la ruta de salida:
     D:\\DATOS\\Activos\\<fuente>\\<simbolo>\\<simbolo>_<tf>_<YYYY-MM-DD>_to_<YYYY-MM-DD>.csv
     """
-    symbol_slug = symbol.lower().replace('/', '_')
+    symbol_slug = symbol.lower().translate(
+        str.maketrans({k: '_' for k in '/:<>"|?*\\'}))
     asset_dir = os.path.join(BASE_DATA, provider_name, symbol_slug)
     os.makedirs(asset_dir, exist_ok=True)
 

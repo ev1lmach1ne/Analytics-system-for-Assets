@@ -127,7 +127,7 @@ class TabImportar(QWidget):
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
         self.explorer = FileExplorer(BASE_DATA, mode='exclude')
-        self.explorer.list_view.clicked.connect(self._on_file_explorer_click)
+        self.explorer.file_chosen.connect(self._on_file_explorer_click)
         splitter.addWidget(self.explorer)
 
         self.console = ConsoleWidget()
@@ -137,14 +137,10 @@ class TabImportar(QWidget):
         splitter.setSizes([350, 600])
         layout.addWidget(splitter, 1)
 
-    def _on_file_explorer_click(self, index):
-        model = self.explorer.filter_model
-        source_index = model.mapToSource(index)
-        path = self.explorer.model.filePath(source_index)
-        if path and not os.path.isdir(path):
-            self._selected_file = path
-            self.path_label.setText(os.path.basename(path))
-            self.btn_config.setEnabled(True)
+    def _on_file_explorer_click(self, path):
+        self._selected_file = path
+        self.path_label.setText(os.path.basename(path))
+        self.btn_config.setEnabled(True)
 
     def _filter_files(self, text: str):
         self.explorer.set_search_text(text)

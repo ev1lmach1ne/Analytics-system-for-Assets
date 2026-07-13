@@ -259,6 +259,7 @@ class TabAnalisis(QWidget):
         super().__init__(parent)
         self.setStyleSheet(STYLE_ANALISIS)
         self._pdf_path = None
+        self._page_map = None
         self._metrics_path = None
         self._all_metrics = None
         self._ticker = ''
@@ -392,11 +393,21 @@ class TabAnalisis(QWidget):
             self._deshabilitar_horizon_item(4)
 
     def _on_horizon_changed(self, idx):
-        if self._pdf_path:
-            pc = self.graphs_viewer.page_count
-            if pc >= 5:
-                target = pc - 5 + idx
-                self.graphs_viewer.go_to_page(target)
+        # El visor es adaptativo: al cambiar la Ventana solo se muestran las
+        # páginas generales + las etiquetadas con el horizonte seleccionado.
+        self._aplicar_filtro_paginas()
+
+    def _aplicar_filtro_paginas(self):
+        if not self._pdf_path:
+            return
+        if not self._page_map:
+            # Resultado antiguo sin mapa de páginas: mostrar todo
+            self.graphs_viewer.set_visible_pages(None)
+            return
+        horizon = self.horizon.currentText() if self.horizon else 'General'
+        visibles = [p['pagina'] for p in self._page_map
+                    if p.get('horizonte') in (None, horizon)]
+        self.graphs_viewer.set_visible_pages(visibles)
 
     def preview_horizon_for(self, nombre, tf):
         print(f"[DEBUG tab_analisis] preview_horizon_for(nombre={nombre!r} tf={tf!r})", flush=True)
@@ -512,9 +523,16 @@ class TabAnalisis(QWidget):
         except Exception:
             self._all_metrics = None
 
+        # Mapa página→horizonte (clave reservada del script); pop para que no
+        # se pinte como categoría. Ausente en resultados antiguos → sin filtro.
+        self._page_map = None
+        if isinstance(self._all_metrics, dict):
+            self._page_map = self._all_metrics.pop('_paginas', None)
+
         self._render_metrics()
         if self._pdf_path:
             self.graphs_viewer.load(self._pdf_path)
+            self._aplicar_filtro_paginas()
             self.inner_tabs.setCurrentIndex(0)
 
     def _render_metrics(self):
@@ -556,11 +574,37 @@ class TabAnalisis(QWidget):
     def _export_pdf(self):
         if not self._pdf_path:
             return
+        # Incluir el rango analizado en el nombre sugerido, extrayéndolo del
+        # nombre del PDF de origen (p.ej. informe_xauusd_1h_2020-03-13_to_2025-06-12.pdf
+        # o caché sidecar ...csv.analysis.2020-03-13_to_2025-06-12.pdf).
+        m = re.search(r'(\d{4}-\d{2}-\d{2})_to_(\d{4}-\d{2}-\d{2})',
+                      os.path.basename(self._pdf_path))
+        rango = f"_{m.group(1)}_to_{m.group(2)}" if m else ""
+        horizon = self.horizon.currentText() if self.horizon else 'General'
+        sufijo_h = f"_{horizon}" if (self._page_map and horizon != 'General') else ""
         path, _ = QFileDialog.getSaveFileName(
             self, "Guardar PDF",
-            f"informe_{self._ticker}_{self._tf}.pdf",
+            f"informe_{self._ticker}_{self._tf}{rango}{sufijo_h}.pdf",
             "PDF (*.pdf)"
         )
-        if path:
-            import shutil
-            shutil.copy2(self._pdf_path, path)
+        if not path:
+            return
+        if self._page_map:
+            # Exportar solo las páginas de la ventana seleccionada (+ generales)
+            try:
+                from pypdf import PdfReader, PdfWriter
+                visibles = [p['pagina'] for p in self._page_map
+                            if p.get('horizonte') in (None, horizon)]
+                reader = PdfReader(self._pdf_path)
+                writer = PdfWriter()
+                for i in visibles:
+                    if 0 <= i < len(reader.pages):
+                        writer.add_page(reader.pages[i])
+                with open(path, 'wb') as f:
+                    writer.write(f)
+                return
+            except Exception:
+                import traceback
+                traceback.print_exc()
+        import shutil
+        shutil.copy2(self._pdf_path, path)

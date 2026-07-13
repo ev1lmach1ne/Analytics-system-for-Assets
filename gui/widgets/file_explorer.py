@@ -1,8 +1,11 @@
 import os
 from PyQt6.QtWidgets import (QListView, QWidget, QVBoxLayout, QPushButton,
-                             QHBoxLayout, QToolButton, QStyle)
+                             QHBoxLayout, QToolButton, QStyle, QFileIconProvider)
 from PyQt6.QtGui import QFileSystemModel, QPixmap, QPainter, QPen, QBrush, QColor, QFont, QIcon
-from PyQt6.QtCore import QSortFilterProxyModel, Qt, QSize, QPoint
+from PyQt6.QtCore import (QSortFilterProxyModel, Qt, QSize, QPoint,
+                          QAbstractListModel, QModelIndex, QFileInfo, pyqtSignal)
+
+_MAX_PROFUNDIDAD_BUSQUEDA = 6
 
 class CsvFilterModel(QSortFilterProxyModel):
     def __init__(self, exclude_patterns=None, parent=None):
@@ -69,11 +72,47 @@ class NoFilterModel(QSortFilterProxyModel):
             return False
         return True
 
+class _SearchResultsModel(QAbstractListModel):
+    """Lista aplanada de rutas absolutas (resultados de búsqueda recursiva)."""
+
+    PATH_ROLE = Qt.ItemDataRole.UserRole + 1
+
+    def __init__(self, paths=None, parent=None):
+        super().__init__(parent)
+        self._paths = paths or []
+        self._icon_provider = QFileIconProvider()
+
+    def rowCount(self, parent=QModelIndex()):
+        return len(self._paths)
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid() or not (0 <= index.row() < len(self._paths)):
+            return None
+        path = self._paths[index.row()]
+        if role == Qt.ItemDataRole.DisplayRole:
+            return os.path.basename(path)
+        if role == Qt.ItemDataRole.DecorationRole:
+            return self._icon_provider.icon(QFileInfo(path))
+        if role == self.PATH_ROLE:
+            return path
+        return None
+
+    def path_at(self, index):
+        if not index.isValid():
+            return None
+        return index.data(self.PATH_ROLE)
+
+
 class FileExplorer(QWidget):
+    file_chosen = pyqtSignal(str)
+
     def __init__(self, root_path, parent=None, mode='csv'):
         super().__init__(parent)
         self._root_path = root_path
         self._nav_stack = []
+        self._mode = mode
+        self._search_text = ''
+        self._searching = False
 
         self.setStyleSheet("""
             QPushButton, QToolButton {
@@ -146,6 +185,7 @@ QPushButton:disabled, QToolButton:disabled { background-color: #1a2a45; color: #
         else:
             self.filter_model = NoFilterModel(parent=self)
         self.filter_model.setSourceModel(self.model)
+        self._search_model = _SearchResultsModel(parent=self)
 
         self.list_view = QListView()
         self.list_view.setModel(self.filter_model)
@@ -157,10 +197,13 @@ QPushButton:disabled, QToolButton:disabled { background-color: #1a2a45; color: #
         self.list_view.setSpacing(10)
         self.list_view.setSelectionMode(QListView.SelectionMode.SingleSelection)
         self.list_view.doubleClicked.connect(self._on_double_click)
+        self.list_view.clicked.connect(self._on_item_clicked)
 
         layout.addWidget(self.list_view, 1)
 
     def _on_double_click(self, index):
+        if self._searching:
+            return
         try:
             if not index.isValid():
                 return
@@ -192,6 +235,9 @@ QPushButton:disabled, QToolButton:disabled { background-color: #1a2a45; color: #
         self.set_root_path(self._root_path)
 
     def set_root_path(self, root_path):
+        if self._searching:
+            self._search_text = ''
+            self._salir_modo_busqueda()
         self._nav_stack.clear()
         self._root_path = root_path
         self.model.setRootPath(root_path)
@@ -199,6 +245,10 @@ QPushButton:disabled, QToolButton:disabled { background-color: #1a2a45; color: #
         self.btn_up.setEnabled(False)
 
     def refresh(self):
+        if self._searching:
+            # Re-ejecutar la búsqueda actual con el árbol de archivos actualizado
+            self._entrar_modo_busqueda()
+            return
         root = self.model.rootPath()
         self.model.setRootPath('')
         self.model.setRootPath(root)
@@ -206,5 +256,74 @@ QPushButton:disabled, QToolButton:disabled { background-color: #1a2a45; color: #
         self.btn_up.setEnabled(False)
 
     def set_search_text(self, text: str):
-        self.filter_model._search_text = text.strip().lower()
-        self.filter_model.invalidateFilter()
+        self._search_text = text.strip().lower()
+        if self._search_text:
+            self._entrar_modo_busqueda()
+        else:
+            self._salir_modo_busqueda()
+
+    def _entrar_modo_busqueda(self):
+        # Búsqueda recursiva desde la raíz: los datos están organizados una
+        # subcarpeta por activo, así que buscar solo en la carpeta mostrada
+        # (single-level, límite de QListView/QFileSystemModel) nunca encuentra
+        # los CSV, que viven un nivel más abajo.
+        self._searching = True
+        resultados = self._buscar_recursivo(self._root_path, self._search_text)
+        self._search_model.beginResetModel()
+        self._search_model._paths = resultados
+        self._search_model.endResetModel()
+        if self.list_view.model() is not self._search_model:
+            self.list_view.setModel(self._search_model)
+        self.btn_home.setEnabled(False)
+        self.btn_up.setEnabled(False)
+        self.btn_reload.setEnabled(False)
+
+    def _salir_modo_busqueda(self):
+        self._searching = False
+        if self.list_view.model() is not self.filter_model:
+            self.list_view.setModel(self.filter_model)
+        self.list_view.setRootIndex(
+            self.filter_model.mapFromSource(self.model.index(self.model.rootPath()))
+        )
+        self.btn_home.setEnabled(True)
+        self.btn_reload.setEnabled(True)
+        self.btn_up.setEnabled(len(self._nav_stack) > 0)
+
+    def _buscar_recursivo(self, root, texto):
+        exclude_patterns = ['_preparado', '_limpiado', '_preparado_preparado']
+        include_patterns = ['_limpiado', '_limpio']
+        resultados = []
+        root = os.path.normpath(root)
+        base_depth = root.count(os.sep)
+        for dirpath, dirnames, filenames in os.walk(root):
+            if dirpath.count(os.sep) - base_depth >= _MAX_PROFUNDIDAD_BUSQUEDA:
+                dirnames[:] = []
+                continue
+            for fname in filenames:
+                name_lower = fname.lower()
+                if not (name_lower.endswith('.csv') or name_lower.endswith('.txt')):
+                    continue
+                if self._mode == 'exclude' and any(p in name_lower for p in exclude_patterns):
+                    continue
+                if self._mode == 'include' and not any(p in name_lower for p in include_patterns):
+                    continue
+                if texto not in name_lower:
+                    continue
+                resultados.append(os.path.join(dirpath, fname))
+        resultados.sort(key=lambda p: os.path.basename(p).lower())
+        return resultados
+
+    def _on_item_clicked(self, index):
+        path = self._resolver_ruta(index)
+        if path and not os.path.isdir(path):
+            self.file_chosen.emit(path)
+
+    def _resolver_ruta(self, index):
+        if not index.isValid():
+            return None
+        if self._searching:
+            return self._search_model.path_at(index)
+        source_index = self.filter_model.mapToSource(index)
+        if not source_index.isValid():
+            return None
+        return self.model.filePath(source_index)
