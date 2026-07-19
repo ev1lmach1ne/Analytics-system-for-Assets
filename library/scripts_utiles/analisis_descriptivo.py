@@ -15,6 +15,7 @@ from core.config import CONFIG_PATH, INFORMES_DIR, LIMPIADOS_DIR, BASE_DATA, tf_
 from core.metrics import (calcular_er_series, calcular_kama_numba,
                           calcular_umbrales_er, contar_regimen_hurst,
                           calcular_hurst_array)
+from core.candle_patterns import SESIONES
 from scipy import stats
 from scipy.signal import fftconvolve
 from statsmodels.tsa.stattools import adfuller, kpss
@@ -1005,7 +1006,19 @@ if __name__ == "__main__":
     try:
         if 'hora_utc' not in df.columns:
             df['hora_utc'] = df.index.hour
-    
+
+        # Hora LOCAL de cada plaza (vía IANA, tz_convert): incorpora el
+        # cambio de horario de verano/invierno vela a vela, en vez de un
+        # rango UTC fijo que solo es exacto la mitad del año. Misma
+        # convención que SESIONES en core/candle_patterns.py (8:00-17:00
+        # hora local de la plaza). Tokio no tiene horario de verano, pero
+        # se calcula igual por uniformidad.
+        _idx_utc = (df.index.tz_localize('UTC') if df.index.tz is None
+                    else df.index.tz_convert('UTC'))
+        df['hora_tokio'] = _idx_utc.tz_convert('Asia/Tokyo').hour
+        df['hora_londres'] = _idx_utc.tz_convert(SESIONES['londres']['tz']).hour
+        df['hora_ny'] = _idx_utc.tz_convert(SESIONES['ny']['tz']).hour
+
         velas_por_dia = FACTORES_TF['dia']
         ventana_vol = int(velas_por_dia)
         ventana_corr = int(velas_por_dia * 7)
@@ -1085,12 +1098,16 @@ if __name__ == "__main__":
                 hora_mas_volatil = vol_por_hora.idxmax()
                 vol_maxima = vol_por_hora.max()
     
-            # Estacionalidad temporal por sesión
+            # Estacionalidad temporal por sesión: 8:00-17:00 HORA LOCAL de
+            # cada plaza (between es inclusivo: horas 8..16 = fin exclusivo
+            # a las 17:00), misma convención que el filtro de sesión de la
+            # pestaña Patrones. Al usar hora local convertida, el rango UTC
+            # efectivo se ajusta solo con el DST de cada plaza.
             overall_vol = df['retorno'].std()
             if overall_vol > 0:
-                asia = df[df['hora_utc'].between(0, 7)]
-                london = df[df['hora_utc'].between(8, 13)]
-                ny = df[df['hora_utc'].between(14, 21)]
+                asia = df[df['hora_tokio'].between(8, 16)]
+                london = df[df['hora_londres'].between(8, 16)]
+                ny = df[df['hora_ny'].between(8, 16)]
                 vol_relativa_asia = asia['retorno'].std() / overall_vol if len(asia) > 50 else 0.0
                 vol_relativa_london = london['retorno'].std() / overall_vol if len(london) > 50 else 0.0
                 vol_relativa_ny = ny['retorno'].std() / overall_vol if len(ny) > 50 else 0.0
@@ -1808,9 +1825,9 @@ if __name__ == "__main__":
         'Minima correlación (Panic)': _color_signo(corr_min),
         'Tiempo corr. negativa (%)': _color_pct_tiempo_negativo(tiempo_negativa),
     }, **({
-        'Volatilidad promedio Asia (00-08)': f"{barra(vol_relativa_asia, _rel_h_max)} {vol_relativa_asia:.2f}x" if vol_relativa_asia > 0 else f"{barra(0, 1)} N/A",
-        'Volatilidad promedio Londres (08-14)': f"{barra(vol_relativa_london, _rel_h_max)} {vol_relativa_london:.2f}x" if vol_relativa_london > 0 else f"{barra(0, 1)} N/A",
-        'Volatilidad promedio NY (14-22)': f"{barra(vol_relativa_ny, _rel_h_max)} {vol_relativa_ny:.2f}x" if vol_relativa_ny > 0 else f"{barra(0, 1)} N/A",
+        'Volatilidad promedio Tokio (08-17h local)': f"{barra(vol_relativa_asia, _rel_h_max)} {vol_relativa_asia:.2f}x" if vol_relativa_asia > 0 else f"{barra(0, 1)} N/A",
+        'Volatilidad promedio Londres (08-17h local)': f"{barra(vol_relativa_london, _rel_h_max)} {vol_relativa_london:.2f}x" if vol_relativa_london > 0 else f"{barra(0, 1)} N/A",
+        'Volatilidad promedio NY (08-17h local)': f"{barra(vol_relativa_ny, _rel_h_max)} {vol_relativa_ny:.2f}x" if vol_relativa_ny > 0 else f"{barra(0, 1)} N/A",
         'Vol. fin de semana vs laborable': f"{vol_weekend_ratio:.1%}" if vol_weekend_ratio > 0 else "N/A"
     } if len(vol_por_hora) > 0 else {})))
 
@@ -1900,47 +1917,123 @@ if __name__ == "__main__":
         )
     })
 
-    # ── NATR, correlación Multi-TF ──
-    natr_cat = {}
-    for tf_name in sorted(_NATR_DATA.keys(), key=lambda x: _tf_to_minutes(x) or 0):
-        natr_cat[f'NATR({tf_name})'] = f'{_NATR_DATA[tf_name].mean():.4f}'
-    for horizon_name in HORIZON_NAMES:
-        results = _NATR_PAIRS.get(horizon_name, [])
-        for result_item in results:
-            prefix = f'[{horizon_name}] Par {result_item["pair"]}'
-            natr_cat[f'{prefix} - NATR base'] = f'{result_item["natr_base"]:.4f}'
-            natr_cat[f'{prefix} - NATR target'] = f'{result_item["natr_target"]:.4f}'
-            natr_cat[f'{prefix} - Ratio'] = f'{result_item["ratio"]:.4f}'
-            natr_cat[f'{prefix} - Lead-Lag'] = f'~{result_item["lag"]} velas ({result_item["lag_unit"]}) [max: {result_item["max_lag"]} lags]'
-    _mostrar_categoria('14. NATR, correlación Multi-TF', natr_cat)
+    # ── 14/14.5. NATR, Z-score, Ratio — tabla con bordes ──
 
-    # ── NATR Z-score, Régimen, Ratio por horizonte ──
-    natr_zr = {}
+    # Helper: dibuja una tabla con bordes ┌─┐└─┘├─┤│
+    def _natr_grid(headers, rows, caption=''):
+        col_widths = [
+            max(len(str(row[i])) for row in rows + [headers]) + 2
+            for i in range(len(headers))
+        ]
+        sep = '├' + '┼'.join('─' * w for w in col_widths) + '┤'
+        top = '┌' + '┬'.join('─' * w for w in col_widths) + '┐'
+        bot = '└' + '┴'.join('─' * w for w in col_widths) + '┘'
+
+        def _row(cells):
+            return '│' + '│'.join(f'{str(c):^{w}}' for c, w in zip(cells, col_widths)) + '│'
+
+        lines = [top, _row(headers), sep]
+        for i, row in enumerate(rows):
+            lines.append(_row(row))
+            if i < len(rows) - 1:
+                lines.append(sep)
+        lines.append(bot)
+        if caption:
+            print(f"\n  {caption}")
+        for line in lines:
+            print(f"  {line}")
+        sys.stdout.flush()
+
     for horizon_name in HORIZON_NAMES:
-        prefix = f'[{horizon_name}]'
+        label_h = f' [General]' if horizon_name == 'General' else f' [{horizon_name}]'
+        titulo = f'14. NATR Multi-TF{label_h}'
         zs = _NATR_Z_CURRENT.get(horizon_name, {})
         pairs = HORIZON_PAIRS.get(horizon_name, [])
+        pairs_data = _NATR_PAIRS.get(horizon_name, [])
 
-        if horizon_name == 'General':
-            tfs_relevantes = sorted(zs.keys(), key=lambda x: _tf_to_minutes(x) or 0)
-        else:
-            tfs_pares = {_natr_key(tf) for par in pairs for tf in par}
-            tfs_relevantes = sorted(
-                (tf for tf in tfs_pares if tf and tf in zs),
-                key=lambda x: _tf_to_minutes(x) or 0
+        # ----- bloque A: tabla NATR por TF -----
+        tfs = sorted(_NATR_DATA.keys(), key=lambda x: _tf_to_minutes(x) or 0)
+        rows_a = []
+        for tf in tfs:
+            natr_val = _NATR_DATA[tf].mean()
+            z_val = zs.get(tf, 0.0)
+            teo = _NATR_THEORETICAL.get(tf, 0)
+            dev = (natr_val / teo - 1) * 100 if teo > 0 else 0
+            rows_a.append((
+                f'{tf}',
+                f'{natr_val:.4f}%',
+                f'{z_val:+.2f}',
+                f'{teo:.4f}%',
+                f'{dev:+.1f}%',
+            ))
+        _natr_grid(
+            ['TF', 'NATR', 'Z-score', 'Teórico √T', 'Desv.'],
+            rows_a,
+            caption=f'{titulo} — NATR por timeframe'
+        )
+
+        # ----- bloque B: lead-lag -----
+        if pairs_data:
+            rows_b = []
+            for pr in pairs_data:
+                rows_b.append((
+                    pr['pair'],
+                    f'{pr["natr_base"]:.4f}',
+                    f'{pr["natr_target"]:.4f}',
+                    f'{pr["ratio"]:.4f}',
+                    f'~{pr["lag"]}v ({pr["lag_unit"]})',
+                ))
+            _natr_grid(
+                ['Par', 'NATR base', 'NATR target', 'Ratio', 'Lead-Lag'],
+                rows_b,
+                caption=f'{titulo} — Pares de volatilidad'
             )
-        for tf in tfs_relevantes:
-            natr_zr[f'{prefix}Z-score({tf})'] = f'{zs[tf]:+.3f}'
 
+        # ----- bloque C: ratio con bandas -----
         for tf_a, tf_b in pairs:
-            tf_a, tf_b = _natr_key(tf_a), _natr_key(tf_b)
-            bb = _NATR_RATIO_BB.get(horizon_name, {}).get((tf_a, tf_b))
+            tf_a_k, tf_b_k = _natr_key(tf_a), _natr_key(tf_b)
+            bb = _NATR_RATIO_BB.get(horizon_name, {}).get((tf_a_k, tf_b_k))
             if not bb:
                 continue
-            natr_zr[f'{prefix}Ratio({tf_a}/{tf_b})'] = f'{bb["current"]:.4f}'
-            natr_zr[f'{prefix}Ratio BB sup({tf_a}/{tf_b})'] = f'{bb["upper"].iloc[0]:.4f}'
-            natr_zr[f'{prefix}Ratio BB inf({tf_a}/{tf_b})'] = f'{bb["lower"].iloc[0]:.4f}'
-    _mostrar_categoria('14.5. NATR Z-score, Ratio por horizonte', natr_zr)
+            rows_c = [(
+                f'{tf_a_k}/{tf_b_k}',
+                f'{bb["current"]:.4f}',
+                f'{bb["upper"].iloc[0]:.4f}',
+                f'{bb["lower"].iloc[0]:.4f}',
+            )]
+            _natr_grid(
+                ['Ratio', 'Actual', 'BB Sup (+2σ)', 'BB Inf (-2σ)'],
+                rows_c,
+                caption=f'{titulo} — Ratio con Bandas Bollinger'
+            )
+
+    # Poblar metricas para PDF (formato plano original, compatibilidad)
+    natr_cat_pdf = {}
+    for tf_name in sorted(_NATR_DATA.keys(), key=lambda x: _tf_to_minutes(x) or 0):
+        natr_cat_pdf[f'NATR({tf_name})'] = f'{_NATR_DATA[tf_name].mean():.4f}'
+    for horizon_name in HORIZON_NAMES:
+        for pr in _NATR_PAIRS.get(horizon_name, []):
+            prefix = f'[{horizon_name}] Par {pr["pair"]}'
+            natr_cat_pdf[f'{prefix} - NATR base'] = f'{pr["natr_base"]:.4f}'
+            natr_cat_pdf[f'{prefix} - NATR target'] = f'{pr["natr_target"]:.4f}'
+            natr_cat_pdf[f'{prefix} - Ratio'] = f'{pr["ratio"]:.4f}'
+            natr_cat_pdf[f'{prefix} - Lead-Lag'] = f'~{pr["lag"]} velas ({pr["lag_unit"]}) [max: {pr["max_lag"]} lags]'
+    metricas['14. NATR, correlación Multi-TF'] = natr_cat_pdf
+
+    natr_zr_pdf = {}
+    for horizon_name in HORIZON_NAMES:
+        pfx = f'[{horizon_name}]'
+        for tf, zval in _NATR_Z_CURRENT.get(horizon_name, {}).items():
+            natr_zr_pdf[f'{pfx}Z-score({tf})'] = f'{zval:+.3f}'
+        for tf_a, tf_b in HORIZON_PAIRS.get(horizon_name, []):
+            tf_a_k, tf_b_k = _natr_key(tf_a), _natr_key(tf_b)
+            bb = _NATR_RATIO_BB.get(horizon_name, {}).get((tf_a_k, tf_b_k))
+            if not bb:
+                continue
+            natr_zr_pdf[f'{pfx}Ratio({tf_a_k}/{tf_b_k})'] = f'{bb["current"]:.4f}'
+            natr_zr_pdf[f'{pfx}Ratio BB sup({tf_a_k}/{tf_b_k})'] = f'{bb["upper"].iloc[0]:.4f}'
+            natr_zr_pdf[f'{pfx}Ratio BB inf({tf_a_k}/{tf_b_k})'] = f'{bb["lower"].iloc[0]:.4f}'
+    metricas['14.5. NATR Z-score, Ratio por horizonte'] = natr_zr_pdf
 
     print()
     print(f"\n{'═'*70}\n")

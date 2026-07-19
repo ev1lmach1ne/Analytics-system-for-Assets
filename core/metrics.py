@@ -41,7 +41,11 @@ def calcular_er_series(retorno_log, periodo):
     return er.fillna(0)
 
 
-@njit
+# nogil=True en todos los @njit: numba por defecto RETIENE el GIL durante la
+# ejecución compilada, así que un cálculo largo (Hurst sobre millones de velas
+# de 1m) congelaría la GUI entera aunque corra dentro de un QThread. Con nogil
+# el hilo de fondo trabaja de verdad en paralelo al event loop de Qt.
+@njit(nogil=True)
 def calcular_kama_numba(close, er, fast, slow):
     """
     Kaufman Adaptive Moving Average: suaviza `close` con una constante
@@ -97,7 +101,7 @@ def contar_regimen_hurst(hurst_series):
 
 
 # ── Exponente de Hurst (R/S, Anis-Lloyd calibrado) ─────────────────
-@njit
+@njit(nogil=True)
 def hurst_rs_numba(series, lags):
     """
     Calcula el Exponente de Hurst aplicando la corrección de Anis-Lloyd
@@ -188,7 +192,7 @@ def hurst_rs_numba(series, lags):
     return h
 
 
-@njit
+@njit(nogil=True)
 def calcular_hurst_array(retornos, ventana, paso, lags):
     """Aplica hurst_rs_numba en ventana deslizante sobre `retornos`."""
     n         = len(retornos)

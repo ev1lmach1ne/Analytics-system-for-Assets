@@ -6,6 +6,7 @@ from gui.widgets.tab_descargar import TabDescargar
 from gui.widgets.tab_importar import TabImportar
 from gui.widgets.tab_analisis import TabAnalisis
 from gui.widgets.tab_limpiados import TabLimpiados
+from gui.widgets.tab_comparador import TabComparador
 
 STYLE = """
 QMainWindow, QWidget { background-color: #111828; color: #c8d6e5; }
@@ -73,7 +74,7 @@ class HeaderBar(QFrame):
         subtitle.setStyleSheet("color: #3a5a7a; font-size: 11px;")
         subtitle.setContentsMargins(6, 0, 0, 0)
 
-        version = QLabel("v0.5.5")
+        version = QLabel("v0.5.6")
         version.setStyleSheet("color: #2a4a6a; font-size: 10px; padding-left: 8px;")
 
         layout.addWidget(title)
@@ -192,13 +193,15 @@ class MainWindow(QMainWindow):
         self.tab_importar = TabImportar()
         self.tab_limpiados = TabLimpiados()
         self.tab_analisis = TabAnalisis()
+        self.tab_comparador = TabComparador()
 
         self.tab_limpiados.set_analisis_tab(self.tab_analisis)
 
         self.tabs.addTab(self.tab_descargar, u"   Descargar   ")
         self.tabs.addTab(self.tab_importar, u"   Importar   ")
-        self.tabs.addTab(self.tab_limpiados, u"   Limpiados   ")
+        self.tabs.addTab(self.tab_limpiados, u"   Limpiador   ")
         self.tabs.addTab(self.tab_analisis, u"   Analizador   ")
+        self.tabs.addTab(self.tab_comparador, u"   Comparador   ")
 
         # Refresh file explorer and table mode when import completes
         self.tab_importar.import_completed.connect(self.tab_limpiados.explorer.refresh)
@@ -223,6 +226,9 @@ class MainWindow(QMainWindow):
         if index == 2:
             self.tab_limpiados.explorer.refresh()
             self.tab_limpiados._scan_assets()
+        elif index == 4:
+            # Comparador: por si se analizo un activo nuevo desde la ultima visita
+            self.tab_comparador.refresh_available()
 
     def set_status(self, text):
         sb = self.findChild(StatusBar)

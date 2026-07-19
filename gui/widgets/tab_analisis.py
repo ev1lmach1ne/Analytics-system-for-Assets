@@ -5,6 +5,7 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont, QColor
 from gui.widgets.pdf_viewer import PdfViewer
+from gui.widgets.tab_patrones import TabPatrones
 from core.config import tf_to_minutes
 
 STYLE_ANALISIS = """
@@ -334,6 +335,9 @@ class TabAnalisis(QWidget):
         self.graphs_viewer = PdfViewer()
         self.inner_tabs.addTab(self.graphs_viewer, "  Graficos  ")
 
+        self.patterns_tab = TabPatrones()
+        self.inner_tabs.addTab(self.patterns_tab, "  Patrones  ")
+
         layout.addWidget(self.inner_tabs, 1)
 
     @property
@@ -421,6 +425,7 @@ class TabAnalisis(QWidget):
         self._ticker = ticker or ''
         self._tf = tf or ''
         self._csv_path = csv_path or None
+        self.patterns_tab.set_source(self._csv_path, ticker, tf)
 
         self.lbl_asset.setText(f"{ticker} {tf}" if ticker and tf else "Sin activo")
         self._update_horizon_items(tf)

@@ -1,4 +1,4 @@
-import os, json, shutil
+import os, json, re, shutil
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                              QLabel, QSplitter, QFileDialog, QMessageBox,
                              QLineEdit, QComboBox, QFrame)
@@ -98,8 +98,15 @@ class TabImportar(QWidget):
         self.btn_stop.clicked.connect(self._stop_import)
         self.btn_stop.setEnabled(False)
 
+        self.btn_delete = QPushButton(" Eliminar")
+        self.btn_delete.setObjectName("danger")
+        self.btn_delete.setToolTip("Eliminar el archivo seleccionado")
+        self.btn_delete.clicked.connect(self._delete_file)
+        self.btn_delete.setEnabled(False)
+
         toolbar.addWidget(self.btn_config)
         toolbar.addWidget(self.btn_stop)
+        toolbar.addWidget(self.btn_delete)
         toolbar.addStretch()
 
         self.path_label = QLabel("Ningun archivo seleccionado")
@@ -141,6 +148,7 @@ class TabImportar(QWidget):
         self._selected_file = path
         self.path_label.setText(os.path.basename(path))
         self.btn_config.setEnabled(True)
+        self.btn_delete.setEnabled(True)
 
     def _filter_files(self, text: str):
         self.explorer.set_search_text(text)
@@ -154,12 +162,16 @@ class TabImportar(QWidget):
             self._selected_file = path
             self.path_label.setText(os.path.basename(path))
             self.btn_config.setEnabled(True)
+            self.btn_delete.setEnabled(True)
 
     def _run_import(self):
         if not self._selected_file:
             return
 
-        nombre = self.nombre_input.text().strip().lower()
+        # Solo letras y numeros: el nombre se usa como identificador de tabla
+        # SQL y los scripts separan activo/tf con '_', asi que guiones,
+        # espacios y '_' se eliminan (msci-acwi -> msciacwi).
+        nombre = re.sub(r'[^a-z0-9]', '', self.nombre_input.text().strip().lower())
         if not nombre:
             QMessageBox.warning(self, "Error", "El nombre del activo no puede estar vacio.")
             self.nombre_input.setFocus()
@@ -179,6 +191,7 @@ class TabImportar(QWidget):
         self._config = cfg
         self.btn_config.setEnabled(False)
         self.btn_select.setEnabled(False)
+        self.btn_delete.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self.path_label.setText(f"Limpiando {cfg['nombre']} ({cfg['tf']})...")
 
@@ -215,6 +228,29 @@ class TabImportar(QWidget):
 
         preparar_py = os.path.join(SCRIPTS_DIR, "preparar_datos.py")
         self.console.run(preparar_py, env=env)
+
+    def _delete_file(self):
+        if not self._selected_file or not os.path.exists(self._selected_file):
+            return
+        reply = QMessageBox.question(
+            self, "Confirmar eliminacion",
+            f"Eliminar {os.path.basename(self._selected_file)}?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            try:
+                os.remove(self._selected_file)
+                # Si la carpeta del activo queda vacia, se elimina tambien
+                parent = os.path.dirname(self._selected_file)
+                if os.path.normpath(parent) != os.path.normpath(BASE_DATA) and not os.listdir(parent):
+                    os.rmdir(parent)
+                self._selected_file = None
+                self.path_label.setText("Ningun archivo seleccionado")
+                self.btn_config.setEnabled(False)
+                self.btn_delete.setEnabled(False)
+                self.explorer.refresh()
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"No se pudo eliminar:\n{e}")
 
     def _stop_import(self):
         self.console.stop()
@@ -264,5 +300,6 @@ class TabImportar(QWidget):
         self.btn_config.setEnabled(True)
         self.btn_select.setEnabled(True)
         self.btn_stop.setEnabled(False)
+        self.btn_delete.setEnabled(bool(self._selected_file))
         if self._selected_file:
             self.path_label.setText(os.path.basename(self._selected_file))
