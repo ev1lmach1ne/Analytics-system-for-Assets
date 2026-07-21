@@ -1,3 +1,4 @@
+import json
 import os
 import re
 from dotenv import load_dotenv
@@ -5,6 +6,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+APP_CONFIG_PATH = os.path.join(PROJECT_ROOT, 'config.json')
 
 # === QuestDB Config ===
 QUESTDB_HOST     = os.getenv('QUESTDB_HOST', 'localhost')
@@ -22,18 +24,106 @@ DB_CONFIG = {
     'password': QUESTDB_PASSWORD,
 }
 
-# === Paths ===
+# === Paths (mutable) ===
 BASE_DATA     = os.getenv('BASE_DATA', r"D:\DATOS\Activos")
 LIMPIADOS_DIR = os.path.join(BASE_DATA, "Limpiados")
 INFORMES_DIR  = os.path.join(LIMPIADOS_DIR, "Informes")
 CONFIG_PATH   = os.path.join(BASE_DATA, "sesion_config.json")
 SCRIPTS_DIR   = os.path.join(PROJECT_ROOT, "library", "scripts_utiles")
 
+
+def get_base_data():
+    return BASE_DATA
+
+
+def set_base_data(path):
+    """Actualiza BASE_DATA y todas las rutas derivadas globalmente."""
+    global BASE_DATA, LIMPIADOS_DIR, INFORMES_DIR, CONFIG_PATH
+    BASE_DATA = path
+    LIMPIADOS_DIR = os.path.join(BASE_DATA, "Limpiados")
+    INFORMES_DIR = os.path.join(LIMPIADOS_DIR, "Informes")
+    CONFIG_PATH = os.path.join(BASE_DATA, "sesion_config.json")
+    _save_app_config()
+
+
+def _save_app_config():
+    try:
+        with open(APP_CONFIG_PATH, 'w', encoding='utf-8') as f:
+            json.dump({'base_data': BASE_DATA}, f, indent=2)
+    except Exception:
+        pass
+
+
+def load_app_config():
+    """Lee config.json del PROJECT_ROOT y aplica BASE_DATA si existe."""
+    global BASE_DATA, LIMPIADOS_DIR, INFORMES_DIR, CONFIG_PATH
+    if not os.path.exists(APP_CONFIG_PATH):
+        return False
+    try:
+        with open(APP_CONFIG_PATH, 'r', encoding='utf-8') as f:
+            cfg = json.load(f)
+        path = cfg.get('base_data')
+        if path and os.path.isdir(path):
+            BASE_DATA = path
+            LIMPIADOS_DIR = os.path.join(BASE_DATA, "Limpiados")
+            INFORMES_DIR = os.path.join(LIMPIADOS_DIR, "Informes")
+            CONFIG_PATH = os.path.join(BASE_DATA, "sesion_config.json")
+            return True
+    except Exception:
+        pass
+    return False
+
+
+load_app_config()
+
 TF_LABELS  = ['30s', '1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '1d']
 TIPO_LABELS = ['Futuro/Cfd', 'Forex', 'Stock', 'Crypto']
 TIPO_MAP    = {'Futuro/Cfd': 'FUTURO', 'Forex': 'FOREX', 'Stock': 'STOCK', 'Crypto': 'CRYPTO'}
 
 TF_PATTERN = re.compile(r'_(\d+[a-z]+)_limpiado|_(\d+[a-z]+)_limpio')
+
+# Fricción aproximada POR LADO (en %, como los muestran los spinboxes del
+# backtest) según la clase de activo — dentro de cada clase hay más y menos
+# líquidos, esto solo prellena un punto de partida razonable que el usuario
+# puede ajustar a su broker.
+PRESETS_FRICCION = {
+    'CRYPTO': {'slippage_pct': 0.10, 'comision_pct': 0.03},
+    'STOCK':  {'slippage_pct': 0.07, 'comision_pct': 0.07},
+    'FUTURO': {'slippage_pct': 0.02, 'comision_pct': 0.03},
+    'FOREX':  {'slippage_pct': 0.02, 'comision_pct': 0.03},
+}
+
+# tokens (minúsculas) para clasificar archivos legacy sin meta.json
+_TOKENS_CRYPTO = ('btc', 'eth', 'sol', 'xrp', 'doge', 'ada', 'bnb', 'usdt',
+                  'crypto', 'cripto')
+_TOKENS_FOREX = ('eurusd', 'gbpusd', 'usdjpy', 'audusd', 'usdcad', 'usdchf',
+                 'nzdusd', 'xauusd', 'xagusd')
+_TOKENS_FUTURO = ('us500', 'spx', 'nas100', 'us30', 'ger40', 'dax', 'oil',
+                  'wti', 'brent', 'ng')
+
+
+def tipo_activo_de_csv(csv_path):
+    """Clase de activo (FUTURO/FOREX/STOCK/CRYPTO) de un CSV limpiado, o
+    None si no se puede determinar. Primero el sidecar <csv>.meta.json
+    (escrito por la pestaña Importar); si no existe o no trae 'activo',
+    heurística por tokens del nombre del archivo y su carpeta."""
+    try:
+        with open(str(csv_path) + '.meta.json', encoding='utf-8') as f:
+            activo = (json.load(f) or {}).get('activo')
+        if activo in PRESETS_FRICCION:
+            return activo
+    except (OSError, json.JSONDecodeError, AttributeError):
+        pass
+
+    nombre = os.path.basename(str(csv_path)).lower()
+    carpeta = os.path.basename(os.path.dirname(str(csv_path))).lower()
+    texto = f"{carpeta}_{nombre}"
+    for tokens, tipo in ((_TOKENS_CRYPTO, 'CRYPTO'),
+                         (_TOKENS_FOREX, 'FOREX'),
+                         (_TOKENS_FUTURO, 'FUTURO')):
+        if any(t in texto for t in tokens):
+            return tipo
+    return None
 
 FACTORES = {
     'CRYPTO': {

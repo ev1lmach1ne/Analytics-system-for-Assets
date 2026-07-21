@@ -355,7 +355,7 @@ class TabComparador(QWidget):
         lbl_rf.setObjectName("tfLabel")
         barra.addWidget(lbl_rf)
         self.rf_input = QLineEdit("4.33")
-        self.rf_input.setFixedWidth(72)
+        self.rf_input.setFixedWidth(82)
         # Enter en el campo tambien aplica (returnPressed); editingFinished
         # cubre ademas el clic fuera del campo
         self.rf_input.editingFinished.connect(self._refresh_scatter)
@@ -1114,10 +1114,20 @@ class TabComparador(QWidget):
                        edgecolors='#111111', linewidths=0.6, zorder=6)
             # CML: recta desde (0, Rf) pasando por la cartera tangente
             if v_tan > 0:
+                slope = (r_tan - rf) / v_tan
                 x_cml = np.linspace(0, max(f_vols.max(), max(vols)) * 1.1, 50)
-                ax.plot(x_cml, rf + (r_tan - rf) / v_tan * x_cml,
+                ax.plot(x_cml, rf + slope * x_cml,
                         color='#ffd54f', linewidth=0.9, linestyle='-.',
                         alpha=0.7, zorder=2)
+                # Etiqueta CML FUERA del area del grafico (como Rf): x en coords
+                # de ejes (>1, fuera a la derecha), y en coords de datos pegado al
+                # extremo de la linea. No afecta a margenes del axes.
+                import matplotlib.transforms as mtransforms
+                trans_cml = mtransforms.blended_transform_factory(ax.transAxes, ax.transData)
+                y_cml_end = rf + slope * x_cml[-1]
+                ax.text(1.01, y_cml_end, 'CML', transform=trans_cml, clip_on=False,
+                        color='#ffd54f', fontsize=6.5, alpha=0.8, fontweight='bold',
+                        ha='left', va='center')
             # Composicion de la cartera tangente (pesos >3%), junto a la estrella
             pesos_txt = "  ".join(
                 f"{lbl} {w_i:.0%}" for lbl, w_i in
@@ -1183,7 +1193,7 @@ class TabComparador(QWidget):
         # (x en coords de ejes >1, y en coords de datos, sin recorte)
         import matplotlib.transforms as mtransforms
         trans_rf = mtransforms.blended_transform_factory(ax.transAxes, ax.transData)
-        ax.text(1.01, rf, f'Rf\n{rf:.2f}%', transform=trans_rf, clip_on=False,
+        ax.text(1.01, rf, f'Rf\n{rf:.3f}%', transform=trans_rf, clip_on=False,
                 color='#ffffff', fontsize=6.5, alpha=0.8, va='center', ha='left')
 
         ax.set_xlabel('Volatilidad anualizada (%) → riesgo', fontsize=8)

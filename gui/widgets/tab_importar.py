@@ -5,7 +5,7 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
 from PyQt6.QtCore import Qt, pyqtSignal
 from gui.widgets.file_explorer import FileExplorer
 from gui.widgets.console_widget import ConsoleWidget
-from core.config import BASE_DATA, LIMPIADOS_DIR, TF_LABELS, TIPO_LABELS, TIPO_MAP, SCRIPTS_DIR
+from core.config import get_base_data, LIMPIADOS_DIR, TF_LABELS, TIPO_LABELS, TIPO_MAP, SCRIPTS_DIR
 
 STYLE_IMPORT = """
 QWidget { background-color: #141e30; }
@@ -46,6 +46,7 @@ class TabImportar(QWidget):
         self.setStyleSheet(STYLE_IMPORT)
         self._selected_file = None
         self._running_clean = False
+        self._base_data = get_base_data()
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
@@ -131,18 +132,29 @@ class TabImportar(QWidget):
         layout.addLayout(search_layout)
 
         # ── Splitter: FileExplorer (left) + Console (right) ──
-        splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        self.explorer = FileExplorer(BASE_DATA, mode='exclude')
+        self.explorer = FileExplorer(self._base_data, mode='exclude')
         self.explorer.file_chosen.connect(self._on_file_explorer_click)
-        splitter.addWidget(self.explorer)
+        self.splitter.addWidget(self.explorer)
 
         self.console = ConsoleWidget()
         self.console.finished.connect(self._on_import_finished)
-        splitter.addWidget(self.console)
+        self.splitter.addWidget(self.console)
 
-        splitter.setSizes([350, 600])
-        layout.addWidget(splitter, 1)
+        self.splitter.setSizes([350, 600])
+        layout.addWidget(self.splitter, 1)
+
+    def update_base_data(self, path):
+        self._base_data = path
+        old = self.explorer
+        new = FileExplorer(path, mode='exclude')
+        new.file_chosen.connect(self._on_file_explorer_click)
+        idx = self.splitter.indexOf(old)
+        self.splitter.replaceWidget(idx, new)
+        old.setParent(None)
+        old.deleteLater()
+        self.explorer = new
 
     def _on_file_explorer_click(self, path):
         self._selected_file = path
@@ -156,7 +168,7 @@ class TabImportar(QWidget):
     def _select_file(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Seleccionar archivo CSV/TXT",
-            BASE_DATA, "CSV (*.csv);;TXT (*.txt);;Todos (*)"
+            self._base_data, "CSV (*.csv);;TXT (*.txt);;Todos (*)"
         )
         if path:
             self._selected_file = path
@@ -196,7 +208,7 @@ class TabImportar(QWidget):
         self.path_label.setText(f"Limpiando {cfg['nombre']} ({cfg['tf']})...")
 
         src = self._selected_file
-        dst_dir = os.path.join(BASE_DATA, cfg['nombre'])
+        dst_dir = os.path.join(self._base_data, cfg['nombre'])
         os.makedirs(dst_dir, exist_ok=True)
         dst = os.path.join(dst_dir, os.path.basename(src))
         if src != dst:
@@ -212,7 +224,7 @@ class TabImportar(QWidget):
                     self._reset_ui()
                     return
 
-        config_path = os.path.join(BASE_DATA, "sesion_config.json")
+        config_path = os.path.join(self._base_data, "sesion_config.json")
         with open(config_path, 'w') as f:
             json.dump(cfg, f)
 
@@ -242,7 +254,7 @@ class TabImportar(QWidget):
                 os.remove(self._selected_file)
                 # Si la carpeta del activo queda vacia, se elimina tambien
                 parent = os.path.dirname(self._selected_file)
-                if os.path.normpath(parent) != os.path.normpath(BASE_DATA) and not os.listdir(parent):
+                if os.path.normpath(parent) != os.path.normpath(self._base_data) and not os.listdir(parent):
                     os.rmdir(parent)
                 self._selected_file = None
                 self.path_label.setText("Ningun archivo seleccionado")

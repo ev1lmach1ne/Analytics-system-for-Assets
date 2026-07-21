@@ -9,7 +9,7 @@ from gui.widgets.file_explorer import FileExplorer
 from gui.widgets.console_widget import ConsoleWidget
 from gui.widgets.rango_dialog import RangoAnalisisDialog
 
-from core.config import BASE_DATA, LIMPIADOS_DIR, SCRIPTS_DIR, TF_PATTERN
+from core.config import get_base_data, LIMPIADOS_DIR, SCRIPTS_DIR, TF_PATTERN
 
 STYLE_LIMPIADOS = """
 QWidget { background-color: #141e30; }
@@ -87,6 +87,8 @@ class TabLimpiados(QWidget):
         self._analisis_tab = None
         self._grid_mode = True
         self._rf_rate = 0.0
+        self._base_data = get_base_data()
+        self._limpiados_dir = LIMPIADOS_DIR
         self._rango_inicio = None
         self._rango_fin = None
 
@@ -144,7 +146,7 @@ class TabLimpiados(QWidget):
         self.mode_stack = QStackedWidget()
 
         # Page 0: FileExplorer
-        self.explorer = FileExplorer(LIMPIADOS_DIR, mode='csv')
+        self.explorer = FileExplorer(self._limpiados_dir, mode='csv')
         self.explorer.file_chosen.connect(self._on_file_click)
         self.mode_stack.addWidget(self.explorer)
 
@@ -262,11 +264,25 @@ class TabLimpiados(QWidget):
 
     # ── Table mode: asset scanning ──
 
+    def update_base_data(self, path):
+        self._base_data = path
+        self._limpiados_dir = os.path.join(path, "Limpiados")
+        old = self.explorer
+        new = FileExplorer(self._limpiados_dir, mode='csv')
+        new.file_chosen.connect(self._on_file_click)
+        idx = self.mode_stack.indexOf(old)
+        self.mode_stack.removeWidget(old)
+        self.mode_stack.insertWidget(idx, new)
+        old.setParent(None)
+        old.deleteLater()
+        self.explorer = new
+        self._scan_assets()
+
     def _scan_assets(self):
         assets = set()
-        if os.path.isdir(LIMPIADOS_DIR):
-            for entry in os.listdir(LIMPIADOS_DIR):
-                sub = os.path.join(LIMPIADOS_DIR, entry)
+        if os.path.isdir(self._limpiados_dir):
+            for entry in os.listdir(self._limpiados_dir):
+                sub = os.path.join(self._limpiados_dir, entry)
                 if os.path.isdir(sub):
                     for f in os.listdir(sub):
                         if f.endswith('_limpiado.csv') or f.endswith('_limpio.csv'):
@@ -285,7 +301,7 @@ class TabLimpiados(QWidget):
             self.asset_table.setRowCount(0)
             return
         nombre = self.asset_combo.currentText()
-        asset_dir = os.path.join(LIMPIADOS_DIR, nombre)
+        asset_dir = os.path.join(self._limpiados_dir, nombre)
         files = []
         if os.path.isdir(asset_dir):
             for f in os.listdir(asset_dir):
@@ -453,7 +469,7 @@ class TabLimpiados(QWidget):
                 self.btn_reanalyze.setEnabled(False)
                 self.preview_table.setVisible(False)
                 self.lbl_info.setText("")
-                self.explorer.set_root_path(LIMPIADOS_DIR)
+                self.explorer.set_root_path(self._limpiados_dir)
                 self._scan_assets()
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"No se pudo eliminar:\n{e}")
@@ -521,12 +537,12 @@ class TabLimpiados(QWidget):
             'horizonte': horizon,
             'rf_rate': rf_val,
         }
-        config_path = os.path.join(BASE_DATA, "sesion_config.json")
+        config_path = os.path.join(self._base_data, "sesion_config.json")
         with open(config_path, 'w') as f:
             json.dump(cfg, f)
 
-        metrics_path = os.path.join(BASE_DATA, "_gui_metrics.json")
-        pdf_path_file = os.path.join(BASE_DATA, "_gui_pdf_path.json")
+        metrics_path = os.path.join(self._base_data, "_gui_metrics.json")
+        pdf_path_file = os.path.join(self._base_data, "_gui_pdf_path.json")
 
         env = {
             'CONFIG_PATH': config_path,

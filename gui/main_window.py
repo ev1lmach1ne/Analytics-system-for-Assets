@@ -1,12 +1,13 @@
 from PyQt6.QtWidgets import (QMainWindow, QTabWidget, QWidget, QVBoxLayout,
                              QLabel, QPushButton, QHBoxLayout, QFrame, QSizePolicy)
-from PyQt6.QtCore import Qt, QPoint
+from PyQt6.QtCore import Qt, QPoint, pyqtSignal
 from PyQt6.QtGui import QFont, QPixmap
 from gui.widgets.tab_descargar import TabDescargar
 from gui.widgets.tab_importar import TabImportar
 from gui.widgets.tab_analisis import TabAnalisis
 from gui.widgets.tab_limpiados import TabLimpiados
 from gui.widgets.tab_comparador import TabComparador
+from gui.widgets.tab_backtest import TabBacktest
 
 STYLE = """
 QMainWindow, QWidget { background-color: #111828; color: #c8d6e5; }
@@ -74,13 +75,23 @@ class HeaderBar(QFrame):
         subtitle.setStyleSheet("color: #3a5a7a; font-size: 11px;")
         subtitle.setContentsMargins(6, 0, 0, 0)
 
-        version = QLabel("v0.5.6")
+        version = QLabel("v0.5.7-alpha")
         version.setStyleSheet("color: #2a4a6a; font-size: 10px; padding-left: 8px;")
 
         layout.addWidget(title)
         layout.addWidget(subtitle)
         layout.addWidget(version)
         layout.addStretch()
+
+        self.btn_settings = QPushButton("⚙")
+        self.btn_settings.setFixedSize(36, 32)
+        self.btn_settings.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_settings.setToolTip("Ajustes")
+        self.btn_settings.setStyleSheet("""
+            QPushButton { background: transparent; color: #7a9aba; border: none; font-size: 16px; border-radius: 0; }
+            QPushButton:hover { background-color: #1a2a45; color: #4fc3f7; }
+        """)
+        layout.addWidget(self.btn_settings)
 
         sep = QFrame()
         sep.setFixedWidth(1)
@@ -184,6 +195,7 @@ class MainWindow(QMainWindow):
         layout.setSpacing(0)
 
         self.header = HeaderBar(self)
+        self.header.btn_settings.clicked.connect(self._on_settings)
         layout.addWidget(self.header)
 
         self.tabs = QTabWidget()
@@ -194,6 +206,7 @@ class MainWindow(QMainWindow):
         self.tab_limpiados = TabLimpiados()
         self.tab_analisis = TabAnalisis()
         self.tab_comparador = TabComparador()
+        self.tab_backtest = TabBacktest()
 
         self.tab_limpiados.set_analisis_tab(self.tab_analisis)
 
@@ -202,6 +215,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.tab_limpiados, u"   Limpiador   ")
         self.tabs.addTab(self.tab_analisis, u"   Analizador   ")
         self.tabs.addTab(self.tab_comparador, u"   Comparador   ")
+        self.tabs.addTab(self.tab_backtest, u"   Backtester   ")
 
         # Refresh file explorer and table mode when import completes
         self.tab_importar.import_completed.connect(self.tab_limpiados.explorer.refresh)
@@ -229,8 +243,27 @@ class MainWindow(QMainWindow):
         elif index == 4:
             # Comparador: por si se analizo un activo nuevo desde la ultima visita
             self.tab_comparador.refresh_available()
+        elif index == 5:
+            # Backtest: refrescar el explorador de activos limpiados
+            self.tab_backtest.refresh_available()
 
     def set_status(self, text):
         sb = self.findChild(StatusBar)
         if sb:
             sb.label.setText(text)
+
+    def _on_settings(self):
+        from gui.dialogs.settings_dialog import SettingsDialog
+        from core.config import get_base_data
+        before = get_base_data()
+        dlg = SettingsDialog(self)
+        dlg.exec()
+        after = get_base_data()
+        if after != before:
+            if hasattr(self.tab_importar, 'update_base_data'):
+                self.tab_importar.update_base_data(after)
+            if hasattr(self.tab_limpiados, 'update_base_data'):
+                self.tab_limpiados.update_base_data(after)
+            if hasattr(self.tab_descargar, 'update_base_data'):
+                self.tab_descargar.update_base_data(after)
+            self.set_status(f"Ruta de datos: {after}")

@@ -11,7 +11,6 @@ El escaneo O(n_velas) corre en un QThread (lectura CSV + detección + contexto);
 el cambio de filtros solo recalcula estadística O(n_ocurrencias) en el hilo GUI.
 """
 import os
-import re
 
 import numpy as np
 import pandas as pd
@@ -34,12 +33,8 @@ from core.candle_patterns import (
 )
 from core.metrics import calcular_er_series, calcular_hurst_array
 from core.config import tf_to_minutes
-
-# Temporalidades ofrecidas para recalcular patrones (solo se puede subir de
-# granularidad respecto a la nativa del archivo importado, nunca bajar).
-TF_LABELS_PATRONES = ['1m', '3m', '5m', '15m', '30m', '1h', '4h', '1d', '1w']
-REGLAS_RESAMPLE = {'1m': '1min', '3m': '3min', '5m': '5min', '15m': '15min',
-                   '30m': '30min', '1h': '1h', '4h': '4h', '1d': '1D', '1w': '1W'}
+from gui.widgets.tf_common import TF_LABELS as TF_LABELS_PATRONES, \
+    parsear_tf_custom as _parsear_tf_custom, regla_de_tf as _regla_de_tf
 
 # Familias de TF para el precálculo en segundo plano: al cargar un activo (o
 # pulsar una TF de otra familia) se van precalculando las TFs hermanas para
@@ -56,26 +51,6 @@ def _familia_de_tf(tf_label):
         if tf_label in tfs:
             return tfs
     return []   # TFs custom: sin hermanas que precalcular
-
-
-def _parsear_tf_custom(texto):
-    """'20m'/'2 h'/'3d'/'2w' → etiqueta normalizada ('20m') o None si no es
-    una temporalidad válida."""
-    m = re.match(r'^\s*(\d+)\s*(m|h|d|w)\s*$', str(texto), re.IGNORECASE)
-    if not m or int(m.group(1)) <= 0:
-        return None
-    return f"{int(m.group(1))}{m.group(2).lower()}"
-
-
-def _regla_de_tf(tf_label):
-    """Regla de resample de pandas para una TF (preset o custom)."""
-    if tf_label in REGLAS_RESAMPLE:
-        return REGLAS_RESAMPLE[tf_label]
-    m = re.match(r'^(\d+)(m|h|d|w)$', tf_label)
-    if not m:
-        return None
-    unidad = {'m': 'min', 'h': 'h', 'd': 'D', 'w': 'W'}[m.group(2)]
-    return f"{m.group(1)}{unidad}"
 
 # Bloques de calendario ofrecidos para agregar_por_periodo (etiqueta, regla
 # de resample de pandas, minutos aprox. — para deshabilitar los que sean más
