@@ -25,7 +25,7 @@ DB_CONFIG = {
 }
 
 # === Paths (mutable) ===
-BASE_DATA     = os.getenv('BASE_DATA', r"D:\DATOS\Activos")
+BASE_DATA     = os.getenv('BASE_DATA', os.path.join(PROJECT_ROOT, "data"))
 LIMPIADOS_DIR = os.path.join(BASE_DATA, "Limpiados")
 INFORMES_DIR  = os.path.join(LIMPIADOS_DIR, "Informes")
 CONFIG_PATH   = os.path.join(BASE_DATA, "sesion_config.json")

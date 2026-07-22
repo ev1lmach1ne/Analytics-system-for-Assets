@@ -7,3 +7,5 @@ config.json
 *.db
 *.log
 tick_vault_data/
+data/
+*.lnk
