@@ -83,6 +83,16 @@ class HeaderBar(QFrame):
         layout.addWidget(version)
         layout.addStretch()
 
+        self.btn_help = QPushButton("?")
+        self.btn_help.setFixedSize(36, 32)
+        self.btn_help.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_help.setToolTip("Cómo funciona")
+        self.btn_help.setStyleSheet("""
+            QPushButton { background: transparent; color: #7a9aba; border: none; font-size: 16px; border-radius: 0; }
+            QPushButton:hover { background-color: #1a2a45; color: #4fc3f7; }
+        """)
+        layout.addWidget(self.btn_help)
+
         self.btn_settings = QPushButton("⚙")
         self.btn_settings.setFixedSize(36, 32)
         self.btn_settings.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -196,6 +206,7 @@ class MainWindow(QMainWindow):
 
         self.header = HeaderBar(self)
         self.header.btn_settings.clicked.connect(self._on_settings)
+        self.header.btn_help.clicked.connect(self._on_ayuda)
         layout.addWidget(self.header)
 
         self.tabs = QTabWidget()
@@ -252,6 +263,10 @@ class MainWindow(QMainWindow):
         if sb:
             sb.label.setText(text)
 
+    def _on_ayuda(self):
+        from gui.dialogs.tutorial_dialog import TutorialDialog
+        TutorialDialog(self).exec()
+
     def _on_settings(self):
         from gui.dialogs.settings_dialog import SettingsDialog
         from core.config import get_base_data
@@ -267,3 +282,13 @@ class MainWindow(QMainWindow):
             if hasattr(self.tab_descargar, 'update_base_data'):
                 self.tab_descargar.update_base_data(after)
             self.set_status(f"Ruta de datos: {after}")
+
+    def closeEvent(self, event):
+        # apaga la QuestDB local solo si la arrancamos nosotros en esta
+        # sesión — nunca toca una que el usuario ya tuviera corriendo
+        from core.questdb_manager import detener_bundled
+        try:
+            detener_bundled()
+        except Exception:
+            pass
+        super().closeEvent(event)

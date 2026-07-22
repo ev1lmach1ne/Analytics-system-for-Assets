@@ -62,6 +62,7 @@ QHeaderView::section {
 QFrame#panel { background-color: #0d1424; border: 1px solid #253a60; border-radius: 4px; }
 QLabel#panelTitle { color: #4fc3f7; font-size: 12px; font-weight: bold; background: transparent; }
 QLabel#tfLabel { color: #5a7a9a; font-size: 11px; background: transparent; }
+QLabel#tangenteLabel { color: #ffd54f; font-size: 11px; background: transparent; }
 QFrame#chip { background-color: #1a2a45; border: 1px solid #253a60; border-radius: 10px; }
 QLabel#chipName { color: #c8d6e5; font-size: 11px; background: transparent; }
 QPushButton#chipDel {
@@ -316,7 +317,7 @@ class TabComparador(QWidget):
         root.setContentsMargins(14, 10, 14, 10)
         root.setSpacing(8)
 
-        titulo = QLabel("Analizador Multi-Activo Comparativo")
+        titulo = QLabel("Analizador Multi-Activo Comparativo  |  Análisis de Carteras")
         titulo.setStyleSheet("color: #4fc3f7; font-size: 16px; font-weight: bold; background: transparent;")
         root.addWidget(titulo)
 
@@ -465,6 +466,11 @@ class TabComparador(QWidget):
         self.panel_scatter.header.addWidget(self.frontera_check)
         self.fig_scatter, self.canvas_scatter = _make_canvas()
         self.panel_scatter.vlay.addWidget(self.canvas_scatter, 1)
+        self.tangente_label = QLabel("")
+        self.tangente_label.setObjectName("tangenteLabel")
+        self.tangente_label.setWordWrap(True)
+        self.tangente_label.setVisible(False)
+        self.panel_scatter.vlay.addWidget(self.tangente_label)
         grid.addWidget(self.panel_scatter, 1, 1)
 
         # ── Splitter: Explorer (izquierda) + Dashboard (derecha) ──
@@ -1076,6 +1082,7 @@ class TabComparador(QWidget):
         listos = self._series_listas()
         if not listos:
             _ax_placeholder(ax, "Añade activos para comparar")
+            self.tangente_label.setVisible(False)
             self.canvas_scatter.draw_idle()
             return
 
@@ -1084,6 +1091,7 @@ class TabComparador(QWidget):
         rf = self._rf_actual()
 
         bench_path = self.benchmark_combo.currentData()
+        self.tangente_label.setVisible(False)
 
         # ── Frontera eficiente de Markowitz (opcional) ──
         frontera = None
@@ -1100,6 +1108,7 @@ class TabComparador(QWidget):
                 ax.text(0.5, 0.90, aviso, transform=ax.transAxes,
                         color='#f39c12', fontsize=7, ha='center', va='top',
                         fontweight='bold', alpha=0.9)
+        cml_slope = None
         if frontera is not None:
             f_vols, f_rets, f_w = frontera['vols'], frontera['rets'], frontera['pesos']
             # Nube de carteras posibles (long-only), tenue, detras de todo
@@ -1114,28 +1123,27 @@ class TabComparador(QWidget):
                        edgecolors='#111111', linewidths=0.6, zorder=6)
             # CML: recta desde (0, Rf) pasando por la cartera tangente
             if v_tan > 0:
-                slope = (r_tan - rf) / v_tan
+                cml_slope = (r_tan - rf) / v_tan
                 x_cml = np.linspace(0, max(f_vols.max(), max(vols)) * 1.1, 50)
-                ax.plot(x_cml, rf + slope * x_cml,
+                ax.plot(x_cml, rf + cml_slope * x_cml,
                         color='#ffd54f', linewidth=0.9, linestyle='-.',
                         alpha=0.7, zorder=2)
-                # Etiqueta CML FUERA del area del grafico (como Rf): x en coords
-                # de ejes (>1, fuera a la derecha), y en coords de datos pegado al
-                # extremo de la linea. No afecta a margenes del axes.
-                import matplotlib.transforms as mtransforms
-                trans_cml = mtransforms.blended_transform_factory(ax.transAxes, ax.transData)
-                y_cml_end = rf + slope * x_cml[-1]
-                ax.text(1.01, y_cml_end, 'CML', transform=trans_cml, clip_on=False,
-                        color='#ffd54f', fontsize=6.5, alpha=0.8, fontweight='bold',
-                        ha='left', va='center')
-            # Composicion de la cartera tangente (pesos >3%), junto a la estrella
+                # La etiqueta "CML" se coloca mas abajo, una vez fijados los
+                # limites definitivos del eje (ax.set_xlim/set_ylim): si se
+                # posiciona aqui, sobre el extremo extrapolado de la recta,
+                # su y puede quedar muy lejos del rango visible y, al tener
+                # clip_on=False, tight_layout() encoge el axes para intentar
+                # que quepa (los margenes "saltan" solo al activar Frontera).
+            # Composicion de la cartera tangente (pesos >3%): fuera del
+            # grafico (QLabel bajo el canvas) en vez de anotacion junto a la
+            # estrella, ya que esta puede caer en cualquier punto de la nube
+            # y solapar datos.
             pesos_txt = "  ".join(
                 f"{lbl} {w_i:.0%}" for lbl, w_i in
                 sorted(zip(frontera['labels'], f_w[i_tan]), key=lambda t: -t[1])
                 if w_i >= 0.03)
-            ax.annotate(f"Tangente: {pesos_txt}", (v_tan, r_tan),
-                        textcoords='offset points', xytext=(8, -12),
-                        color='#ffd54f', fontsize=6.5, alpha=0.9)
+            self.tangente_label.setText(f"★ Cartera tangente (máx. Sharpe): {pesos_txt}")
+            self.tangente_label.setVisible(True)
 
         for p, info, datos in listos:
             es_bench = (p == bench_path)
@@ -1204,4 +1212,20 @@ class TabComparador(QWidget):
             self.fig_scatter.subplots_adjust(right=0.90)
         except Exception:
             pass
+
+        if cml_slope is not None:
+            # Etiqueta CML FUERA del area del grafico (como Rf), dibujada
+            # DESPUES de tight_layout()/subplots_adjust(): un texto con
+            # clip_on=False igualmente se incluye en el calculo de bbox de
+            # tight_layout (el clip solo afecta al dibujado, no al bbox), asi
+            # que si se anade antes, su posicion puede achicar los margenes
+            # segun el Sharpe de la cartera tangente. Anadiendola despues no
+            # influye en el layout y ademas se acota al rango visible final
+            # del eje para que nunca quede lejos de la vista.
+            y_lo, y_hi = ax.get_ylim()
+            y_cml = min(max(rf + cml_slope * ax.get_xlim()[1], y_lo), y_hi)
+            ax.text(1.01, y_cml, 'CML', transform=trans_rf, clip_on=False,
+                    color='#ffd54f', fontsize=6.5, alpha=0.8, fontweight='bold',
+                    ha='left', va='center')
+
         self.canvas_scatter.draw_idle()

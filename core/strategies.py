@@ -27,7 +27,10 @@ Máximo MAX_SETUPS setups por sistema (límite del bitmask de 64 bits).
 import numpy as np
 import pandas as pd
 
-from core.candle_patterns import PATRONES_INFO, detectar_patrones
+from core.candle_patterns import (
+    PATRONES_INFO, detectar_patrones, preparar_contexto, _mascara_sesion,
+)
+from core.metrics import calcular_er_series, calcular_kama_numba, calcular_hurst_array
 
 PERIODO_ATR_DEFECTO = 14
 MAX_SETUPS = 64   # límite del bitmask int64 de salidas por setup
@@ -64,6 +67,54 @@ def bollinger(c, periodo=20, desv=2.0):
     media = s.rolling(int(periodo)).mean()
     std = s.rolling(int(periodo)).std()
     return media.values, (media + desv * std).values, (media - desv * std).values
+
+
+def _retorno_log(close):
+    """Retornos log cierre-a-cierre — misma convención que
+    library/scripts_utiles/limpieza_datos_er.py y tab_patrones.py."""
+    c = pd.Series(close, dtype=np.float64)
+    return np.log(c / c.shift(1))
+
+
+def _er_serie(close, periodo):
+    """Efficiency Ratio (Kaufman) de `close`, ventana `periodo`."""
+    return calcular_er_series(_retorno_log(close), int(periodo))
+
+
+def _kama_serie(close, periodo_er, rapido, lento):
+    """KAMA de `close`: ER interno con ventana periodo_er, SC entre
+    2/(rapido+1) y 2/(lento+1)."""
+    c = np.asarray(close, dtype=np.float64)
+    er = _er_serie(c, periodo_er).values.astype(np.float64)
+    return calcular_kama_numba(c, er, float(rapido), float(lento))
+
+
+def _lags_hurst_defecto(periodo):
+    """Deriva lags/paso de Hurst a partir de una única ventana `periodo`
+    expuesta en la UI, con proporciones similares a las que usan
+    library/scripts_utiles/limpieza_datos_er.py y tab_patrones.py."""
+    max_lag = max(8, 2 ** int(np.floor(np.log2(max(periodo // 4, 8)))))
+    lags = sorted({l for l in (max_lag // 8, max_lag // 4, max_lag // 2, max_lag) if l >= 4})
+    if len(lags) < 2:
+        lags = [4, 8]
+    paso = max(1, periodo // 100)
+    return np.array(lags, dtype=np.int64), paso
+
+
+def _hurst_serie(close, periodo):
+    """Hurst rodante (ventana=periodo) para el filtro de régimen. Devuelve
+    None si el histórico es más corto que la ventana pedida — evita que el
+    relleno de NaN→0.5 clasifique silenciosamente TODAS las velas como
+    régimen neutro y bloquee el filtro de tendencia/reversión sin avisar."""
+    n = len(close)
+    if n <= periodo:
+        return None
+    retornos = _retorno_log(close).fillna(0.0).values.astype(np.float64)
+    lags, paso = _lags_hurst_defecto(int(periodo))
+    hurst_vals = calcular_hurst_array(retornos, int(periodo), paso, lags)
+    if np.isnan(hurst_vals).all():
+        return None
+    return pd.Series(hurst_vals).interpolate(limit_direction='both').bfill().ffill().values
 
 
 def _cruza_arriba(a, b):
@@ -152,6 +203,28 @@ def _gen_rsi(df, p):
     return s
 
 
+def _gen_kama(df, p):
+    """KAMA (Kaufman Adaptive Moving Average): entrada en el cruce de
+    close contra la línea KAMA, igual patrón que _gen_cruce_medias pero con
+    una media que acelera en tendencia (ER alto) y se aplana en rango (ER
+    bajo) en vez de un periodo fijo."""
+    c = df['close'].values.astype(np.float64)
+    n = len(c)
+    kama = _kama_serie(c, p['periodo_er'], p['rapido'], p['lento'])
+    s = _base_senales(n, df['high'].values, df['low'].values, c)
+    arriba = _cruza_arriba(c, kama)
+    abajo = _cruza_abajo(c, kama)
+    arriba = _limpiar_nan(arriba, kama)
+    abajo = _limpiar_nan(abajo, kama)
+    if p['direccion'] in ('Long', 'Ambas'):
+        s['entradas_long'] = arriba.copy()
+        s['salidas_long'] = abajo.copy()
+    if p['direccion'] in ('Short', 'Ambas'):
+        s['entradas_short'] = abajo.copy()
+        s['salidas_short'] = arriba.copy()
+    return s
+
+
 def _gen_patrones(df, p):
     """Entradas en cada ocurrencia de los patrones elegidos (dir del patrón
     decide long/short); salida por tiempo la gestiona el motor con
@@ -177,8 +250,15 @@ def _gen_patrones(df, p):
 # ══════════════ estrategia custom (constructor de reglas) ══════════════
 
 _INDICADORES_REGLA = ['close', 'open', 'high', 'low', 'SMA', 'EMA', 'RSI',
-                      'ATR', 'BB_sup', 'BB_inf', 'BB_media']
+                      'ATR', 'BB_sup', 'BB_inf', 'BB_media', 'KAMA', 'ER']
 _OPERADORES_REGLA = ['>', '<', 'cruza arriba', 'cruza abajo']
+
+# defaults fijos de KAMA cuando se usa desde el constructor de reglas: la
+# tabla del editor solo expone un "Periodo" por indicador, así que el SC
+# rápido/lento de KAMA quedan fijos aquí (el «Periodo» de la fila mapea a
+# periodo_er). Para variar rápido/lento hace falta la plantilla KAMA dedicada.
+_KAMA_RAPIDO_REGLA = 2
+_KAMA_LENTO_REGLA = 30
 
 
 def _serie_indicador(df, spec):
@@ -202,6 +282,10 @@ def _serie_indicador(df, spec):
     if tipo in ('BB_sup', 'BB_inf', 'BB_media'):
         media, sup, inf = bollinger(c, periodo, float(spec.get('desv', 2.0)))
         return {'BB_sup': sup, 'BB_inf': inf, 'BB_media': media}[tipo]
+    if tipo == 'KAMA':
+        return _kama_serie(c, periodo, _KAMA_RAPIDO_REGLA, _KAMA_LENTO_REGLA)
+    if tipo == 'ER':
+        return _er_serie(c, periodo).values.astype(np.float64)
     raise ValueError(f"Indicador desconocido: {tipo}")
 
 
@@ -230,6 +314,36 @@ def _evaluar_reglas(df, condiciones):
     for cond in condiciones:
         m &= _evaluar_condicion(df, cond)
     return m
+
+
+def _mascara_condiciones(df, condiciones):
+    """AND de condiciones opcionales usadas como FILTRO de un setup — al
+    contrario que _evaluar_reglas (que define una señal y sin condiciones
+    no dispara nunca), aquí sin condiciones significa SIN RESTRICCIÓN."""
+    if not condiciones:
+        return np.ones(len(df), dtype=bool)
+    m = np.ones(len(df), dtype=bool)
+    for cond in condiciones:
+        m &= _evaluar_condicion(df, cond)
+    return m
+
+
+def _mascaras_condiciones_dir(df, condiciones):
+    """Como _mascara_condiciones pero direccional: cada condición lleva
+    'direccion' ('ambas'|'long'|'short'; por defecto 'ambas') y solo entra en
+    el AND del lado(s) al que se aplica. Devuelve (m_long, m_short). Sin
+    condiciones → (True, True) = sin restricción en ningún lado."""
+    n = len(df)
+    m_long = np.ones(n, dtype=bool)
+    m_short = np.ones(n, dtype=bool)
+    for cond in (condiciones or []):
+        mask = _evaluar_condicion(df, cond)
+        d = cond.get('direccion', 'ambas')
+        if d in ('ambas', 'long'):
+            m_long &= mask
+        if d in ('ambas', 'short'):
+            m_short &= mask
+    return m_long, m_short
 
 
 def _gen_custom(df, p):
@@ -262,6 +376,19 @@ def _desc_spec(spec):
     if tipo in ('BB_sup', 'BB_inf', 'BB_media'):
         return f"{tipo}({spec.get('periodo', 20)},{spec.get('desv', 2.0):g})"
     return f"{tipo}({spec.get('periodo', 14)})"
+
+
+def _desc_condicion_dir(cond):
+    """Descripción legible de una condición de filtro (condiciones_entrada/
+    condiciones_salida), con la etiqueta de dirección al final solo cuando
+    restringe un único lado (evita ruido cuando es 'ambas', el caso normal)."""
+    texto = f"{_desc_spec(cond['izq'])} {cond['op']} {_desc_spec(cond['der'])}"
+    d = cond.get('direccion', 'ambas')
+    if d == 'long':
+        return f"{texto} [Long]"
+    if d == 'short':
+        return f"{texto} [Short]"
+    return texto
 
 
 def _desc_cruce(p):
@@ -299,6 +426,21 @@ def _desc_rsi(p):
     if p['direccion'] in ('Short', 'Ambas'):
         partes.append(f"Entrada Short: RSI({per}) > {p['sobrecompra']:g} · "
                       f"Salida Short: RSI({per}) < 50")
+    return "\n".join(partes)
+
+
+def _desc_kama(p):
+    per_er, r, l = p['periodo_er'], p['rapido'], p['lento']
+    partes = []
+    if p['direccion'] in ('Long', 'Ambas'):
+        partes.append(f"Entrada Long: close cruza arriba KAMA(ER={per_er}, rápido={r}, lento={l}) · "
+                      f"Salida Long: close cruza abajo KAMA")
+    if p['direccion'] in ('Short', 'Ambas'):
+        partes.append(f"Entrada Short: close cruza abajo KAMA(ER={per_er}, rápido={r}, lento={l}) · "
+                      f"Salida Short: close cruza arriba KAMA")
+    partes.append("(KAMA se adapta: sigue de cerca en tendencia -ER alto- y "
+                  "se aplana en rango -ER bajo-; sin stop ATR por defecto, "
+                  "igual criterio que Cruce de medias)")
     return "\n".join(partes)
 
 
@@ -372,6 +514,23 @@ ESTRATEGIAS = {
              'opciones': _OPCIONES_DIRECCION, 'defecto': 'Ambas'},
         ],
     },
+    'KAMA': {
+        'generar': _gen_kama,
+        'descripcion': _desc_kama,
+        # la salida es el cruce contrario, igual razón que Cruce de medias:
+        # un stop cortaría el trade antes de que KAMA vuelva a cruzarse
+        'defaults_setup': {'stop_atr': 0.0},
+        'params': [
+            {'clave': 'periodo_er', 'etiqueta': 'Periodo ER', 'tipo': 'int',
+             'defecto': 10, 'min': 2, 'max': 200},
+            {'clave': 'rapido', 'etiqueta': 'SC rápido (velas)', 'tipo': 'int',
+             'defecto': 2, 'min': 1, 'max': 50},
+            {'clave': 'lento', 'etiqueta': 'SC lento (velas)', 'tipo': 'int',
+             'defecto': 30, 'min': 5, 'max': 500},
+            {'clave': 'direccion', 'etiqueta': 'Dirección', 'tipo': 'choice',
+             'opciones': _OPCIONES_DIRECCION, 'defecto': 'Ambas'},
+        ],
+    },
     'Patrones de velas': {
         'generar': _gen_patrones,
         'descripcion': _desc_patrones,
@@ -416,6 +575,81 @@ def describir(nombre_estrategia, params=None):
     return est['descripcion'](p)
 
 
+# ══════════════ filtros de entrada por setup ══════════════
+
+def _filtros_por_defecto():
+    """Filtros de ENTRADA de un setup — None/'ninguno' en cualquier eje =
+    sin restricción en ese eje. Solo se aplican a NUEVAS entradas (ver
+    generar_senales_sistema): las salidas nunca se filtran, para no dejar
+    una posición abierta sin forma de cerrarse si el régimen/sesión/día
+    cambia a mitad de una operación."""
+    return {
+        'dias_semana': None,      # None = todos; si no, lista de ints 0=Lun..6=Dom
+        'regimen': {'metodo': 'ninguno', 'periodo': 100},
+        # metodo: 'ninguno'|'er_tendencia'|'er_rango'|'hurst_tendencia'|'hurst_reversion'
+        'sesion': {'tipo': 'ninguna', 'hora_inicio': 0, 'hora_fin': 0},
+        # tipo: 'ninguna'|'overnight'|'londres'|'ny'|'personalizada' (horas UTC en 'personalizada')
+        'condiciones_entrada': [],   # lista de {'izq':spec,'op':...,'der':spec}; AND; [] = sin restricción
+        'condiciones_salida': [],    # idem, pero se aplica sobre la señal de SALIDA del setup
+    }
+
+
+def _mascara_filtros_setup(df, filtros):
+    """(m_long, m_short): máscaras AND de los filtros activos de un setup
+    (True = vela admitida para NUEVAS entradas). Día/régimen/sesión son
+    agnósticos a la dirección y se aplican a ambos lados por igual;
+    condiciones_entrada puede restringir un solo lado según su 'direccion'
+    (ver _mascaras_condiciones_dir). Reutiliza los umbrales/sesiones de
+    core.candle_patterns.preparar_contexto para no duplicar convenciones."""
+    n = len(df)
+    m = np.ones(n, dtype=bool)
+    if not filtros:
+        return m, m.copy()
+
+    dias = filtros.get('dias_semana')
+    if dias:
+        dow = df['timestamp'].dt.dayofweek.values
+        m &= np.isin(dow, list(dias))
+
+    reg = filtros.get('regimen') or {}
+    metodo = reg.get('metodo', 'ninguno')
+    ses = filtros.get('sesion') or {}
+    tipo_sesion = ses.get('tipo', 'ninguna')
+
+    necesita_er = metodo in ('er_tendencia', 'er_rango')
+    necesita_hurst = metodo in ('hurst_tendencia', 'hurst_reversion')
+    necesita_ctx = necesita_er or necesita_hurst or tipo_sesion in ('overnight', 'londres', 'ny')
+
+    if necesita_ctx:
+        close = df['close'].values.astype(np.float64)
+        periodo = int(reg.get('periodo', 100))
+        er_vals = _er_serie(close, periodo).values if necesita_er else None
+        hurst_vals = _hurst_serie(close, periodo) if necesita_hurst else None
+        ctx = preparar_contexto(
+            close, er=er_vals, hurst=hurst_vals,
+            timestamps=df['timestamp'].values if tipo_sesion != 'ninguna' else None)
+
+        if necesita_er and ctx['regimen_er'] is not None:
+            m &= (ctx['regimen_er'] == (2 if metodo == 'er_tendencia' else 0))
+        if necesita_hurst and ctx['regimen_hurst'] is not None:
+            m &= (ctx['regimen_hurst'] == (2 if metodo == 'hurst_tendencia' else 0))
+        if tipo_sesion in ('overnight', 'londres', 'ny'):
+            m_sesion = _mascara_sesion(ctx, tipo_sesion)
+            if m_sesion is not None:
+                m &= m_sesion
+
+    if tipo_sesion == 'personalizada':
+        horas = pd.DatetimeIndex(df['timestamp']).hour.values
+        h_ini, h_fin = int(ses.get('hora_inicio', 0)), int(ses.get('hora_fin', 0))
+        if h_ini <= h_fin:
+            m &= (horas >= h_ini) & (horas < h_fin)
+        else:
+            m &= (horas >= h_ini) | (horas < h_fin)   # cruza medianoche
+
+    mc_long, mc_short = _mascaras_condiciones_dir(df, filtros.get('condiciones_entrada'))
+    return m & mc_long, m & mc_short
+
+
 # ══════════════ sistemas multi-setup ══════════════
 
 def generar_senales_sistema(df, setups):
@@ -450,14 +684,31 @@ def generar_senales_sistema(df, setups):
             out['atr'] = s['atr']
         ent_l = np.asarray(s['entradas_long'], dtype=bool)
         ent_s = np.asarray(s['entradas_short'], dtype=bool)
+        sal_l = np.asarray(s['salidas_long'], dtype=bool)
+        sal_s = np.asarray(s['salidas_short'], dtype=bool)
+        filtros = setup.get('filtros')
+        if filtros:
+            m_ent_long, m_ent_short = _mascara_filtros_setup(df, filtros)
+            ent_l = ent_l & m_ent_long
+            ent_s = ent_s & m_ent_short
+            # condiciones_salida SÍ restringe la salida (a diferencia de
+            # día/régimen/sesión): pedido explícito del usuario. El stop/TP/
+            # tiempo del setup siguen siendo la red de seguridad si la
+            # condición de salida no llega a cumplirse. Cada condición puede
+            # ir dirigida solo a long, solo a short, o a ambas (ver
+            # 'direccion' en _mascaras_condiciones_dir).
+            m_sal_long, m_sal_short = _mascaras_condiciones_dir(
+                df, filtros.get('condiciones_salida'))
+            sal_l = sal_l & m_sal_long
+            sal_s = sal_s & m_sal_short
         nuevas = (ent_l | ent_s) & ~reclamada
         out['entradas_long'] |= ent_l & nuevas
         out['entradas_short'] |= ent_s & ~ent_l & nuevas
         out['setup_id'][nuevas] = k
         reclamada |= nuevas
         bit = np.int64(1) << np.int64(k)
-        out['salidas_long'][np.asarray(s['salidas_long'], dtype=bool)] |= bit
-        out['salidas_short'][np.asarray(s['salidas_short'], dtype=bool)] |= bit
+        out['salidas_long'][sal_l] |= bit
+        out['salidas_short'][sal_s] |= bit
 
     if out['atr'] is None:
         out['atr'] = np.zeros(n)
@@ -493,6 +744,14 @@ def _codigo_reglas_plantilla(plantilla, p):
         if p['direccion'] in ('Short', 'Ambas'):
             ent.append(f"SHORT: SI RSI({per}) > {p['sobrecompra']:g} → vender al open siguiente")
             sal.append(f"SHORT: SI RSI({per}) < 50 → recomprar al open siguiente")
+    elif plantilla == 'KAMA':
+        per_er, r, l = p['periodo_er'], p['rapido'], p['lento']
+        if p['direccion'] in ('Long', 'Ambas'):
+            ent.append(f"LONG:  SI close cruza arriba KAMA(ER={per_er},rápido={r},lento={l}) → comprar al open siguiente")
+            sal.append(f"LONG:  SI close cruza abajo KAMA(ER={per_er},rápido={r},lento={l}) → vender al open siguiente")
+        if p['direccion'] in ('Short', 'Ambas'):
+            ent.append(f"SHORT: SI close cruza abajo KAMA(ER={per_er},rápido={r},lento={l}) → vender al open siguiente")
+            sal.append(f"SHORT: SI close cruza arriba KAMA(ER={per_er},rápido={r},lento={l}) → recomprar al open siguiente")
     elif plantilla == 'Patrones de velas':
         pats = p['patrones'] or ['(ninguno)']
         for nombre in pats:
@@ -515,6 +774,47 @@ def _codigo_reglas_plantilla(plantilla, p):
         if not ent:
             ent.append("(sin reglas de entrada definidas)")
     return ent, sal
+
+
+_NOMBRES_DIA_ES = ['Lun', 'Mar', 'Mié', 'Jue', 'Vie', 'Sáb', 'Dom']
+
+
+def _desc_filtros(filtros):
+    """Líneas legibles de los filtros de entrada activos de un setup (vacío
+    = sin filtros) — mismo principio de "no caja negra" que
+    _codigo_reglas_plantilla."""
+    if not filtros:
+        return []
+    lineas = []
+    dias = filtros.get('dias_semana')
+    if dias:
+        lineas.append(f"Día de la semana: solo {', '.join(_NOMBRES_DIA_ES[d] for d in sorted(dias))}")
+    reg = filtros.get('regimen') or {}
+    metodo = reg.get('metodo', 'ninguno')
+    if metodo != 'ninguno':
+        per = reg.get('periodo', 100)
+        etiquetas = {
+            'er_tendencia': f"ER({per}) por encima del umbral de tendencia",
+            'er_rango': f"ER({per}) por debajo del umbral de ruido",
+            'hurst_tendencia': f"Hurst({per}) > 0.58 (tendencia)",
+            'hurst_reversion': f"Hurst({per}) < 0.52 (reversión a la media)",
+        }
+        lineas.append(f"Régimen: solo entra si {etiquetas[metodo]}")
+    ses = filtros.get('sesion') or {}
+    tipo_sesion = ses.get('tipo', 'ninguna')
+    if tipo_sesion != 'ninguna':
+        if tipo_sesion == 'personalizada':
+            lineas.append(f"Sesión: solo entre {ses.get('hora_inicio', 0):02d}:00 y "
+                          f"{ses.get('hora_fin', 0):02d}:00 (UTC)")
+        else:
+            lineas.append(f"Sesión: solo en «{tipo_sesion}»")
+    for clave, etiqueta in (('condiciones_entrada', 'Condición extra de entrada'),
+                            ('condiciones_salida', 'Condición extra de salida')):
+        conds = filtros.get(clave) or []
+        if conds:
+            texto = " Y ".join(_desc_condicion_dir(c) for c in conds)
+            lineas.append(f"{etiqueta}: {texto}")
+    return lineas
 
 
 def codigo_setup(setup, indice=0):
@@ -549,6 +849,14 @@ def codigo_setup(setup, indice=0):
         f" · stop = {f'{stop:g}×ATR' if stop else 'ninguno'}"
         f" · take-profit = {f'{tp:g}R' if tp else 'ninguno'}"
         f" · salida por tiempo = {f'+{tiempo} velas' if tiempo else 'sin límite'}")
+
+    filtros_lineas = _desc_filtros(setup.get('filtros'))
+    if filtros_lineas:
+        lineas.append("  FILTROS (día/régimen/sesión y condiciones de entrada solo "
+                      "condicionan nuevas entradas; las condiciones de salida sí "
+                      "pueden restringir cuándo se cierra la posición):")
+        for fl in filtros_lineas:
+            lineas.append(f"    {fl}")
 
     ent, sal = _codigo_reglas_plantilla(plantilla, p)
     lineas.append("  ENTRADA:")
@@ -614,4 +922,16 @@ def describir_setup(setup):
         partes.append(f"TP {setup['tp_r']:g}R")
     if setup.get('salida_n_velas'):
         partes.append(f"salida +{setup['salida_n_velas']} velas")
+    filtros = setup.get('filtros') or {}
+    activos = []
+    if filtros.get('dias_semana'):
+        activos.append('día')
+    if (filtros.get('regimen') or {}).get('metodo', 'ninguno') != 'ninguno':
+        activos.append('régimen')
+    if (filtros.get('sesion') or {}).get('tipo', 'ninguna') != 'ninguna':
+        activos.append('sesión')
+    if filtros.get('condiciones_entrada') or filtros.get('condiciones_salida'):
+        activos.append('condición')
+    if activos:
+        partes.append(f"filtros: {'+'.join(activos)}")
     return " · ".join(partes)

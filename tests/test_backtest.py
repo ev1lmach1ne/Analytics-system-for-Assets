@@ -84,6 +84,45 @@ def test_stop_se_ejecuta_en_la_vela_correcta():
     assert t['precio_salida'][0] == pytest.approx(97.0)
     # riesgo: unidades = 10000*0.01/3 -> perdida = unidades*3 = 100 = 1%
     assert t['pnl'][0] == pytest.approx(-100.0)
+    # precio_stop persistido = precio de entrada (100) - 1.5*ATR(2) = 97
+    assert t['precio_stop'][0] == pytest.approx(97.0)
+
+
+def test_precio_stop_persistido_long_y_short():
+    """El motor calcula stop_precio al entrar (core/backtest.py:107) pero se
+    descartaba; ahora se guarda por trade en 'precio_stop' para poder
+    dibujarlo en la gráfica de operaciones."""
+    n = 10
+    o, h, l, c = _ohlc_plano(n)   # ATR=2 constante (ver _base_senales/atr)
+    s = _senales_vacias(n)
+    s['entradas_long'][2] = True
+    s['salidas_long'][5] = True
+    cfg = dict(CONFIG_BASE, stop_atr=1.5)
+    r = simular(o, h, l, c, s, cfg)
+    t = r['trades']
+    assert r['n_trades'] == 1
+    # long: stop por debajo de la entrada -> 100 - 1.5*2 = 97
+    assert t['precio_stop'][0] == pytest.approx(97.0)
+
+    s2 = _senales_vacias(n)
+    s2['entradas_short'][2] = True
+    s2['salidas_short'][5] = True
+    r2 = simular(o, h, l, c, s2, cfg)
+    t2 = r2['trades']
+    assert r2['n_trades'] == 1
+    # short: stop por encima de la entrada -> 100 + 1.5*2 = 103
+    assert t2['precio_stop'][0] == pytest.approx(103.0)
+
+
+def test_precio_stop_es_cero_sin_stop_configurado():
+    n = 10
+    o, h, l, c = _ohlc_plano(n)
+    s = _senales_vacias(n)
+    s['entradas_long'][2] = True
+    s['salidas_long'][5] = True
+    r = simular(o, h, l, c, s, CONFIG_BASE)   # stop_atr=0.0 por defecto
+    assert r['n_trades'] == 1
+    assert r['trades']['precio_stop'][0] == pytest.approx(0.0)
 
 
 def test_riesgo_por_setup_distinto():

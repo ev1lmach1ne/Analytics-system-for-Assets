@@ -40,14 +40,14 @@ from PyQt6.QtWidgets import (
     QPushButton, QSplitter, QLineEdit, QSpinBox, QDoubleSpinBox, QSlider,
     QListWidget, QListWidgetItem, QTabWidget, QFormLayout, QGroupBox,
     QInputDialog, QDateEdit, QSizePolicy, QApplication, QDialog, QProgressBar,
-    QButtonGroup, QStyledItemDelegate, QStyle,
+    QButtonGroup, QStyledItemDelegate, QStyle, QStackedWidget,
 )
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
 from matplotlib.widgets import RangeSlider
 from matplotlib.dates import date2num, num2date
-from matplotlib.collections import PolyCollection
+from matplotlib.collections import PolyCollection, LineCollection
 
 from core.config import (
     LIMPIADOS_DIR, TF_PATTERN, tf_to_minutes, tipo_activo_de_csv,
@@ -64,12 +64,13 @@ from core.optimizer import (
 from core.strategies import (
     ESTRATEGIAS, params_por_defecto, generar_senales_sistema,
     describir, describir_setup, codigo_sistema, defaults_setup, MAX_SETUPS,
-    _INDICADORES_REGLA, _OPERADORES_REGLA,
+    _INDICADORES_REGLA, _OPERADORES_REGLA, _filtros_por_defecto,
     sma, ema, rsi, atr, bollinger,
 )
 from core.candle_patterns import detectar_patrones
 from gui.widgets.file_explorer import FileExplorer
 from gui.widgets.tf_common import TF_LABELS, parsear_tf_custom, regla_de_tf
+from gui.widgets.lwc_chart import LwcChart, WEBENGINE_OK
 
 FIG_BG = '#0d1424'
 AX_FG = '#c8d6e5'
@@ -79,6 +80,11 @@ ROJO = '#e74c3c'
 GRIS = '#5a7a9a'
 AMBAR = '#f1c40f'
 AZUL = '#4fc3f7'
+
+# color fijo por periodo para las medias (SMA/EMA) dibujadas en el gráfico de
+# Resultados — así una media de 200 siempre se identifica por su color sin
+# importar el orden en que aparezcan los demás setups/filtros.
+COLOR_MEDIA_FIJO = {20: '#2B7FFF', 50: '#FF8904', 200: '#800000'}
 
 MODOS_WFA = [
     'Retorno %',
@@ -428,6 +434,51 @@ class _OptimizerThread(QThread):
 
 
 # ══════════════ editor de reglas custom ══════════════
+def _combo_regla(opciones, actual=None):
+    cb = QComboBox()
+    cb.addItems(opciones)
+    if actual in opciones:
+        cb.setCurrentText(actual)
+    return cb
+
+
+def _spin_regla(valor, minimo=1, maximo=100000, dec=None):
+    if dec is None:
+        sp = QSpinBox()
+        sp.setRange(minimo, maximo)
+        sp.setValue(int(valor))
+    else:
+        sp = QDoubleSpinBox()
+        sp.setRange(-1e9, 1e9)
+        sp.setDecimals(dec)
+        sp.setValue(float(valor))
+    return sp
+
+
+def _spec_regla(tipo, num):
+    if tipo == 'Valor':
+        return {'tipo': 'valor', 'valor': num}
+    if tipo in ('close', 'open', 'high', 'low'):
+        return {'tipo': tipo}
+    return {'tipo': tipo, 'periodo': int(num)}
+
+
+def _acumular_indicador_spec(spec, mas, rsis, atrs, bbs):
+    """Clasifica un spec de indicador ({'tipo':'EMA','periodo':200}, etc.) en
+    los sets que consumen ResultadosWidget._dibujar_principal/_dibujar_indicadores.
+    Ignora specs sin indicador real (close/open/high/low/valor)."""
+    t = spec.get('tipo', '')
+    per = int(spec.get('periodo', 14))
+    if t in ('SMA', 'EMA'):
+        mas.add((t, per))
+    elif t == 'RSI':
+        rsis.add(per)
+    elif t == 'ATR':
+        atrs.add(per)
+    elif t in ('BB_sup', 'BB_inf', 'BB_media'):
+        bbs.add((per, float(spec.get('desv', 2.0))))
+
+
 class EditorReglas(QGroupBox):
     """Tabla de condiciones: cada fila es una condición; las filas con la
     misma (regla, setup) se combinan con AND; setups distintos con OR."""
@@ -456,37 +507,18 @@ class EditorReglas(QGroupBox):
         fila.addStretch()
         lay.addLayout(fila)
 
-    def _combo(self, opciones, actual=None):
-        cb = QComboBox()
-        cb.addItems(opciones)
-        if actual in opciones:
-            cb.setCurrentText(actual)
-        return cb
-
-    def _spin(self, valor, minimo=1, maximo=100000, dec=None):
-        if dec is None:
-            sp = QSpinBox()
-            sp.setRange(minimo, maximo)
-            sp.setValue(int(valor))
-        else:
-            sp = QDoubleSpinBox()
-            sp.setRange(-1e9, 1e9)
-            sp.setDecimals(dec)
-            sp.setValue(float(valor))
-        return sp
-
     def _add_fila(self, _=False, datos=None):
         r = self.tabla.rowCount()
         self.tabla.insertRow(r)
         d = datos or {}
-        self.tabla.setCellWidget(r, 0, self._combo(self._REGLAS, d.get('regla')))
-        self.tabla.setCellWidget(r, 1, self._spin(d.get('setup', 0), 0, 9))
-        self.tabla.setCellWidget(r, 2, self._combo(_INDICADORES_REGLA, d.get('izq', 'close')))
-        self.tabla.setCellWidget(r, 3, self._spin(d.get('izq_periodo', 14), 1, 5000))
-        self.tabla.setCellWidget(r, 4, self._combo(_OPERADORES_REGLA, d.get('op', '>')))
-        self.tabla.setCellWidget(r, 5, self._combo(['Valor'] + _INDICADORES_REGLA,
-                                                   d.get('der', 'Valor')))
-        self.tabla.setCellWidget(r, 6, self._spin(d.get('der_valor', 0.0), dec=4))
+        self.tabla.setCellWidget(r, 0, _combo_regla(self._REGLAS, d.get('regla')))
+        self.tabla.setCellWidget(r, 1, _spin_regla(d.get('setup', 0), 0, 9))
+        self.tabla.setCellWidget(r, 2, _combo_regla(_INDICADORES_REGLA, d.get('izq', 'close')))
+        self.tabla.setCellWidget(r, 3, _spin_regla(d.get('izq_periodo', 14), 1, 5000))
+        self.tabla.setCellWidget(r, 4, _combo_regla(_OPERADORES_REGLA, d.get('op', '>')))
+        self.tabla.setCellWidget(r, 5, _combo_regla(['Valor'] + _INDICADORES_REGLA,
+                                                    d.get('der', 'Valor')))
+        self.tabla.setCellWidget(r, 6, _spin_regla(d.get('der_valor', 0.0), dec=4))
 
     def _del_fila(self):
         r = self.tabla.currentRow()
@@ -494,13 +526,6 @@ class EditorReglas(QGroupBox):
             self.tabla.removeRow(r)
         elif self.tabla.rowCount():
             self.tabla.removeRow(self.tabla.rowCount() - 1)
-
-    def _spec(self, tipo, num):
-        if tipo == 'Valor':
-            return {'tipo': 'valor', 'valor': num}
-        if tipo in ('close', 'open', 'high', 'low'):
-            return {'tipo': tipo}
-        return {'tipo': tipo, 'periodo': int(num)}
 
     def reglas(self):
         """Serializa la tabla a la estructura de _gen_custom."""
@@ -513,8 +538,8 @@ class EditorReglas(QGroupBox):
             op = self.tabla.cellWidget(r, 4).currentText()
             der = self.tabla.cellWidget(r, 5).currentText()
             der_val = self.tabla.cellWidget(r, 6).value()
-            cond = {'izq': self._spec(izq, izq_per), 'op': op,
-                    'der': self._spec(der, der_val)}
+            cond = {'izq': _spec_regla(izq, izq_per), 'op': op,
+                    'der': _spec_regla(der, der_val)}
             grupos.setdefault((self._CLAVES[regla], setup), []).append(cond)
         out = {'entradas_long': [], 'salidas_long': [],
                'entradas_short': [], 'salidas_short': []}
@@ -539,16 +564,119 @@ class EditorReglas(QGroupBox):
                     })
 
 
+class EditorCondiciones(QGroupBox):
+    """Tabla de condiciones planas (todas AND entre sí) — versión simplificada
+    de EditorReglas sin agrupación por regla/setup: se usa como filtro extra
+    de un setup (entrada o salida), aplicable sobre CUALQUIER plantilla, no
+    solo 'Custom (reglas)'."""
+
+    def __init__(self, titulo, parent=None):
+        super().__init__(titulo, parent)
+        lay = QVBoxLayout(self)
+        self.tabla = QTableWidget(0, 6)
+        self.tabla.setHorizontalHeaderLabels(
+            ['Indicador', 'Periodo', 'Operador', 'Comparar con', 'Valor/Periodo',
+             'Dirección'])
+        self.tabla.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.tabla.verticalHeader().setVisible(False)
+        self.tabla.setMinimumHeight(90)
+        lay.addWidget(self.tabla)
+        fila = QHBoxLayout()
+        btn_add = QPushButton("+ Condición")
+        btn_add.clicked.connect(self._add_fila)
+        btn_del = QPushButton("− Quitar")
+        btn_del.clicked.connect(self._del_fila)
+        fila.addWidget(btn_add)
+        fila.addWidget(btn_del)
+        fila.addStretch()
+        lay.addLayout(fila)
+
+    def _add_fila(self, _=False, datos=None):
+        r = self.tabla.rowCount()
+        self.tabla.insertRow(r)
+        d = datos or {}
+        self.tabla.setCellWidget(r, 0, _combo_regla(_INDICADORES_REGLA, d.get('izq', 'close')))
+        self.tabla.setCellWidget(r, 1, _spin_regla(d.get('izq_periodo', 14), 1, 5000))
+        self.tabla.setCellWidget(r, 2, _combo_regla(_OPERADORES_REGLA, d.get('op', '>')))
+        self.tabla.setCellWidget(r, 3, _combo_regla(['Valor'] + _INDICADORES_REGLA,
+                                                    d.get('der', 'Valor')))
+        self.tabla.setCellWidget(r, 4, _spin_regla(d.get('der_valor', 0.0), dec=4))
+        cmb_dir = _combo_regla(list(_MAPA_DIRECCION), d.get('direccion', 'Ambas'))
+        cmb_dir.setToolTip(
+            "A qué lado se aplica esta condición: 'Ambas' la exige tanto para "
+            "entradas/salidas long como short (comportamiento clásico); "
+            "'Long'/'Short' la restringe solo a ese lado, sin afectar al otro "
+            "— p.ej. close > SMA(200) en Long y close < SMA(200) en Short "
+            "dentro del mismo setup.")
+        self.tabla.setCellWidget(r, 5, cmb_dir)
+
+    def _del_fila(self):
+        r = self.tabla.currentRow()
+        if r >= 0:
+            self.tabla.removeRow(r)
+        elif self.tabla.rowCount():
+            self.tabla.removeRow(self.tabla.rowCount() - 1)
+
+    def condiciones(self):
+        """Lista plana de condiciones (AND entre sí dentro de su misma
+        dirección; ver 'direccion' de cada una)."""
+        out = []
+        for r in range(self.tabla.rowCount()):
+            izq = self.tabla.cellWidget(r, 0).currentText()
+            izq_per = self.tabla.cellWidget(r, 1).value()
+            op = self.tabla.cellWidget(r, 2).currentText()
+            der = self.tabla.cellWidget(r, 3).currentText()
+            der_val = self.tabla.cellWidget(r, 4).value()
+            direccion = _MAPA_DIRECCION[self.tabla.cellWidget(r, 5).currentText()]
+            out.append({'izq': _spec_regla(izq, izq_per), 'op': op,
+                        'der': _spec_regla(der, der_val), 'direccion': direccion})
+        return out
+
+    def cargar_condiciones(self, condiciones):
+        self.tabla.setRowCount(0)
+        for cond in (condiciones or []):
+            izq, der = cond['izq'], cond['der']
+            self._add_fila(datos={
+                'izq': izq['tipo'], 'izq_periodo': izq.get('periodo', 14),
+                'op': cond['op'],
+                'der': 'Valor' if der['tipo'] == 'valor' else der['tipo'],
+                'der_valor': der.get('valor', der.get('periodo', 0.0)),
+                'direccion': _MAPA_DIRECCION_INV.get(cond.get('direccion', 'ambas'), 'Ambas'),
+            })
+
+
 # ══════════════ sub-pestaña Optimizador ══════════════
 def _setup_por_defecto(plantilla='Cruce de medias'):
     s = {'nombre': 'Setup 1', 'plantilla': plantilla,
          'params': params_por_defecto(plantilla),
          'riesgo_pct': 0.01, 'stop_atr': 2.0, 'tp_r': 0.0,
-         'salida_n_velas': 0, 'edge': False}
+         'salida_n_velas': 0, 'edge': False,
+         'filtros': _filtros_por_defecto()}
     # la plantilla puede recomendar su propio stop/tp por defecto (p.ej. el
     # cruce de medias sale por cruce contrario: sin stop ATR)
     s.update(defaults_setup(plantilla))
     return s
+
+
+# mapas etiqueta (UI, español) <-> valor interno del setup['filtros']
+_MAPA_REGIMEN = {
+    'Ninguno': 'ninguno', 'Tendencia (ER)': 'er_tendencia',
+    'Rango (ER)': 'er_rango', 'Tendencia (Hurst)': 'hurst_tendencia',
+    'Reversión (Hurst)': 'hurst_reversion',
+}
+_MAPA_SESION = {
+    'Ninguna': 'ninguna', 'Overnight': 'overnight', 'Londres': 'londres',
+    'NY': 'ny', 'Personalizada': 'personalizada',
+}
+_MAPA_REGIMEN_INV = {v: k for k, v in _MAPA_REGIMEN.items()}
+_MAPA_SESION_INV = {v: k for k, v in _MAPA_SESION.items()}
+
+# dirección de una condición de filtro (EditorCondiciones): a qué lado(s) se
+# aplica. 'Ambas' es el valor por defecto y restringe long y short por igual
+# (comportamiento previo a esta columna, 100% compatible con setups guardados
+# sin el campo 'direccion').
+_MAPA_DIRECCION = {'Ambas': 'ambas', 'Long': 'long', 'Short': 'short'}
+_MAPA_DIRECCION_INV = {v: k for k, v in _MAPA_DIRECCION.items()}
 
 
 class OptimizadorWidget(QWidget):
@@ -566,6 +694,7 @@ class OptimizadorWidget(QWidget):
         self._setups = [_setup_por_defecto()]
         self._cargando = False    # guard anti-bucle al poblar el editor
         self._fila_editada = None  # setup cuyo estado reflejan los widgets
+        self._dias_disponibles = set(range(7))   # se recalcula al cargar un CSV
         # temporalidad: nativa del archivo (detectada del nombre, igual que
         # Patrones) y la elegida para el backtest — solo se puede subir de
         # granularidad, nunca bajar
@@ -768,6 +897,70 @@ class OptimizadorWidget(QWidget):
         # etiquetas de stop/TP: se oscurecen junto al campo en modo edge
         self._lbl_stop = f_set.labelForField(self.sp_stop)
         self._lbl_tp = f_set.labelForField(self.sp_tp)
+
+        # ── filtros de entrada del setup (no afectan a las salidas) ──
+        grp_filtros = QGroupBox("Filtros del setup")
+        grp_filtros.setToolTip(
+            "Día/régimen/sesión restringen cuándo puede abrirse una posición "
+            "NUEVA (nunca cierran una ya abierta). Las condiciones extra de "
+            "entrada/salida, más abajo, sí pueden aplicarse también a la "
+            "salida si así se configuran.")
+        f_filtros = QFormLayout(grp_filtros)
+
+        fila_dias = QHBoxLayout()
+        self._chk_dias = []
+        for etiqueta_dia in ['L', 'M', 'X', 'J', 'V', 'S', 'D']:
+            chk = QCheckBox(etiqueta_dia)
+            chk.setChecked(True)
+            chk.toggled.connect(self._guardar_setup_actual)
+            fila_dias.addWidget(chk)
+            self._chk_dias.append(chk)
+        f_filtros.addRow("Día de la semana:", fila_dias)
+
+        self.cmb_regimen = QComboBox()
+        self.cmb_regimen.addItems(list(_MAPA_REGIMEN))
+        self.cmb_regimen.currentTextChanged.connect(self._on_regimen_changed)
+        f_filtros.addRow("Régimen:", self.cmb_regimen)
+        self.sp_regimen_periodo = QSpinBox()
+        self.sp_regimen_periodo.setRange(10, 5000)
+        self.sp_regimen_periodo.setValue(100)
+        self.sp_regimen_periodo.setToolTip(
+            "Ventana rodante del ER/Hurst usada para clasificar el régimen "
+            "de la vela (mismos umbrales fijos que la pestaña Patrones)")
+        self.sp_regimen_periodo.valueChanged.connect(self._guardar_setup_actual)
+        f_filtros.addRow("Periodo (ventana):", self.sp_regimen_periodo)
+
+        self.cmb_sesion = QComboBox()
+        self.cmb_sesion.addItems(list(_MAPA_SESION))
+        self.cmb_sesion.currentTextChanged.connect(self._on_sesion_changed)
+        f_filtros.addRow("Sesión horaria:", self.cmb_sesion)
+        fila_horas = QHBoxLayout()
+        self.sp_hora_ini = QSpinBox()
+        self.sp_hora_ini.setRange(0, 23)
+        self.sp_hora_fin = QSpinBox()
+        self.sp_hora_fin.setRange(0, 23)
+        self.sp_hora_ini.valueChanged.connect(self._guardar_setup_actual)
+        self.sp_hora_fin.valueChanged.connect(self._guardar_setup_actual)
+        fila_horas.addWidget(QLabel("de"))
+        fila_horas.addWidget(self.sp_hora_ini)
+        fila_horas.addWidget(QLabel("a"))
+        fila_horas.addWidget(self.sp_hora_fin)
+        fila_horas.addWidget(QLabel("(hora UTC)"))
+        fila_horas.addStretch()
+        self._fila_horas_widget = QWidget()
+        self._fila_horas_widget.setLayout(fila_horas)
+        f_filtros.addRow("Horas:", self._fila_horas_widget)
+
+        self.editor_cond_entrada = EditorCondiciones("Condiciones extra de ENTRADA (AND)")
+        self.editor_cond_entrada.tabla.cellChanged.connect(
+            lambda *_: self._guardar_setup_actual())
+        f_filtros.addRow(self.editor_cond_entrada)
+        self.editor_cond_salida = EditorCondiciones("Condiciones extra de SALIDA (AND)")
+        self.editor_cond_salida.tabla.cellChanged.connect(
+            lambda *_: self._guardar_setup_actual())
+        f_filtros.addRow(self.editor_cond_salida)
+
+        f_set.addRow(grp_filtros)
         lay.addWidget(self.grp_setup)
 
         # ── código del sistema (siempre visible, se regenera en vivo) ──
@@ -900,6 +1093,8 @@ class OptimizadorWidget(QWidget):
         self.lbl_activo.setText(os.path.basename(path))
         m = TF_PATTERN.search(os.path.basename(path))
         self._tf_nativo = (m.group(1) or m.group(2)) if m else None
+        self._dias_disponibles = self._detectar_dias_disponibles(path)
+        self._actualizar_dias_checkboxes()
         self._configurar_botones_tf()
         self._aplicar_preset_friccion(path)
         self.btn_run.setEnabled(True)
@@ -1174,8 +1369,20 @@ class OptimizadorWidget(QWidget):
             self._bloquear_stop_tp(edge)
             if s['plantilla'] == 'Custom (reglas)':
                 self.editor_reglas.cargar_reglas(s['params'].get('reglas'))
+            filtros = s.get('filtros') or _filtros_por_defecto()
+            self._actualizar_dias_checkboxes()
+            self.cmb_regimen.setCurrentText(
+                _MAPA_REGIMEN_INV.get(filtros.get('regimen', {}).get('metodo', 'ninguno'), 'Ninguno'))
+            self.sp_regimen_periodo.setValue(filtros.get('regimen', {}).get('periodo', 100))
+            self.cmb_sesion.setCurrentText(
+                _MAPA_SESION_INV.get(filtros.get('sesion', {}).get('tipo', 'ninguna'), 'Ninguna'))
+            self.sp_hora_ini.setValue(filtros.get('sesion', {}).get('hora_inicio', 0))
+            self.sp_hora_fin.setValue(filtros.get('sesion', {}).get('hora_fin', 0))
+            self.editor_cond_entrada.cargar_condiciones(filtros.get('condiciones_entrada'))
+            self.editor_cond_salida.cargar_condiciones(filtros.get('condiciones_salida'))
         finally:
             self._cargando = False
+        self._actualizar_visibilidad_filtros()
         self._refresh_definicion()
 
     @_no_crash
@@ -1286,6 +1493,47 @@ class OptimizadorWidget(QWidget):
         self._bloquear_stop_tp(on)
         self._guardar_setup_actual()
 
+    # ── filtros de entrada del setup ──
+    def _detectar_dias_disponibles(self, path):
+        """Días de la semana (0=Lun..6=Dom) con AL MENOS una vela en el CSV
+        — para deshabilitar/destildar los checkboxes de días sin datos
+        (forex/acciones sin sábado/domingo) en vez de dejar seleccionable
+        un filtro que nunca haría nada."""
+        try:
+            try:
+                df_ts = pd.read_csv(path, usecols=['timestamp'], engine='pyarrow')
+            except (ImportError, ValueError):
+                df_ts = pd.read_csv(path, usecols=lambda c: c == 'timestamp')
+            dow = pd.to_datetime(df_ts['timestamp'], errors='coerce').dt.dayofweek.dropna()
+            dias = set(int(d) for d in dow.unique())
+            return dias or set(range(7))
+        except Exception:
+            return set(range(7))   # si algo falla, no restringir nada
+
+    def _actualizar_dias_checkboxes(self):
+        s = self._setup_actual()
+        dias = (s.get('filtros', {}) or {}).get('dias_semana') if s else None
+        for i, chk in enumerate(self._chk_dias):
+            chk.blockSignals(True)
+            disponible = i in self._dias_disponibles
+            chk.setEnabled(disponible)
+            chk.setChecked(disponible and (dias is None or i in dias))
+            chk.blockSignals(False)
+
+    def _actualizar_visibilidad_filtros(self):
+        self.sp_regimen_periodo.setEnabled(self.cmb_regimen.currentText() != 'Ninguno')
+        self._fila_horas_widget.setVisible(self.cmb_sesion.currentText() == 'Personalizada')
+
+    @_no_crash
+    def _on_regimen_changed(self, _texto):
+        self._actualizar_visibilidad_filtros()
+        self._guardar_setup_actual()
+
+    @_no_crash
+    def _on_sesion_changed(self, _texto):
+        self._actualizar_visibilidad_filtros()
+        self._guardar_setup_actual()
+
     @_no_crash
     def _guardar_setup_actual(self, *_):
         if self._cargando:
@@ -1301,6 +1549,22 @@ class OptimizadorWidget(QWidget):
         s['tp_r'] = self.sp_tp.value()
         s['salida_n_velas'] = self.sp_tiempo.value()
         s['edge'] = self.btn_edge.isChecked()
+        elegidos = [i for i, chk in enumerate(self._chk_dias) if chk.isChecked()]
+        dias_disponibles = self._dias_disponibles or set(range(7))
+        s['filtros'] = {
+            'dias_semana': None if set(elegidos) >= dias_disponibles else elegidos,
+            'regimen': {
+                'metodo': _MAPA_REGIMEN[self.cmb_regimen.currentText()],
+                'periodo': self.sp_regimen_periodo.value(),
+            },
+            'sesion': {
+                'tipo': _MAPA_SESION[self.cmb_sesion.currentText()],
+                'hora_inicio': self.sp_hora_ini.value(),
+                'hora_fin': self.sp_hora_fin.value(),
+            },
+            'condiciones_entrada': self.editor_cond_entrada.condiciones(),
+            'condiciones_salida': self.editor_cond_salida.condiciones(),
+        }
         self._refresh_item_actual()
         self._refresh_definicion()
         self._refresh_codigo()
@@ -1721,9 +1985,32 @@ class ResultadosWidget(QWidget):
         self.btn_modo_grafico.setChecked(True)
         self.btn_modo_grafico.clicked.connect(self._toggle_modo_grafico)
         fila_zoom.addWidget(self.btn_modo_grafico)
+        self.chk_stop = QCheckBox("Mostrar stop loss")
+        self.chk_stop.setToolTip(
+            "Dibuja el nivel de stop-loss (×ATR) de cada operación y la zona "
+            "de riesgo entre el precio de entrada y el stop.")
+        self.chk_stop.toggled.connect(self._toggle_stop_loss)
+        fila_zoom.addWidget(self.chk_stop)
+        # conmutador de vista: matplotlib (Clásica) <-> Lightweight Charts (Moderna)
+        self.btn_vista = QPushButton("🖥 Vista: Clásica")
+        self.btn_vista.setCheckable(True)
+        self.btn_vista.setToolTip(
+            "Alterna entre la gráfica clásica (matplotlib) y una vista moderna "
+            "estilo TradingView (Lightweight Charts).")
+        self.btn_vista.clicked.connect(self._toggle_vista)
+        if not WEBENGINE_OK:
+            self.btn_vista.setEnabled(False)
+            self.btn_vista.setToolTip("Vista moderna no disponible: falta "
+                                      "instalar PyQt6-WebEngine.")
+        fila_zoom.addWidget(self.btn_vista)
         fila_zoom.addStretch()
         lay.addLayout(fila_zoom)
-        lay.addWidget(self.canvas)
+        # el canvas de matplotlib y la vista LWC comparten hueco en un stack
+        self.lwc = LwcChart()
+        self.stack_grafico = QStackedWidget()
+        self.stack_grafico.addWidget(self.canvas)   # índice 0 = clásica
+        self.stack_grafico.addWidget(self.lwc)       # índice 1 = moderna
+        lay.addWidget(self.stack_grafico)
 
         # arrastrar los márgenes de los ejes (estilo TradingView/MT4): eje Y
         # (precio) para estirar/comprimir la escala, eje X (fecha) para zoom
@@ -1927,6 +2214,9 @@ class ResultadosWidget(QWidget):
         self._dibujar_principal()
         self._dibujar_equity(payload)
         self._dibujar_indicadores(payload)
+        # si la vista moderna (LWC) está activa, refrescarla con el nuevo backtest
+        if getattr(self, 'btn_vista', None) is not None and self.btn_vista.isChecked():
+            self.lwc.mostrar(payload)
 
         # fechas de los QDateEdit
         self.fecha_ini.setDate(QDate(ts[0].year, ts[0].month, ts[0].day))
@@ -1970,6 +2260,31 @@ class ResultadosWidget(QWidget):
     def _toggle_modo_grafico(self):
         self._modo_grafico = 'velas' if self.btn_modo_grafico.isChecked() else 'linea'
         self.btn_modo_grafico.setText("🕯 Velas" if self._modo_grafico == 'velas' else "📈 Línea")
+        self._redibujar_principal_conservando_zoom()
+
+    def _toggle_stop_loss(self, _=False):
+        self._redibujar_principal_conservando_zoom()
+
+    def _toggle_vista(self, _=False):
+        """Alterna entre la gráfica matplotlib (Clásica) y Lightweight Charts
+        (Moderna). Al pasar a Moderna, repinta la vista LWC con el payload
+        actual; matplotlib sigue siendo el modo por defecto."""
+        moderna = self.btn_vista.isChecked()
+        self.btn_vista.setText("📈 Vista: Moderna" if moderna else "🖥 Vista: Clásica")
+        self.stack_grafico.setCurrentIndex(1 if moderna else 0)
+        if moderna and getattr(self, '_payload', None) is not None:
+            self.lwc.mostrar(self._payload)
+
+    def _redibujar_principal_conservando_zoom(self):
+        """Redibuja el gráfico principal preservando el rango temporal (zoom)
+        actual — compartido por los toggles de modo velas/línea y stop-loss."""
+        xlim = None
+        if getattr(self, '_ax_principal', None) is not None:
+            a, b = self._ax_principal.get_xlim()
+            xlim = (pd.Timestamp(num2date(a)), pd.Timestamp(num2date(b)))
+        self._dibujar_principal(xlim=xlim)
+
+    def _toggle_stop_loss(self, _checked):
         xlim = None
         if getattr(self, '_ax_principal', None) is not None:
             a, b = self._ax_principal.get_xlim()
@@ -2206,6 +2521,30 @@ class ResultadosWidget(QWidget):
             ax.scatter(ts[idx_venta], y[idx_venta], marker='v', s=28,
                        color=ROJO, zorder=3, label='Venta')
 
+        # stop-loss por operación (nivel ×ATR fijado al entrar) + zona de
+        # riesgo entre precio de entrada y stop — opcional, vía checkbox
+        if getattr(self, 'chk_stop', None) is not None and self.chk_stop.isChecked() \
+                and 'precio_stop' in tr:
+            segmentos, cuadros = [], []
+            for r in range(len(tr['pnl'])):
+                stop = tr['precio_stop'][r]
+                if stop <= 0:   # sin stop real (stop_atr=0) → nada que dibujar
+                    continue
+                x0 = self._x_full[tr['idx_entrada'][r]]
+                x1 = self._x_full[tr['idx_salida'][r]]
+                ent = tr['precio_entrada'][r]
+                segmentos.append([(x0, stop), (x1, stop)])
+                cuadros.append([(x0, ent), (x1, ent), (x1, stop), (x0, stop)])
+            if segmentos:
+                ax.add_collection(PolyCollection(
+                    cuadros, facecolors=ROJO, alpha=0.08, edgecolors='none',
+                    zorder=1.5))
+                ax.add_collection(LineCollection(
+                    segmentos, colors=ROJO, linewidths=0.8, linestyles='--',
+                    alpha=0.7, zorder=2.5))
+                ax.plot([], [], color=ROJO, linestyle='--', linewidth=1.0,
+                        label='Stop loss')
+
         # etiquetas IS / OOS sobre el eje
         ax.text(0.01, 0.97, 'IS', transform=ax.transAxes, color=AZUL,
                 fontsize=9, fontweight='bold', va='top')
@@ -2216,8 +2555,12 @@ class ResultadosWidget(QWidget):
         # ── indicadores overlays (medias, Bollinger, patrones) ──
         mas, bbs, _, _, patrones_set = self._recolectar_indicadores(p)
         paletas_ma = [AZUL, AMBAR, '#2ecc71', '#9b59b6', '#e67e22']
-        for i, (tipo, per) in enumerate(sorted(mas, key=lambda x: x[1])):
-            color = paletas_ma[i % len(paletas_ma)]
+        idx_paleta = 0
+        for tipo, per in sorted(mas, key=lambda x: x[1]):
+            color = COLOR_MEDIA_FIJO.get(per)
+            if color is None:
+                color = paletas_ma[idx_paleta % len(paletas_ma)]
+                idx_paleta += 1
             f = ema if tipo == 'EMA' else sma
             val = f(y, per)
             ax.plot(ts, val, color=color, linewidth=1.0, alpha=0.75,
@@ -2488,16 +2831,16 @@ class ResultadosWidget(QWidget):
                     for grupo in p.get('reglas', {}).get(clave, []):
                         for cond in grupo.get('condiciones', []):
                             for lado in (cond.get('izq', {}), cond.get('der', {})):
-                                t = lado.get('tipo', '')
-                                per = int(lado.get('periodo', 14))
-                                if t in ('SMA', 'EMA'):
-                                    mas.add((t, per))
-                                elif t == 'RSI':
-                                    rsis.add(per)
-                                elif t == 'ATR':
-                                    atrs.add(per)
-                                elif t in ('BB_sup', 'BB_inf', 'BB_media'):
-                                    bbs.add((per, float(lado.get('desv', 2.0))))
+                                _acumular_indicador_spec(lado, mas, rsis, atrs, bbs)
+
+            # filtros extra del setup (condiciones_entrada/condiciones_salida) —
+            # aplicables a CUALQUIER plantilla, no solo Custom (reglas); por
+            # eso van fuera del if/elif de arriba.
+            filtros = setup.get('filtros') or {}
+            for clave in ('condiciones_entrada', 'condiciones_salida'):
+                for cond in filtros.get(clave, []):
+                    for lado in (cond.get('izq', {}), cond.get('der', {})):
+                        _acumular_indicador_spec(lado, mas, rsis, atrs, bbs)
         return mas, bbs, rsis, atrs, patrones_set
 
     def _dibujar_indicadores(self, payload):

@@ -13,6 +13,7 @@ statsmodels
 seaborn
 python-dotenv
 PyQt6
+PyQt6-WebEngine
 customtkinter
 pytest
 pypdf

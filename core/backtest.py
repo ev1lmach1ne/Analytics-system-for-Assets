@@ -32,7 +32,8 @@ MOTIVOS_SALIDA = {0: 'Señal', 1: 'Stop', 2: 'Take-profit', 3: 'Tiempo', 4: 'Fin
 
 # columnas del array de trades que devuelve _simular_numba
 (_T_IDX_IN, _T_IDX_OUT, _T_DIR, _T_SETUP, _T_PIN, _T_POUT, _T_PNL, _T_MOTIVO,
- _T_EQ_IN, _T_UNIDADES) = range(10)
+ _T_EQ_IN, _T_UNIDADES, _T_STOP) = range(11)
+_N_COLS_TRADE = 11
 
 
 @njit(nogil=True)
@@ -51,7 +52,7 @@ def _simular_numba(o, h, l, c, ent_long, ent_short, sal_long, sal_short,
     """
     n = len(c)
     max_trades = n // 2 + 1
-    trades = np.zeros((max_trades, 10))
+    trades = np.zeros((max_trades, _N_COLS_TRADE))
     n_trades = 0
     equity = np.full(n, capital_inicial)
 
@@ -85,6 +86,7 @@ def _simular_numba(o, h, l, c, ent_long, ent_short, sal_long, sal_short,
             trades[n_trades, _T_MOTIVO] = 0
             trades[n_trades, _T_EQ_IN] = cap - pnl
             trades[n_trades, _T_UNIDADES] = unidades
+            trades[n_trades, _T_STOP] = stop_precio
             n_trades += 1
             en_pos = False
             pendiente_salida = False
@@ -152,6 +154,7 @@ def _simular_numba(o, h, l, c, ent_long, ent_short, sal_long, sal_short,
                 trades[n_trades, _T_MOTIVO] = motivo
                 trades[n_trades, _T_EQ_IN] = cap - pnl
                 trades[n_trades, _T_UNIDADES] = unidades
+                trades[n_trades, _T_STOP] = stop_precio
                 n_trades += 1
                 en_pos = False
                 pendiente_salida = False
@@ -265,6 +268,7 @@ def simular(o, h, l, c, senales, config):
         'motivo': t[:, _T_MOTIVO].astype(np.int64),
         'equity_entrada': t[:, _T_EQ_IN],
         'unidades': t[:, _T_UNIDADES],
+        'precio_stop': t[:, _T_STOP],   # nivel de stop-loss del trade (0 = sin stop)
     }
     # retorno del trade como fracción del equity al entrar (para Montecarlo
     # y expectancy comparables entre trades con capital distinto)

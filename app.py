@@ -1,6 +1,15 @@
 import sys, os, ctypes
 sys.path.insert(0, os.path.dirname(__file__))
 
+# QtWebEngineWidgets (vista "Moderna" de la pestaña Resultados, gui/widgets/
+# lwc_chart.py) EXIGE importarse antes de crear cualquier QApplication — si no,
+# PyQt6 lanza ImportError. El orden de imports de main_window ya lo cumple hoy
+# por casualidad; se fija aquí explícitamente para no depender de ese orden.
+try:
+    import PyQt6.QtWebEngineWidgets  # noqa: F401
+except ImportError:
+    pass   # PyQt6-WebEngine no instalado -> lwc_chart.WEBENGINE_OK queda False
+
 from core.config import APP_CONFIG_PATH
 
 def _ensure_config():
@@ -38,6 +47,12 @@ def main():
     window = MainWindow()
     window.setWindowIcon(app_icon)
     window.show()
+
+    from core.config import get_tutorial_visto, set_tutorial_visto
+    if not get_tutorial_visto():
+        from gui.dialogs.tutorial_dialog import TutorialDialog
+        TutorialDialog(window).exec()
+        set_tutorial_visto()
 
     sys.exit(app.exec())
 

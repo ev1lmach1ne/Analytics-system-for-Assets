@@ -6,6 +6,8 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QIcon
 
 from core.config import get_base_data, set_base_data, PROJECT_ROOT
+from core.questdb_manager import is_reachable, detener_bundled
+from gui.questdb_bootstrap import mostrar_bootstrap_questdb
 
 STYLE = """
 QDialog { background-color: #141e30; }
@@ -28,6 +30,8 @@ QPushButton#accept:hover { background-color: #1a3a2a; }
 QPushButton#browse { background-color: #1a2a45; color: #7aaccc; }
 QPushButton#browse:hover { background-color: #253a60; color: #c8d6e5; }
 QFrame#sep { background-color: #253a60; max-height: 1px; }
+QLabel#estadoOk { color: #2ecc71; font-size: 12px; font-weight: bold; }
+QLabel#estadoMal { color: #e74c3c; font-size: 12px; font-weight: bold; }
 """
 
 
@@ -36,7 +40,7 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Analytics System · Ajustes")
         self.setModal(True)
-        self.resize(560, 320)
+        self.resize(560, 420)
         self.setStyleSheet(STYLE)
 
         icon_path = os.path.join(PROJECT_ROOT, "icon.ico")
@@ -78,6 +82,35 @@ class SettingsDialog(QDialog):
         desc.setObjectName("desc")
         layout.addWidget(desc)
 
+        sep2 = QFrame()
+        sep2.setObjectName("sep")
+        sep2.setFixedHeight(1)
+        layout.addWidget(sep2)
+
+        subtitle_qdb = QLabel("QuestDB (base de datos local):")
+        subtitle_qdb.setObjectName("subtitle")
+        layout.addWidget(subtitle_qdb)
+
+        qdb_layout = QHBoxLayout()
+        qdb_layout.setSpacing(8)
+        self.lbl_qdb_estado = QLabel()
+        qdb_layout.addWidget(self.lbl_qdb_estado, 1)
+        btn_qdb_reiniciar = QPushButton(" Reiniciar")
+        btn_qdb_reiniciar.setObjectName("browse")
+        btn_qdb_reiniciar.clicked.connect(self._reiniciar_questdb)
+        qdb_layout.addWidget(btn_qdb_reiniciar)
+        layout.addLayout(qdb_layout)
+
+        desc_qdb = QLabel(
+            " La usa el paso «Limpiar» de Importar. Se descarga y arranca sola "
+            "la primera vez que hace falta — este botón solo la reinicia si "
+            "algo se ha quedado atascado."
+        )
+        desc_qdb.setObjectName("desc")
+        desc_qdb.setWordWrap(True)
+        layout.addWidget(desc_qdb)
+        self._refrescar_estado_questdb()
+
         layout.addStretch()
 
         btn_layout = QHBoxLayout()
@@ -93,6 +126,22 @@ class SettingsDialog(QDialog):
         btn_layout.addWidget(btn_cancel)
 
         layout.addLayout(btn_layout)
+
+    def _refrescar_estado_questdb(self):
+        if is_reachable():
+            self.lbl_qdb_estado.setText("●  En ejecución")
+            self.lbl_qdb_estado.setObjectName("estadoOk")
+        else:
+            self.lbl_qdb_estado.setText("●  No disponible")
+            self.lbl_qdb_estado.setObjectName("estadoMal")
+        # reaplicar el estilo tras cambiar objectName (Qt no lo hace solo)
+        self.lbl_qdb_estado.style().unpolish(self.lbl_qdb_estado)
+        self.lbl_qdb_estado.style().polish(self.lbl_qdb_estado)
+
+    def _reiniciar_questdb(self):
+        detener_bundled()
+        mostrar_bootstrap_questdb(self)
+        self._refrescar_estado_questdb()
 
     def _browse(self):
         cur = self.path_input.text() or get_base_data()

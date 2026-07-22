@@ -5,6 +5,7 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
 from PyQt6.QtCore import Qt, pyqtSignal
 from gui.widgets.file_explorer import FileExplorer
 from gui.widgets.console_widget import ConsoleWidget
+from gui.questdb_bootstrap import mostrar_bootstrap_questdb
 from core.config import get_base_data, LIMPIADOS_DIR, TF_LABELS, TIPO_LABELS, TIPO_MAP, SCRIPTS_DIR
 
 STYLE_IMPORT = """
@@ -237,6 +238,15 @@ class TabImportar(QWidget):
             'MPLBACKEND': 'Agg',
             'PYTHONIOENCODING': 'utf-8',
         }
+
+        # "Preparar" sube el resultado a QuestDB (con fallo silencioso) y
+        # "Limpiar" (siguiente paso, _on_import_finished) SÍ la necesita para
+        # funcionar — se prepara aquí (descarga/arranca sola si hace falta,
+        # instantáneo si ya estaba disponible) para no encontrarnos el fallo
+        # más tarde, a mitad del flujo.
+        if not mostrar_bootstrap_questdb(self):
+            self._reset_ui()
+            return
 
         preparar_py = os.path.join(SCRIPTS_DIR, "preparar_datos.py")
         self.console.run(preparar_py, env=env)

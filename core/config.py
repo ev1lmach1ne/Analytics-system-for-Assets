@@ -32,6 +32,9 @@ CONFIG_PATH   = os.path.join(BASE_DATA, "sesion_config.json")
 SCRIPTS_DIR   = os.path.join(PROJECT_ROOT, "library", "scripts_utiles")
 
 
+_APP_CONFIG_CACHE = {}
+
+
 def get_base_data():
     return BASE_DATA
 
@@ -46,10 +49,20 @@ def set_base_data(path):
     _save_app_config()
 
 
+def get_tutorial_visto():
+    return _APP_CONFIG_CACHE.get('tutorial_visto', False)
+
+
+def set_tutorial_visto(valor=True):
+    _APP_CONFIG_CACHE['tutorial_visto'] = valor
+    _save_app_config()
+
+
 def _save_app_config():
     try:
+        _APP_CONFIG_CACHE['base_data'] = BASE_DATA
         with open(APP_CONFIG_PATH, 'w', encoding='utf-8') as f:
-            json.dump({'base_data': BASE_DATA}, f, indent=2)
+            json.dump(_APP_CONFIG_CACHE, f, indent=2)
     except Exception:
         pass
 
@@ -62,6 +75,7 @@ def load_app_config():
     try:
         with open(APP_CONFIG_PATH, 'r', encoding='utf-8') as f:
             cfg = json.load(f)
+        _APP_CONFIG_CACHE.update(cfg)
         path = cfg.get('base_data')
         if path and os.path.isdir(path):
             BASE_DATA = path
