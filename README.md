@@ -10,7 +10,14 @@ Aplicación de escritorio (PyQt6) para importar, limpiar, analizar y backtestear
 
 No hace falta instalar Java, Docker ni QuestDB por separado en Windows/macOS.
 
-## Instalación
+## Instalación rápida (Windows)
+
+1. Descarga (o clona) esta carpeta.
+2. Doble clic en **`instalar.bat`**.
+
+El instalador localiza Python (y si no lo tienes, lo instala con winget), crea el entorno virtual, instala las dependencias y deja un acceso directo **"Analytics System"** en el escritorio. Se puede volver a ejecutar en cualquier momento: solo instala lo que falte.
+
+## Instalación manual (Windows / macOS / Linux)
 
 ```bash
 git clone <url-del-repo>
@@ -20,6 +27,12 @@ venv\Scripts\activate        # Windows
 # source venv/bin/activate   # macOS / Linux
 pip install -r requirements.txt
 ```
+
+## Actualizar a una versión nueva
+
+Descarga la versión nueva **sobre la misma carpeta** (o `git pull`): así se conserva tu configuración (`config.json`, `.env`). Tus datos y QuestDB viven fuera del proyecto y no se tocan.
+
+No hace falta reinstalar: al abrir la app con el acceso directo (o `launcher.vbs`), si la versión nueva trae dependencias nuevas se instalan solas antes de arrancar.
 
 Los scripts sueltos de `library/scripts_utiles/` y `library/Backtests/` tienen dependencias extra propias en `library/requirements.txt` (solo instalarlas si vas a usar esos scripts).
 
@@ -32,12 +45,13 @@ Los scripts sueltos de `library/scripts_utiles/` y `library/Backtests/` tienen d
 
 ## Arranque
 
-- **Opción A**: doble clic en `launcher.vbs` (lanza la app sin ventana de consola; requiere que `pythonw.exe` esté en el PATH).
-- **Opción B**: con el entorno virtual activado, `python app.py` (o `pythonw app.py` para no abrir consola).
+- **Opción A**: el acceso directo **"Analytics System"** del escritorio (lo crea `instalar.bat`).
+- **Opción B**: doble clic en `launcher.vbs` — usa el venv del proyecto si existe (si no, el `pythonw.exe` del sistema) y actualiza las dependencias automáticamente si `requirements.txt` cambió.
+- **Opción C**: con el entorno virtual activado, `python app.py` (o `pythonw app.py` para no abrir consola).
 
 En el primer arranque la app pide la carpeta base de datos y crea dentro las subcarpetas `Limpiados/` y `Limpiados/Informes/`.
 
-Para crear un acceso directo en el escritorio: clic derecho → Nuevo → Acceso directo → apuntar a `launcher.vbs` (o a `pythonw.exe app.py` con "Iniciar en" = la carpeta del proyecto) y asignar el icono de `gui/resources` si se desea.
+Para crear un acceso directo a mano: clic derecho → Nuevo → Acceso directo → apuntar a `launcher.vbs` con "Iniciar en" = la carpeta del proyecto, y asignar el icono `icon.ico` de la raíz si se desea.
 
 ## QuestDB
 

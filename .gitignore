@@ -9,3 +9,4 @@ config.json
 tick_vault_data/
 data/
 *.lnk
+venv/
