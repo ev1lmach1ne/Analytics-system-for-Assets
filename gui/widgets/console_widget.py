@@ -1,7 +1,21 @@
+import os
 import re
+import sys
 from PyQt6.QtWidgets import QTextEdit, QWidget, QVBoxLayout, QLabel
 from PyQt6.QtCore import Qt, QProcess, pyqtSignal, QByteArray
 from PyQt6.QtGui import QTextCursor, QTextCharFormat, QColor, QFont
+
+
+def _python_exe():
+    """Intérprete para los subprocesos: el mismo con el que corre la app
+    (venv incluido), nunca el 'python' que haya en el PATH del sistema —
+    ese puede ser otro Python sin las dependencias instaladas."""
+    exe = sys.executable
+    if os.path.basename(exe).lower() == 'pythonw.exe':
+        candidato = os.path.join(os.path.dirname(exe), 'python.exe')
+        if os.path.exists(candidato):
+            exe = candidato
+    return exe
 
 STYLE_CONSOLE = """
 QTextEdit {
@@ -102,7 +116,7 @@ class ConsoleWidget(QWidget):
             self._process.setProcessEnvironment(qenv)
         self._process.readyReadStandardOutput.connect(self._on_stdout)
         self._process.finished.connect(self._on_finished)
-        self._process.start("python", ["-u", script_path])
+        self._process.start(_python_exe(), ["-u", script_path])
 
     def run_with_args(self, script_path, args, env=None):
         self.output.clear()
@@ -117,7 +131,7 @@ class ConsoleWidget(QWidget):
             self._process.setProcessEnvironment(qenv)
         self._process.readyReadStandardOutput.connect(self._on_stdout)
         self._process.finished.connect(self._on_finished)
-        self._process.start("python", ["-u", script_path] + args)
+        self._process.start(_python_exe(), ["-u", script_path] + args)
 
     def _on_stdout(self):
         data = self._process.readAllStandardOutput()

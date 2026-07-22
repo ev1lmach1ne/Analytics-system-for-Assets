@@ -16,5 +16,12 @@ requests>=2.31
 ccxt>=4.0
 yfinance>=0.2
 
+# Usadas por los scripts que la GUI lanza como subprocesos
+# (Importar -> preparar_datos/limpieza_datos_er; Analisis -> analisis_descriptivo)
+psycopg2-binary>=2.9
+customtkinter>=5.2
+statsmodels>=0.14
+seaborn>=0.13
+
 # Opcional: solo necesario si se configura un conector Oanda
 oandapyV20>=0.7
