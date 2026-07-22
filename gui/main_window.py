@@ -1,5 +1,6 @@
 from PyQt6.QtWidgets import (QMainWindow, QTabWidget, QWidget, QVBoxLayout,
-                             QLabel, QPushButton, QHBoxLayout, QFrame, QSizePolicy)
+                             QLabel, QPushButton, QHBoxLayout, QFrame, QSizePolicy,
+                             QApplication)
 from PyQt6.QtCore import Qt, QPoint, pyqtSignal
 from PyQt6.QtGui import QFont, QPixmap
 from gui.widgets.tab_descargar import TabDescargar
@@ -193,7 +194,14 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Analytics System for Assets")
-        self.setGeometry(100, 100, 1400, 900)
+        # 1400x900 como tamaño deseado, recortado al área visible de la
+        # pantalla (en portátiles pequeños 1400x900 no cabe) y centrado.
+        disp = QApplication.primaryScreen().availableGeometry()
+        ancho = min(1400, int(disp.width() * 0.92))
+        alto = min(900, int(disp.height() * 0.92))
+        x = disp.x() + (disp.width() - ancho) // 2
+        y = disp.y() + (disp.height() - alto) // 2
+        self.setGeometry(x, y, ancho, alto)
         self.setStyleSheet(STYLE)
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
         self._drag_offset = QPoint()
