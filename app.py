@@ -63,7 +63,6 @@ def main():
 
     from PyQt6.QtWidgets import QApplication
     from PyQt6.QtGui import QIcon
-    from gui.main_window import MainWindow
 
     app = QApplication(sys.argv)
     app.setApplicationName("Analytics System for Assets")
@@ -75,6 +74,11 @@ def main():
 
     if not _ensure_config():
         sys.exit(0)
+
+    # Importar DESPUÉS de _ensure_config(): los módulos de las pestañas copian
+    # LIMPIADOS_DIR al importarse, y en el primer arranque BASE_DATA no queda
+    # fijado hasta que el usuario elige carpeta en el FirstLaunchDialog.
+    from gui.main_window import MainWindow
 
     window = MainWindow()
     window.setWindowIcon(app_icon)
