@@ -49,6 +49,7 @@ from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
 from matplotlib.widgets import RangeSlider
 from matplotlib.dates import date2num, num2date
 from matplotlib.collections import PolyCollection, LineCollection
+from matplotlib.patches import FancyArrowPatch
 
 from core.config import (
     LIMPIADOS_DIR, SISTEMAS_DIR, TF_PATTERN, tf_to_minutes, tipo_activo_de_csv,
@@ -81,6 +82,11 @@ ROJO = '#e74c3c'
 GRIS = '#5a7a9a'
 AMBAR = '#f1c40f'
 AZUL = '#4fc3f7'
+
+# flechas de operaciones: tonos más saturados que las velas (VERDE/ROJO de
+# arriba) para que los marcadores no se camuflen sobre cuerpos del mismo color
+VERDE_FLECHA = '#00e676'   # compra (abre largo / cierra corto)
+ROJO_FLECHA = '#ff1744'    # venta (abre corto / cierra largo)
 
 # color fijo por periodo para las medias (SMA/EMA) dibujadas en el gráfico de
 # Resultados — así una media de 200 siempre se identifica por su color sin
@@ -2206,6 +2212,12 @@ class ResultadosWidget(QWidget):
             "de riesgo entre el precio de entrada y el stop.")
         self.chk_stop.toggled.connect(self._toggle_stop_loss)
         fila_zoom.addWidget(self.chk_stop)
+        self.chk_trayecto = QCheckBox("Mostrar trayecto")
+        self.chk_trayecto.setToolTip(
+            "Dibuja una línea gris entre el precio de entrada y el de salida "
+            "de cada operación (recorrido del trade).")
+        self.chk_trayecto.toggled.connect(self._toggle_trayecto)
+        fila_zoom.addWidget(self.chk_trayecto)
         # conmutador de vista: matplotlib (Clásica) <-> Lightweight Charts (Moderna)
         self.btn_vista = QPushButton("🖥 Vista: Clásica")
         self.btn_vista.setCheckable(True)
@@ -2431,7 +2443,7 @@ class ResultadosWidget(QWidget):
         self._dibujar_indicadores(payload)
         # si la vista moderna (LWC) está activa, refrescarla con el nuevo backtest
         if getattr(self, 'btn_vista', None) is not None and self.btn_vista.isChecked():
-            self.lwc.mostrar(payload)
+            self._mostrar_lwc(payload)
 
         # fechas de los QDateEdit
         self.fecha_ini.setDate(QDate(ts[0].year, ts[0].month, ts[0].day))
@@ -2488,23 +2500,34 @@ class ResultadosWidget(QWidget):
         self.btn_vista.setText("📈 Vista: Moderna" if moderna else "🖥 Vista: Clásica")
         self.stack_grafico.setCurrentIndex(1 if moderna else 0)
         if moderna and getattr(self, '_payload', None) is not None:
-            self.lwc.mostrar(self._payload)
+            self._mostrar_lwc(self._payload)
+
+    def _mostrar_lwc(self, payload):
+        """Repinta la vista LWC reflejando los mismos checkboxes (trayecto/
+        stop-loss) que la vista clásica, para que ambas se vean coherentes al
+        conmutar entre ellas."""
+        self.lwc.mostrar(
+            payload,
+            mostrar_trayecto=getattr(self, 'chk_trayecto', None) is not None
+                             and self.chk_trayecto.isChecked(),
+            mostrar_stop=getattr(self, 'chk_stop', None) is not None
+                        and self.chk_stop.isChecked())
 
     def _redibujar_principal_conservando_zoom(self):
         """Redibuja el gráfico principal preservando el rango temporal (zoom)
-        actual — compartido por los toggles de modo velas/línea y stop-loss."""
+        actual — compartido por los toggles de modo velas/línea, stop-loss y
+        trayecto. Si la vista moderna (LWC) está activa, también la refresca."""
         xlim = None
         if getattr(self, '_ax_principal', None) is not None:
             a, b = self._ax_principal.get_xlim()
             xlim = (pd.Timestamp(num2date(a)), pd.Timestamp(num2date(b)))
         self._dibujar_principal(xlim=xlim)
+        if getattr(self, 'btn_vista', None) is not None and self.btn_vista.isChecked() \
+                and getattr(self, '_payload', None) is not None:
+            self._mostrar_lwc(self._payload)
 
-    def _toggle_stop_loss(self, _checked):
-        xlim = None
-        if getattr(self, '_ax_principal', None) is not None:
-            a, b = self._ax_principal.get_xlim()
-            xlim = (pd.Timestamp(num2date(a)), pd.Timestamp(num2date(b)))
-        self._dibujar_principal(xlim=xlim)
+    def _toggle_trayecto(self, _=False):
+        self._redibujar_principal_conservando_zoom()
 
     def _redibujar_datos(self, ax):
         """Redibuja solo las velas/línea, decimadas al rango visible de
@@ -2720,7 +2743,26 @@ class ResultadosWidget(QWidget):
             ax.set_xlim(self._x_full[0], self._x_full[-1])
         self._redibujar_datos(ax)
 
-        # flechas: verde = compra (abre long / cierra short), roja = venta
+        # trayecto de cada operación (entrada→salida, precio real de fill) —
+        # flecha gris tenue con punta en la salida, opcional vía checkbox: la
+        # pendiente muestra de un vistazo si el trade fue ganador o perdedor.
+        # alpha bajo y zorder entre velas (1) y marcadores (3) para no tapar
+        # nada a su paso.
+        if getattr(self, 'chk_trayecto', None) is not None and self.chk_trayecto.isChecked():
+            hay_trayecto = False
+            for r in range(len(tr['pnl'])):
+                x0 = self._x_full[tr['idx_entrada'][r]]
+                x1 = self._x_full[tr['idx_salida'][r]]
+                ax.add_patch(FancyArrowPatch(
+                    (x0, tr['precio_entrada'][r]), (x1, tr['precio_salida'][r]),
+                    arrowstyle='-|>', mutation_scale=8, color=GRIS,
+                    linewidth=0.9, alpha=0.4, zorder=2.5, shrinkA=0, shrinkB=0))
+                hay_trayecto = True
+            if hay_trayecto:
+                ax.plot([], [], color=GRIS, linewidth=1.2, label='Trayecto')
+
+        # flechas: verde = compra (abre long / cierra short), roja = venta —
+        # en tonos más saturados que las velas para que no se camuflen
         idx_compra, idx_venta = [], []
         for r in range(len(tr['pnl'])):
             if tr['dir'][r] > 0:
@@ -2731,10 +2773,10 @@ class ResultadosWidget(QWidget):
                 idx_compra.append(tr['idx_salida'][r])
         if idx_compra:
             ax.scatter(ts[idx_compra], y[idx_compra], marker='^', s=28,
-                       color=VERDE, zorder=3, label='Compra')
+                       color=VERDE_FLECHA, zorder=3, label='Compra')
         if idx_venta:
             ax.scatter(ts[idx_venta], y[idx_venta], marker='v', s=28,
-                       color=ROJO, zorder=3, label='Venta')
+                       color=ROJO_FLECHA, zorder=3, label='Venta')
 
         # stop-loss por operación (nivel ×ATR fijado al entrar) + zona de
         # riesgo entre precio de entrada y stop — opcional, vía checkbox

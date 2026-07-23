@@ -7,6 +7,13 @@ from PyQt6.QtCore import (QSortFilterProxyModel, Qt, QSize, QPoint,
 
 _MAX_PROFUNDIDAD_BUSQUEDA = 6
 
+
+def _asegurar_dir(path):
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError:
+        pass
+
 class CsvFilterModel(QSortFilterProxyModel):
     def __init__(self, exclude_patterns=None, parent=None):
         super().__init__(parent)
@@ -103,14 +110,40 @@ class _SearchResultsModel(QAbstractListModel):
         return index.data(self.PATH_ROLE)
 
 
+class _ListaConAviso(QListView):
+    """QListView que pinta un texto centrado cuando la carpeta está vacía."""
+
+    def __init__(self, empty_hint=None, parent=None):
+        super().__init__(parent)
+        self._empty_hint = empty_hint
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if not self._empty_hint:
+            return
+        model = self.model()
+        if model is None or model.rowCount(self.rootIndex()) > 0:
+            return
+        painter = QPainter(self.viewport())
+        painter.setPen(QColor('#5a7a9a'))
+        painter.drawText(self.viewport().rect(), Qt.AlignmentFlag.AlignCenter,
+                         self._empty_hint)
+        painter.end()
+
+
 class FileExplorer(QWidget):
     file_chosen = pyqtSignal(str)
 
-    def __init__(self, root_path, parent=None, mode='csv'):
+    def __init__(self, root_path, parent=None, mode='csv', empty_hint=None):
         super().__init__(parent)
+        # La raíz debe existir siempre: con una ruta inexistente,
+        # QFileSystemModel.index() devuelve un índice inválido y la vista
+        # cae a mostrar la raíz del sistema de archivos.
+        _asegurar_dir(root_path)
         self._root_path = root_path
         self._nav_stack = []
         self._mode = mode
+        self._empty_hint = empty_hint
         self._search_text = ''
         self._searching = False
 
@@ -187,7 +220,7 @@ QPushButton:disabled, QToolButton:disabled { background-color: #1a2a45; color: #
         self.filter_model.setSourceModel(self.model)
         self._search_model = _SearchResultsModel(parent=self)
 
-        self.list_view = QListView()
+        self.list_view = _ListaConAviso(empty_hint=self._empty_hint)
         self.list_view.setModel(self.filter_model)
         self.list_view.setRootIndex(self.filter_model.mapFromSource(self.model.index(root_path)))
         self.list_view.setViewMode(QListView.ViewMode.IconMode)
@@ -238,6 +271,7 @@ QPushButton:disabled, QToolButton:disabled { background-color: #1a2a45; color: #
         if self._searching:
             self._search_text = ''
             self._salir_modo_busqueda()
+        _asegurar_dir(root_path)
         self._nav_stack.clear()
         self._root_path = root_path
         self.model.setRootPath(root_path)

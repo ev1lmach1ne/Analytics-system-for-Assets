@@ -9,7 +9,7 @@ from gui.widgets.file_explorer import FileExplorer
 from gui.widgets.console_widget import ConsoleWidget
 from gui.widgets.rango_dialog import RangoAnalisisDialog
 
-from core.config import get_base_data, LIMPIADOS_DIR, SCRIPTS_DIR, TF_PATTERN
+from core.config import get_base_data, SCRIPTS_DIR, TF_PATTERN
 
 STYLE_LIMPIADOS = """
 QWidget { background-color: #141e30; }
@@ -88,7 +88,10 @@ class TabLimpiados(QWidget):
         self._grid_mode = True
         self._rf_rate = 0.0
         self._base_data = get_base_data()
-        self._limpiados_dir = LIMPIADOS_DIR
+        # No usar la constante LIMPIADOS_DIR: se copia al importar el módulo
+        # y en el primer arranque eso ocurre antes de que el usuario elija
+        # la carpeta base en el FirstLaunchDialog.
+        self._limpiados_dir = os.path.join(self._base_data, "Limpiados")
         self._rango_inicio = None
         self._rango_fin = None
 
@@ -146,7 +149,10 @@ class TabLimpiados(QWidget):
         self.mode_stack = QStackedWidget()
 
         # Page 0: FileExplorer
-        self.explorer = FileExplorer(self._limpiados_dir, mode='csv')
+        self.explorer = FileExplorer(
+            self._limpiados_dir, mode='csv',
+            empty_hint="Aún no hay archivos importados.\n"
+                       "Usa las pestañas Descargar o Importar para empezar.")
         self.explorer.file_chosen.connect(self._on_file_click)
         self.mode_stack.addWidget(self.explorer)
 

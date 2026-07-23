@@ -204,7 +204,7 @@ def velas_por_anio(tipo_activo, minutos_vela):
     Dos regímenes (misma idea que get_factores() en
     library/scripts_utiles/analisis_descriptivo.py, pero a partir de minutos
     de vela en vez de la etiqueta de TF):
-    - vela &gt;= 1 día de calendario (diaria o más lenta): 1 vela por día de
+    - vela >= 1 día de calendario (diaria o más lenta): 1 vela por día de
       trading, escalado por cuántos días de calendario abarca la vela.
     - vela intradía: cuántas velas caben en la sesión de trading real
       (`minutos_dia`), multiplicado por los días de trading al año.
