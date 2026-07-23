@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+config.json
+*.bak
+*.db
+*.log
+tick_vault_data/
+data/
+*.lnk
+venv/

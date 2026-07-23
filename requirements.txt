@@ -1,0 +1,27 @@
+# Analytics System for Assets - dependencias del core (GUI + motor de datos)
+# Instalar con: pip install -r requirements.txt
+#
+# Los scripts sueltos de library/scripts_utiles/ y library/Backtests/ tienen
+# dependencias adicionales propias en library/requirements.txt.
+
+PyQt6>=6.4
+PyQt6-WebEngine>=6.4
+pandas>=2.0
+numpy>=1.24
+numba>=0.58
+scipy>=1.10
+matplotlib>=3.7
+python-dotenv>=1.0
+requests>=2.31
+ccxt>=4.0
+yfinance>=0.2
+
+# Usadas por los scripts que la GUI lanza como subprocesos
+# (Importar -> preparar_datos/limpieza_datos_er; Analisis -> analisis_descriptivo)
+psycopg2-binary>=2.9
+customtkinter>=5.2
+statsmodels>=0.14
+seaborn>=0.13
+
+# Opcional: solo necesario si se configura un conector Oanda
+oandapyV20>=0.7
