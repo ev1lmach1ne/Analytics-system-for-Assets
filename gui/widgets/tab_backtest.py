@@ -2472,6 +2472,7 @@ class ResultadosWidget(QWidget):
         fila_titulo = QHBoxLayout()
         self.lbl_titulo = QLabel("Ejecuta un backtest desde el Optimizador")
         self.lbl_titulo.setObjectName("titulo")
+        self.lbl_titulo.setWordWrap(True)
         fila_titulo.addWidget(self.lbl_titulo, 1)
         self.btn_favorito = QPushButton("⭐ Guardar como favorito")
         self.btn_favorito.setToolTip(
@@ -2729,10 +2730,15 @@ class ResultadosWidget(QWidget):
         estrategia = html.escape(payload['estrategia'])
         badge = _titulo_activo_html(payload['csv'], payload.get('tf'))
         self.lbl_titulo.setTextFormat(Qt.TextFormat.RichText)
+        max_estr = 80
+        estr_visible = estrategia if len(estrategia) <= max_estr else estrategia[:max_estr - 1] + '…'
         self.lbl_titulo.setText(
-            f"{badge} — {estrategia} — "
+            f"{badge} — {estr_visible} — "
             f"{payload['n_velas']:,} velas · {payload['resultado']['n_trades']} trades · "
             f"capital final {payload['resultado']['capital_final']:,.0f}")
+        self.lbl_titulo.setToolTip(
+            f"{_nombre_activo_limpio(payload['csv'])} · {payload.get('tf', '')} — "
+            f"{estrategia}")
         self.btn_favorito.setEnabled(True)
         self.btn_favorito.setText("⭐ Guardar como favorito")
 
