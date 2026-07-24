@@ -179,5 +179,18 @@ class LwcChart(QWidget):
                 if stop > 0:
                     stops.append([{'time': int(unix[ie]), 'value': stop},
                                   {'time': int(unix[ix]), 'value': stop}])
+        # dedup: cuando un trade se cierra y otro se abre en la misma vela
+        # (ej. reversión) se generan dos marcadores idénticos (mismo time/
+        # position/shape/color) que LWC dibuja superpuestos — se ven como un
+        # icono "doble".
+        vistos = set()
+        markers_unicos = []
+        for m in markers:
+            clave = (m['time'], m['position'], m['shape'], m['color'])
+            if clave in vistos:
+                continue
+            vistos.add(clave)
+            markers_unicos.append(m)
+        markers = markers_unicos
         markers.sort(key=lambda m: m['time'])   # LWC exige orden temporal
         return candles, markers, trayectos, stops

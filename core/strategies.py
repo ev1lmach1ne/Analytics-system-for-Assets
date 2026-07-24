@@ -69,6 +69,39 @@ def bollinger(c, periodo=20, desv=2.0):
     return media.values, (media + desv * std).values, (media - desv * std).values
 
 
+def stochastic(h, l, c, periodo_k=14, suavizado_k=3, periodo_d=3):
+    """Oscilador estocástico (%K / %D). %K = posición del cierre dentro del
+    rango [mínimo, máximo] de las últimas `periodo_k` velas, suavizado con
+    `suavizado_k` (slow stochastic); %D = media móvil de %K. Ambos en 0-100."""
+    hs, ls, cs = pd.Series(h), pd.Series(l), pd.Series(c)
+    ll = ls.rolling(int(periodo_k)).min()
+    hh = hs.rolling(int(periodo_k)).max()
+    raw_k = 100.0 * (cs - ll) / (hh - ll).replace(0, np.nan)
+    k = raw_k.rolling(int(suavizado_k)).mean()          # %K (slow)
+    d = k.rolling(int(periodo_d)).mean()                # %D
+    return k.values, d.values
+
+
+def williams_r(h, l, c, periodo=14):
+    """Williams %R: mismo rango que el estocástico pero invertido en signo,
+    escala -100..0 (-100 = mínimo del rango, 0 = máximo)."""
+    hs, ls, cs = pd.Series(h), pd.Series(l), pd.Series(c)
+    hh = hs.rolling(int(periodo)).max()
+    ll = ls.rolling(int(periodo)).min()
+    return (-100.0 * (hh - cs) / (hh - ll).replace(0, np.nan)).values
+
+
+def cci(h, l, c, periodo=20):
+    """Commodity Channel Index: desviación del precio típico respecto a su
+    media, normalizada por la desviación absoluta media (factor 0.015).
+    Típicamente oscila entre -100 y +100 pero no está acotado."""
+    tp = (pd.Series(h) + pd.Series(l) + pd.Series(c)) / 3.0
+    sma_tp = tp.rolling(int(periodo)).mean()
+    md = tp.rolling(int(periodo)).apply(
+        lambda x: np.abs(x - x.mean()).mean(), raw=True)
+    return ((tp - sma_tp) / (0.015 * md.replace(0, np.nan))).values
+
+
 def _retorno_log(close):
     """Retornos log cierre-a-cierre — misma convención que
     library/scripts_utiles/limpieza_datos_er.py y tab_patrones.py."""
@@ -200,6 +233,53 @@ def _gen_rsi(df, p):
     if p['direccion'] in ('Short', 'Ambas'):
         s['entradas_short'] = r > p['sobrecompra']
         s['salidas_short'] = r < 50.0
+    return s
+
+
+def _gen_stochastic(df, p):
+    """Entrada híbrida: cruce de %K sobre %D CONFIRMADO dentro de la zona
+    extrema (Long: %K cruza arriba de %D y además %K < sobreventa). Salida
+    al recuperar la línea media (50)."""
+    h, l, c = df['high'].values, df['low'].values, df['close'].values
+    n = len(c)
+    k, d = stochastic(h, l, c, p['periodo_k'], p['suavizado_k'], p['periodo_d'])
+    s = _base_senales(n, h, l, c)
+    cruce_up = _cruza_arriba(k, d)
+    cruce_down = _cruza_abajo(k, d)
+    if p['direccion'] in ('Long', 'Ambas'):
+        s['entradas_long'] = _limpiar_nan(cruce_up & (k < p['sobreventa']), k, d)
+        s['salidas_long'] = _limpiar_nan(k > 50.0, k)
+    if p['direccion'] in ('Short', 'Ambas'):
+        s['entradas_short'] = _limpiar_nan(cruce_down & (k > p['sobrecompra']), k, d)
+        s['salidas_short'] = _limpiar_nan(k < 50.0, k)
+    return s
+
+
+def _gen_williams(df, p):
+    h, l, c = df['high'].values, df['low'].values, df['close'].values
+    n = len(c)
+    wr = williams_r(h, l, c, p['periodo'])          # rango -100..0
+    s = _base_senales(n, h, l, c)
+    if p['direccion'] in ('Long', 'Ambas'):
+        s['entradas_long'] = _limpiar_nan(wr < p['sobreventa'], wr)
+        s['salidas_long'] = _limpiar_nan(wr > -50.0, wr)
+    if p['direccion'] in ('Short', 'Ambas'):
+        s['entradas_short'] = _limpiar_nan(wr > p['sobrecompra'], wr)
+        s['salidas_short'] = _limpiar_nan(wr < -50.0, wr)
+    return s
+
+
+def _gen_cci(df, p):
+    h, l, c = df['high'].values, df['low'].values, df['close'].values
+    n = len(c)
+    v = cci(h, l, c, p['periodo'])
+    s = _base_senales(n, h, l, c)
+    if p['direccion'] in ('Long', 'Ambas'):
+        s['entradas_long'] = _limpiar_nan(v < p['sobreventa'], v)
+        s['salidas_long'] = _limpiar_nan(v > 0.0, v)
+    if p['direccion'] in ('Short', 'Ambas'):
+        s['entradas_short'] = _limpiar_nan(v > p['sobrecompra'], v)
+        s['salidas_short'] = _limpiar_nan(v < 0.0, v)
     return s
 
 
@@ -429,6 +509,43 @@ def _desc_rsi(p):
     return "\n".join(partes)
 
 
+def _desc_stochastic(p):
+    pk, sk, pd_ = p['periodo_k'], p['suavizado_k'], p['periodo_d']
+    est = f"Stoch(%K={pk},suav={sk},%D={pd_})"
+    partes = []
+    if p['direccion'] in ('Long', 'Ambas'):
+        partes.append(f"Entrada Long: %K cruza arriba %D con %K < {p['sobreventa']:g} · "
+                      f"Salida Long: %K > 50   [{est}]")
+    if p['direccion'] in ('Short', 'Ambas'):
+        partes.append(f"Entrada Short: %K cruza abajo %D con %K > {p['sobrecompra']:g} · "
+                      f"Salida Short: %K < 50   [{est}]")
+    return "\n".join(partes) + "\n(Reversión a la media; stop/TP los pone el setup)"
+
+
+def _desc_williams(p):
+    per = p['periodo']
+    partes = []
+    if p['direccion'] in ('Long', 'Ambas'):
+        partes.append(f"Entrada Long: %R({per}) < {p['sobreventa']:g} · "
+                      f"Salida Long: %R({per}) > -50")
+    if p['direccion'] in ('Short', 'Ambas'):
+        partes.append(f"Entrada Short: %R({per}) > {p['sobrecompra']:g} · "
+                      f"Salida Short: %R({per}) < -50")
+    return "\n".join(partes) + "\n(Reversión a la media; stop/TP los pone el setup)"
+
+
+def _desc_cci(p):
+    per = p['periodo']
+    partes = []
+    if p['direccion'] in ('Long', 'Ambas'):
+        partes.append(f"Entrada Long: CCI({per}) < {p['sobreventa']:g} · "
+                      f"Salida Long: CCI({per}) > 0")
+    if p['direccion'] in ('Short', 'Ambas'):
+        partes.append(f"Entrada Short: CCI({per}) > {p['sobrecompra']:g} · "
+                      f"Salida Short: CCI({per}) < 0")
+    return "\n".join(partes) + "\n(Reversión a la media; stop/TP los pone el setup)"
+
+
 def _desc_kama(p):
     per_er, r, l = p['periodo_er'], p['rapido'], p['lento']
     partes = []
@@ -473,6 +590,7 @@ _OPCIONES_DIRECCION = ['Ambas', 'Long', 'Short']
 ESTRATEGIAS = {
     'Cruce de medias': {
         'color': '#4fc3f7',
+        'categoria': 'Direccional',
         'desc_corta': 'Cruces de medias móviles SMA/EMA',
         'generar': _gen_cruce_medias,
         'descripcion': _desc_cruce,
@@ -492,6 +610,7 @@ ESTRATEGIAS = {
     },
     'Bollinger + ATR': {
         'color': '#66bb6a',
+        'categoria': 'Mean Reversion',
         'desc_corta': 'Reversión a la media con Bandas Bollinger',
         'generar': _gen_bollinger,
         'descripcion': _desc_bollinger,
@@ -506,6 +625,7 @@ ESTRATEGIAS = {
     },
     'RSI': {
         'color': '#ffa726',
+        'categoria': 'Mean Reversion',
         'desc_corta': 'Sobrecompra / sobreventa con RSI',
         'generar': _gen_rsi,
         'descripcion': _desc_rsi,
@@ -520,8 +640,64 @@ ESTRATEGIAS = {
              'opciones': _OPCIONES_DIRECCION, 'defecto': 'Ambas'},
         ],
     },
+    'Stochastic (%K/%D)': {
+        'color': '#26c6da',
+        'categoria': 'Mean Reversion',
+        'desc_corta': 'Cruce %K/%D en zona de sobreventa/sobrecompra',
+        'generar': _gen_stochastic,
+        'descripcion': _desc_stochastic,
+        'params': [
+            {'clave': 'periodo_k', 'etiqueta': 'Periodo %K', 'tipo': 'int',
+             'defecto': 14, 'min': 2, 'max': 100},
+            {'clave': 'suavizado_k', 'etiqueta': 'Suavizado %K', 'tipo': 'int',
+             'defecto': 3, 'min': 1, 'max': 20},
+            {'clave': 'periodo_d', 'etiqueta': 'Periodo %D', 'tipo': 'int',
+             'defecto': 3, 'min': 1, 'max': 20},
+            {'clave': 'sobreventa', 'etiqueta': 'Umbral sobreventa', 'tipo': 'float',
+             'defecto': 20.0, 'min': 5.0, 'max': 45.0},
+            {'clave': 'sobrecompra', 'etiqueta': 'Umbral sobrecompra', 'tipo': 'float',
+             'defecto': 80.0, 'min': 55.0, 'max': 95.0},
+            {'clave': 'direccion', 'etiqueta': 'Dirección', 'tipo': 'choice',
+             'opciones': _OPCIONES_DIRECCION, 'defecto': 'Ambas'},
+        ],
+    },
+    'Williams %R': {
+        'color': '#ec407a',
+        'categoria': 'Mean Reversion',
+        'desc_corta': 'Sobrecompra / sobreventa con Williams %R',
+        'generar': _gen_williams,
+        'descripcion': _desc_williams,
+        'params': [
+            {'clave': 'periodo', 'etiqueta': 'Periodo %R', 'tipo': 'int',
+             'defecto': 14, 'min': 2, 'max': 100},
+            {'clave': 'sobreventa', 'etiqueta': 'Umbral sobreventa', 'tipo': 'float',
+             'defecto': -80.0, 'min': -95.0, 'max': -55.0},
+            {'clave': 'sobrecompra', 'etiqueta': 'Umbral sobrecompra', 'tipo': 'float',
+             'defecto': -20.0, 'min': -45.0, 'max': -5.0},
+            {'clave': 'direccion', 'etiqueta': 'Dirección', 'tipo': 'choice',
+             'opciones': _OPCIONES_DIRECCION, 'defecto': 'Ambas'},
+        ],
+    },
+    'CCI': {
+        'color': '#5c6bc0',
+        'categoria': 'Mean Reversion',
+        'desc_corta': 'Reversión con Commodity Channel Index',
+        'generar': _gen_cci,
+        'descripcion': _desc_cci,
+        'params': [
+            {'clave': 'periodo', 'etiqueta': 'Periodo CCI', 'tipo': 'int',
+             'defecto': 20, 'min': 5, 'max': 200},
+            {'clave': 'sobreventa', 'etiqueta': 'Umbral sobreventa', 'tipo': 'float',
+             'defecto': -100.0, 'min': -300.0, 'max': -50.0},
+            {'clave': 'sobrecompra', 'etiqueta': 'Umbral sobrecompra', 'tipo': 'float',
+             'defecto': 100.0, 'min': 50.0, 'max': 300.0},
+            {'clave': 'direccion', 'etiqueta': 'Dirección', 'tipo': 'choice',
+             'opciones': _OPCIONES_DIRECCION, 'defecto': 'Ambas'},
+        ],
+    },
     'KAMA': {
         'color': '#ab47bc',
+        'categoria': 'Direccional',
         'desc_corta': 'Tendencia adaptativa (Kaufman)',
         'generar': _gen_kama,
         'descripcion': _desc_kama,
@@ -541,6 +717,7 @@ ESTRATEGIAS = {
     },
     'Patrones de velas': {
         'color': '#ef5350',
+        'categoria': 'Rev. / Direcc.',
         'desc_corta': 'Patrones de velas japonesas',
         'generar': _gen_patrones,
         'descripcion': _desc_patrones,
@@ -554,6 +731,7 @@ ESTRATEGIAS = {
     },
     'Custom (reglas)': {
         'color': '#78909c',
+        'categoria': None,
         'desc_corta': 'Reglas personalizadas editables',
         'generar': _gen_custom,
         'descripcion': _desc_custom,
@@ -756,6 +934,31 @@ def _codigo_reglas_plantilla(plantilla, p):
         if p['direccion'] in ('Short', 'Ambas'):
             ent.append(f"SHORT: SI RSI({per}) > {p['sobrecompra']:g} → vender al open siguiente")
             sal.append(f"SHORT: SI RSI({per}) < 50 → recomprar al open siguiente")
+    elif plantilla == 'Stochastic (%K/%D)':
+        pk, sk, pd_ = p['periodo_k'], p['suavizado_k'], p['periodo_d']
+        est = f"Stoch(%K={pk},suav={sk},%D={pd_})"
+        if p['direccion'] in ('Long', 'Ambas'):
+            ent.append(f"LONG:  SI %K cruza arriba %D Y %K < {p['sobreventa']:g}  [{est}] → comprar al open siguiente")
+            sal.append(f"LONG:  SI %K > 50  [{est}] → vender al open siguiente")
+        if p['direccion'] in ('Short', 'Ambas'):
+            ent.append(f"SHORT: SI %K cruza abajo %D Y %K > {p['sobrecompra']:g}  [{est}] → vender al open siguiente")
+            sal.append(f"SHORT: SI %K < 50  [{est}] → recomprar al open siguiente")
+    elif plantilla == 'Williams %R':
+        per = p['periodo']
+        if p['direccion'] in ('Long', 'Ambas'):
+            ent.append(f"LONG:  SI %R({per}) < {p['sobreventa']:g} → comprar al open siguiente")
+            sal.append(f"LONG:  SI %R({per}) > -50 → vender al open siguiente")
+        if p['direccion'] in ('Short', 'Ambas'):
+            ent.append(f"SHORT: SI %R({per}) > {p['sobrecompra']:g} → vender al open siguiente")
+            sal.append(f"SHORT: SI %R({per}) < -50 → recomprar al open siguiente")
+    elif plantilla == 'CCI':
+        per = p['periodo']
+        if p['direccion'] in ('Long', 'Ambas'):
+            ent.append(f"LONG:  SI CCI({per}) < {p['sobreventa']:g} → comprar al open siguiente")
+            sal.append(f"LONG:  SI CCI({per}) > 0 → vender al open siguiente")
+        if p['direccion'] in ('Short', 'Ambas'):
+            ent.append(f"SHORT: SI CCI({per}) > {p['sobrecompra']:g} → vender al open siguiente")
+            sal.append(f"SHORT: SI CCI({per}) < 0 → recomprar al open siguiente")
     elif plantilla == 'KAMA':
         per_er, r, l = p['periodo_er'], p['rapido'], p['lento']
         if p['direccion'] in ('Long', 'Ambas'):
@@ -925,7 +1128,12 @@ def describir_setup(setup):
     nombre = setup.get('nombre') or setup['plantilla']
     riesgo = setup.get('riesgo_pct')
     stop = setup.get('stop_atr')
-    partes = [nombre, setup['plantilla']]
+    plantilla_txt = setup['plantilla']
+    if plantilla_txt == 'Patrones de velas':
+        pats = (setup.get('params') or {}).get('patrones') or []
+        if pats:
+            plantilla_txt = f"{plantilla_txt}: {' + '.join(pats)}"
+    partes = [nombre, plantilla_txt]
     if riesgo is not None:
         partes.append(f"riesgo {riesgo * 100:g}%")
     if stop:

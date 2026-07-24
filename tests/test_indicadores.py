@@ -11,7 +11,10 @@ para que cualquier cambio futuro sea intencional y no un efecto colateral.
 import numpy as np
 import pytest
 
-from core.strategies import sma, ema, rsi, atr, bollinger, _cruza_arriba, _cruza_abajo
+from core.strategies import (
+    sma, ema, rsi, atr, bollinger, stochastic, williams_r, cci,
+    _cruza_arriba, _cruza_abajo,
+)
 
 
 # ══════════════ SMA ══════════════
@@ -107,6 +110,75 @@ def test_bollinger_usa_desviacion_muestral_ddof1():
         assert media[i] == pytest.approx(centro)
         assert sup[i] == pytest.approx(centro + 2.0 * 1.0)
         assert inf[i] == pytest.approx(centro - 2.0 * 1.0)
+
+
+# ══════════════ Stochastic ══════════════
+def test_stochastic_rango_0_100_y_valores_extremos():
+    # con suavizado_k=1 y periodo_d=1, %K = raw_k sin suavizar
+    h = np.array([10.0, 11.0, 12.0, 13.0, 14.0])
+    l = np.array([9.0, 9.5, 10.0, 10.5, 11.0])
+    c = np.array([9.0, 11.0, 10.0, 13.0, 11.0])
+    k, d = stochastic(h, l, c, periodo_k=3, suavizado_k=1, periodo_d=1)
+    val = k[~np.isnan(k)]
+    assert (val >= 0).all() and (val <= 100).all()
+    # índice 2: ll=min(9,9.5,10)=9, hh=max(10,11,12)=12, c=10 -> (10-9)/(12-9)*100
+    assert k[2] == pytest.approx((10.0 - 9.0) / (12.0 - 9.0) * 100.0)
+    # índice 4: cierre en el mínimo del rango -> %K = 0
+    # ll=min(10,10.5,11)=10, hh=max(12,13,14)=14, c=11 -> (11-10)/(14-10)*100=25
+    assert k[4] == pytest.approx((11.0 - 10.0) / (14.0 - 10.0) * 100.0)
+
+
+def test_stochastic_d_es_media_de_k():
+    h = np.arange(1.0, 11.0) + 1.0
+    l = np.arange(1.0, 11.0) - 1.0
+    c = np.arange(1.0, 11.0)
+    k, d = stochastic(h, l, c, periodo_k=3, suavizado_k=1, periodo_d=2)
+    # %D es media móvil de 2 de %K
+    for i in range(3, 10):
+        if not (np.isnan(k[i]) or np.isnan(k[i - 1])):
+            assert d[i] == pytest.approx((k[i] + k[i - 1]) / 2.0)
+
+
+# ══════════════ Williams %R ══════════════
+def test_williams_r_rango_menos100_a_0():
+    h = np.array([10.0, 11.0, 12.0, 13.0, 14.0])
+    l = np.array([9.0, 9.5, 10.0, 10.5, 11.0])
+    c = np.array([9.0, 11.0, 10.0, 13.0, 12.0])
+    r = williams_r(h, l, c, periodo=3)
+    val = r[~np.isnan(r)]
+    assert (val >= -100).all() and (val <= 0).all()
+    # índice 2: hh=12, ll=9, c=10 -> -100*(12-10)/(12-9) = -66.6666...
+    assert r[2] == pytest.approx(-100.0 * (12.0 - 10.0) / (12.0 - 9.0))
+
+
+def test_williams_r_cierre_en_maximo_da_cero():
+    h = np.array([10.0, 11.0, 12.0])
+    l = np.array([9.0, 9.0, 9.0])
+    c = np.array([10.0, 11.0, 12.0])   # cierra en el máximo del rango
+    r = williams_r(h, l, c, periodo=3)
+    assert r[2] == pytest.approx(0.0)
+
+
+# ══════════════ CCI ══════════════
+def test_cci_cero_cuando_precio_igual_a_su_media():
+    # serie de precio típico constante -> desviación 0 -> CCI NaN (no inf)
+    h = np.full(6, 10.0)
+    l = np.full(6, 10.0)
+    c = np.full(6, 10.0)
+    v = cci(h, l, c, periodo=3)
+    # md=0 -> replace(0,nan) evita inf; el resultado es NaN, nunca +/-inf
+    assert not np.isinf(v).any()
+    assert np.isnan(v[3])
+
+
+def test_cci_signo_positivo_cuando_precio_sobre_su_media():
+    # precio típico creciente -> el último punto está por encima de su SMA -> CCI > 0
+    h = np.array([10.0, 11.0, 12.0, 13.0, 14.0])
+    l = h - 1.0
+    c = h - 0.5
+    v = cci(h, l, c, periodo=3)
+    fin = v[~np.isnan(v)]
+    assert fin[-1] > 0
 
 
 # ══════════════ Cruces ══════════════

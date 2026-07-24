@@ -1,0 +1,49 @@
+{
+  "nombre": "cruce dax 25-50",
+  "csv": "D:/DATOS/Activos/Limpiados/dax/dax_1d_limpiado.csv",
+  "tf": "1d",
+  "setups": [
+    {
+      "nombre": "Cruce de medias",
+      "plantilla": "Cruce de medias",
+      "params": {
+        "tipo": "SMA",
+        "rapida": 25,
+        "lenta": 50,
+        "direccion": "Ambas"
+      },
+      "riesgo_pct": 0.01,
+      "stop_atr": 0.0,
+      "tp_r": 0.0,
+      "salida_n_velas": 0,
+      "edge": false,
+      "filtros": {
+        "dias_semana": null,
+        "regimen": {
+          "metodo": "ninguno",
+          "periodo": 100
+        },
+        "sesion": {
+          "tipo": "ninguna",
+          "hora_inicio": 0,
+          "hora_fin": 0
+        },
+        "condiciones_entrada": [],
+        "condiciones_salida": []
+      }
+    }
+  ],
+  "config": {
+    "capital_inicial": 10000.0,
+    "comision_pct": 0.0007000000000000001,
+    "slippage_pct": 0.0007000000000000001,
+    "config_por_setup": {
+      "0": {
+        "riesgo_pct": 0.01,
+        "stop_atr": 0.0,
+        "tp_r": 0.0,
+        "salida_n_velas": 0
+      }
+    }
+  }
+}

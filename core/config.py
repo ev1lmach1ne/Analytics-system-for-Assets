@@ -31,6 +31,7 @@ INFORMES_DIR  = os.path.join(LIMPIADOS_DIR, "Informes")
 CONFIG_PATH   = os.path.join(BASE_DATA, "sesion_config.json")
 SCRIPTS_DIR   = os.path.join(PROJECT_ROOT, "library", "scripts_utiles")
 SISTEMAS_DIR  = os.path.join(PROJECT_ROOT, "Sistemas")
+FAVORITOS_DIR = os.path.join(PROJECT_ROOT, "Favoritos")
 
 
 _APP_CONFIG_CACHE = {}
@@ -56,6 +57,27 @@ def get_tutorial_visto():
 
 def set_tutorial_visto(valor=True):
     _APP_CONFIG_CACHE['tutorial_visto'] = valor
+    _save_app_config()
+
+
+def get_selector_recientes(clave):
+    """Lista de nombres usados recientemente en un selector de tarjetas
+    (p.ej. 'plantilla' o 'sistema'), del más reciente al más antiguo. Se
+    persiste entre reinicios en config.json."""
+    todos = _APP_CONFIG_CACHE.get('selector_recientes')
+    if isinstance(todos, dict):
+        val = todos.get(clave)
+        if isinstance(val, list):
+            return [n for n in val if isinstance(n, str)]
+    return []
+
+
+def set_selector_recientes(clave, nombres):
+    todos = _APP_CONFIG_CACHE.get('selector_recientes')
+    if not isinstance(todos, dict):
+        todos = {}
+    todos[clave] = list(nombres)
+    _APP_CONFIG_CACHE['selector_recientes'] = todos
     _save_app_config()
 
 
