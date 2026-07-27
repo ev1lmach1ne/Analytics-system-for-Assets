@@ -1,4 +1,4 @@
-import sys, os, ctypes
+import sys, os, ctypes, time
 sys.path.insert(0, os.path.dirname(__file__))
 
 # Verificación temprana de dependencias: si falta alguna librería crítica
@@ -33,15 +33,6 @@ if _faltan:
         print(_msg)
     sys.exit(1)
 
-# QtWebEngineWidgets (vista "Moderna" de la pestaña Resultados, gui/widgets/
-# lwc_chart.py) EXIGE importarse antes de crear cualquier QApplication — si no,
-# PyQt6 lanza ImportError. El orden de imports de main_window ya lo cumple hoy
-# por casualidad; se fija aquí explícitamente para no depender de ese orden.
-try:
-    import PyQt6.QtWebEngineWidgets  # noqa: F401
-except ImportError:
-    pass   # PyQt6-WebEngine no instalado -> lwc_chart.WEBENGINE_OK queda False
-
 from core.config import APP_CONFIG_PATH
 
 def _ensure_config():
@@ -61,8 +52,15 @@ def main():
     except Exception:
         pass
 
-    from PyQt6.QtWidgets import QApplication
-    from PyQt6.QtGui import QIcon, QPalette, QColor
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtWidgets import QApplication, QSplashScreen
+    from PyQt6.QtGui import QIcon, QPalette, QColor, QPixmap
+
+    # QtWebEngineWidgets debe importarse antes de crear QApplication
+    try:
+        import PyQt6.QtWebEngineWidgets  # noqa: F401
+    except ImportError:
+        pass
 
     app = QApplication(sys.argv)
     app.setApplicationName("Analytics System for Assets")
@@ -81,7 +79,21 @@ def main():
     app_icon = QIcon(icon_path)
     app.setWindowIcon(app_icon)
 
+    # Splash screen con fade-in mientras carga la app
+    # Usamos pixmap(256,256) para obtener la mejor resolución del .ico
+    splash_px = app_icon.pixmap(256, 256).scaled(300, 300,
+        Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+    splash = QSplashScreen(splash_px)
+    splash.setWindowFlags(Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.FramelessWindowHint)
+    splash.setWindowOpacity(0.0)
+    splash.show()
+    for i in range(1, 11):
+        splash.setWindowOpacity(i / 10.0)
+        app.processEvents()
+        time.sleep(0.03)
+
     if not _ensure_config():
+        splash.close()
         sys.exit(0)
 
     # Importar DESPUÉS de _ensure_config(): los módulos de las pestañas copian
@@ -91,6 +103,14 @@ def main():
 
     window = MainWindow()
     window.setWindowIcon(app_icon)
+
+    # Fade out del splash — luego mostramos la ventana
+    for i in range(10, -1, -1):
+        splash.setWindowOpacity(i / 10.0)
+        app.processEvents()
+        time.sleep(0.04)
+    splash.close()
+
     window.show()
 
     from core.config import get_tutorial_visto, set_tutorial_visto

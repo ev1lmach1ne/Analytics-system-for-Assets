@@ -60,6 +60,15 @@ def set_tutorial_visto(valor=True):
     _save_app_config()
 
 
+def get_finnhub_api_key():
+    return _APP_CONFIG_CACHE.get('finnhub_api_key', '')
+
+
+def set_finnhub_api_key(valor):
+    _APP_CONFIG_CACHE['finnhub_api_key'] = (valor or '').strip()
+    _save_app_config()
+
+
 def get_selector_recientes(clave):
     """Lista de nombres usados recientemente en un selector de tarjetas
     (p.ej. 'plantilla' o 'sistema'), del más reciente al más antiguo. Se

@@ -781,20 +781,72 @@ def _filtros_por_defecto():
         # tipo: 'ninguna'|'overnight'|'londres'|'ny'|'personalizada' (horas UTC en 'personalizada')
         'condiciones_entrada': [],   # lista de {'izq':spec,'op':...,'der':spec}; AND; [] = sin restricción
         'condiciones_salida': [],    # idem, pero se aplica sobre la señal de SALIDA del setup
+        'noticias': {
+            'activo': False,
+            'minutos_antes': 30,
+            'minutos_despues': 30,
+            'impacto_minimo': 'alto',   # 'bajo'|'medio'|'alto'
+            'monedas': None,            # None = inferir del instrumento en tiempo de ejecución
+            'cerrar_posiciones': False,  # además de bloquear entradas, forzar cierre si hay posición abierta
+        },
     }
 
 
-def _mascara_filtros_setup(df, filtros):
-    """(m_long, m_short): máscaras AND de los filtros activos de un setup
-    (True = vela admitida para NUEVAS entradas). Día/régimen/sesión son
-    agnósticos a la dirección y se aplican a ambos lados por igual;
-    condiciones_entrada puede restringir un solo lado según su 'direccion'
-    (ver _mascaras_condiciones_dir). Reutiliza los umbrales/sesiones de
-    core.candle_patterns.preparar_contexto para no duplicar convenciones."""
+# rango (bajo=0, medio=1, alto=2); ver core.data_providers.economic_calendar.IMPACTO_RANK
+_IMPACTO_RANK_NOTICIAS = {'bajo': 0, 'medio': 1, 'alto': 2}
+
+
+def preparar_eventos_noticias(df_eventos):
+    """DataFrame crudo del proveedor (timestamp/pais/evento/impacto) ->
+    tupla de arrays (ts_epoch_s int64[], pais str[], impacto_rank int8[])
+    lista para pasar a generar_senales_sistema/_mascara_filtros_setup. Se
+    hace una sola vez por corrida para no repetir overhead de pandas si
+    luego se llama en bucle (p.ej. desde el optimizador)."""
+    if df_eventos is None or len(df_eventos) == 0:
+        return (np.array([], dtype=np.int64), np.array([], dtype=object),
+                np.array([], dtype=np.int8))
+    ts = df_eventos['timestamp'].values.astype('datetime64[s]').astype(np.int64)
+    pais = df_eventos['pais'].astype(str).values
+    impacto = df_eventos['impacto'].map(_IMPACTO_RANK_NOTICIAS).fillna(0).astype(np.int8).values
+    orden = np.argsort(ts)
+    return ts[orden], pais[orden], impacto[orden]
+
+
+def _mascara_evitar_ventanas(ts_velas, ts_eventos, antes_s, despues_s):
+    """True = vela admitida para nuevas entradas (fuera de toda ventana de
+    noticia). ts_velas/ts_eventos: int64[] epoch-segundos, ts_eventos ya
+    ordenado. Vectorizado con searchsorted (una operación por evento, no un
+    bucle n_velas × n_eventos)."""
+    admitida = np.ones(len(ts_velas), dtype=bool)
+    for t_ev in ts_eventos:
+        ini = np.searchsorted(ts_velas, t_ev - antes_s, side='left')
+        fin = np.searchsorted(ts_velas, t_ev + despues_s, side='right')
+        if fin > ini:
+            admitida[ini:fin] = False
+    return admitida
+
+
+def _mascara_filtros_setup(df, filtros, eventos_noticias=None):
+    """(m_long, m_short, m_forzar_salida): máscaras AND de los filtros
+    activos de un setup (True = vela admitida para NUEVAS entradas).
+    Día/régimen/sesión/noticias son agnósticos a la dirección y se aplican a
+    ambos lados por igual; condiciones_entrada puede restringir un solo lado
+    según su 'direccion' (ver _mascaras_condiciones_dir). Reutiliza los
+    umbrales/sesiones de core.candle_patterns.preparar_contexto para no
+    duplicar convenciones.
+
+    eventos_noticias: tupla (ts_epoch_s, pais, impacto_rank) ya extraída del
+    calendario económico (ver preparar_eventos_noticias), cubriendo el rango
+    completo de `df`. El filtrado por impacto/moneda del propio setup ocurre
+    aquí, no en el proveedor, para que dos setups del mismo sistema puedan
+    pedir umbrales distintos. m_forzar_salida es None si el setup no pide
+    cerrar posiciones abiertas antes de la noticia (o si no hay filtro de
+    noticias activo)."""
     n = len(df)
     m = np.ones(n, dtype=bool)
+    m_forzar_salida = None
     if not filtros:
-        return m, m.copy()
+        return m, m.copy(), m_forzar_salida
 
     dias = filtros.get('dias_semana')
     if dias:
@@ -836,13 +888,31 @@ def _mascara_filtros_setup(df, filtros):
         else:
             m &= (horas >= h_ini) | (horas < h_fin)   # cruza medianoche
 
+    noticias = filtros.get('noticias') or {}
+    if noticias.get('activo') and eventos_noticias is not None and len(eventos_noticias[0]):
+        ts_ev, pais_ev, impacto_ev = eventos_noticias
+        umbral = _IMPACTO_RANK_NOTICIAS.get(noticias.get('impacto_minimo', 'alto'), 2)
+        sel = impacto_ev >= umbral
+        monedas = noticias.get('monedas')
+        if monedas:
+            sel &= np.isin(pais_ev, list(monedas))
+        ts_ev_f = ts_ev[sel]
+        if len(ts_ev_f):
+            ts_velas = df['timestamp'].values.astype('datetime64[s]').astype(np.int64)
+            antes_s = int(noticias.get('minutos_antes', 30)) * 60
+            despues_s = int(noticias.get('minutos_despues', 30)) * 60
+            m_noticias = _mascara_evitar_ventanas(ts_velas, ts_ev_f, antes_s, despues_s)
+            m &= m_noticias
+            if noticias.get('cerrar_posiciones'):
+                m_forzar_salida = ~m_noticias
+
     mc_long, mc_short = _mascaras_condiciones_dir(df, filtros.get('condiciones_entrada'))
-    return m & mc_long, m & mc_short
+    return m & mc_long, m & mc_short, m_forzar_salida
 
 
 # ══════════════ sistemas multi-setup ══════════════
 
-def generar_senales_sistema(df, setups):
+def generar_senales_sistema(df, setups, eventos_noticias=None):
     """Fusiona las señales de una lista de setups en un único juego para el
     motor. setups: [{'plantilla': nombre de ESTRATEGIAS, 'params': {...}},
     ...] (máx. MAX_SETUPS).
@@ -856,6 +926,11 @@ def generar_senales_sistema(df, setups):
       salir. El motor solo cierra por señal si el bit del setup de la
       posición abierta está activo (la salida de un setup no toca la
       posición de otro).
+
+    eventos_noticias: tupla (ts_epoch_s, pais, impacto_rank) de
+    preparar_eventos_noticias(), o None si ningún setup usa el filtro de
+    noticias. Se reenvía tal cual a _mascara_filtros_setup por cada setup;
+    cada uno aplica su propio umbral de impacto/monedas/ventana.
     """
     if len(setups) > MAX_SETUPS:
         raise ValueError(f"Máximo {MAX_SETUPS} setups por sistema")
@@ -878,7 +953,8 @@ def generar_senales_sistema(df, setups):
         sal_s = np.asarray(s['salidas_short'], dtype=bool)
         filtros = setup.get('filtros')
         if filtros:
-            m_ent_long, m_ent_short = _mascara_filtros_setup(df, filtros)
+            m_ent_long, m_ent_short, m_forzar_salida = _mascara_filtros_setup(
+                df, filtros, eventos_noticias)
             ent_l = ent_l & m_ent_long
             ent_s = ent_s & m_ent_short
             # condiciones_salida SÍ restringe la salida (a diferencia de
@@ -891,6 +967,14 @@ def generar_senales_sistema(df, setups):
                 df, filtros.get('condiciones_salida'))
             sal_l = sal_l & m_sal_long
             sal_s = sal_s & m_sal_short
+            # noticias.cerrar_posiciones SÍ fuerza la salida (a diferencia
+            # del resto de filtros de entrada): si hay una posición abierta
+            # de este setup, se cierra al entrar en la ventana previa al
+            # evento, igual que si la propia estrategia hubiera señalado
+            # salida — el motor no distingue el origen del bit.
+            if m_forzar_salida is not None:
+                sal_l = sal_l | m_forzar_salida
+                sal_s = sal_s | m_forzar_salida
         nuevas = (ent_l | ent_s) & ~reclamada
         out['entradas_long'] |= ent_l & nuevas
         out['entradas_short'] |= ent_s & ~ent_l & nuevas
@@ -1029,6 +1113,15 @@ def _desc_filtros(filtros):
         if conds:
             texto = " Y ".join(_desc_condicion_dir(c) for c in conds)
             lineas.append(f"{etiqueta}: {texto}")
+    noticias = filtros.get('noticias') or {}
+    if noticias.get('activo'):
+        monedas = noticias.get('monedas')
+        alcance = "no abre ni deja posiciones abiertas" if noticias.get('cerrar_posiciones') else "no abre"
+        lineas.append(
+            f"Noticias: {alcance} de {noticias.get('minutos_antes', 30)} min antes a "
+            f"{noticias.get('minutos_despues', 30)} min después de un evento de impacto "
+            f"{noticias.get('impacto_minimo', 'alto')}"
+            + (f" ({'/'.join(monedas)})" if monedas else ""))
     return lineas
 
 
@@ -1059,11 +1152,31 @@ def codigo_setup(setup, indice=0):
     stop = setup.get('stop_atr', 0.0)
     tp = setup.get('tp_r', 0.0)
     tiempo = setup.get('salida_n_velas', 0)
+    be = setup.get('be_atr', 0.0)
+    trail = setup.get('trailing_atr', 0.0)
     lineas.append(
         f"    riesgo = {riesgo:g}% del equity"
         f" · stop = {f'{stop:g}×ATR' if stop else 'ninguno'}"
         f" · take-profit = {f'{tp:g}R' if tp else 'ninguno'}"
-        f" · salida por tiempo = {f'+{tiempo} velas' if tiempo else 'sin límite'}")
+        f" · salida por tiempo = {f'+{tiempo} velas' if tiempo else 'sin límite'}"
+        f" · {'BE a ' + f'{be:g}×ATR' if be else 'sin BE'}"
+        f" · {'trailing a ' + f'{trail:g}×ATR' if trail else 'sin trailing'}")
+    parciales = setup.get('parciales') or []
+    if parciales:
+        gestion_nombres = {0: 'sin cambios', 1: 'BE', 2: 'trailing', 3: '→ precio parcial anterior'}
+        lineas.append("")
+        lineas.append("  SALIDAS PARCIALES:")
+        for e, ep in enumerate(parciales, 1):
+            pct = ep.get('pct', 100)
+            r = ep.get('r', 0)
+            g = ep.get('gestion', {})
+            g_label = gestion_nombres.get(g.get('tipo', 0), '—')
+            if g.get('tipo') in (1, 2) and g.get('val', 0) > 0:
+                g_label += f' {g["val"]:g}×ATR'
+            trigger = f'cuando el precio ≥ +{r:g} R' if r > 0 else 'a la señal del indicador'
+            lineas.append(
+                f"    Salida {e} ({pct:g}%): {trigger}"
+                f" → gestión: {g_label}")
 
     filtros_lineas = _desc_filtros(setup.get('filtros'))
     if filtros_lineas:
@@ -1085,6 +1198,12 @@ def codigo_setup(setup, indice=0):
                       f"(contra low/high de cada vela)")
     if tp:
         lineas.append(f"    ADEMÁS: take-profit a {tp:g}R del riesgo")
+    if be:
+        lineas.append(f"    ADEMÁS: break-even: mueve el stop al precio de entrada "
+                      f"cuando el precio avanza {be:g}×ATR a favor")
+    if trail:
+        lineas.append(f"    ADEMÁS: trailing stop: el stop sigue al precio a "
+                      f"{trail:g}×ATR del máximo alcanzado")
     if tiempo and plantilla != 'Patrones de velas':
         lineas.append(f"    ADEMÁS: cierre forzoso a +{tiempo} velas de la entrada")
     return "\n".join(lineas)
@@ -1152,6 +1271,8 @@ def describir_setup(setup):
         activos.append('sesión')
     if filtros.get('condiciones_entrada') or filtros.get('condiciones_salida'):
         activos.append('condición')
+    if (filtros.get('noticias') or {}).get('activo'):
+        activos.append('noticias')
     if activos:
         partes.append(f"filtros: {'+'.join(activos)}")
     return " · ".join(partes)

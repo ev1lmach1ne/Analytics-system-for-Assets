@@ -104,7 +104,8 @@ def _sharpe_expansivo(equity, velas_por_anio=None):
 
 def optimizar_setup(df, setup_base, sweep_params, sweep_riesgo, config_global,
                      pct_oos, metrica='sharpe', velas_por_anio=None,
-                     limite_combos=LIMITE_COMBOS_DEFECTO, progreso_cb=None):
+                     limite_combos=LIMITE_COMBOS_DEFECTO, progreso_cb=None,
+                     eventos_noticias=None):
     """Recorre la grid de combinaciones para UN setup, simulando SOLO el
     tramo IS (df.iloc[:corte], corte = dividir_is_oos(len(df), pct_oos)).
 
@@ -112,6 +113,9 @@ def optimizar_setup(df, setup_base, sweep_params, sweep_riesgo, config_global,
     sweep_riesgo: barrido de 'riesgo_pct'/'stop_atr'/'tp_r'/'salida_n_velas'
     del propio setup (mismo formato que sweep_params).
     progreso_cb(i, total): opcional, llamado tras cada combinación simulada.
+    eventos_noticias: tupla de preparar_eventos_noticias() ya resuelta por el
+    llamador (la GUI descarga/cachea una sola vez), o None si el setup no usa
+    el filtro de noticias — se reenvía tal cual a generar_senales_sistema.
 
     Devuelve la lista de resultados — cada uno
     {'params_barridos', 'setup', 'metricas', 'equity_sparkline'} — ordenada
@@ -142,13 +146,16 @@ def optimizar_setup(df, setup_base, sweep_params, sweep_riesgo, config_global,
         setup = dict(setup_base, params=dict(setup_base['params'], **params_combo))
         setup.update(riesgo_combo)
 
-        senales = generar_senales_sistema(df_is, [setup])
+        senales = generar_senales_sistema(df_is, [setup], eventos_noticias)
         config = dict(config_global)
         config['config_por_setup'] = {0: {
             'riesgo_pct': float(setup.get('riesgo_pct', 0.01)),
             'stop_atr': float(setup.get('stop_atr', 0.0)),
             'tp_r': float(setup.get('tp_r', 0.0)),
             'salida_n_velas': int(setup.get('salida_n_velas', 0)),
+            'be_atr': float(setup.get('be_atr', 0.0)),
+            'trailing_atr': float(setup.get('trailing_atr', 0.0)),
+            'parciales': setup.get('parciales', []),
         }}
         resultado = simular(o, h, l, c, senales, config)
         met = calcular_metricas(resultado, 0, n_is, velas_por_anio)

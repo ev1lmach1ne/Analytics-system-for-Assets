@@ -36,7 +36,7 @@ import shutil
 import numpy as np
 import pandas as pd
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QDate, QSize, QEvent, QTimer
-from PyQt6.QtGui import QColor
+from PyQt6.QtGui import QColor, QShortcut
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QComboBox,
     QCheckBox, QScrollArea, QFrame, QTableWidget, QTableWidgetItem,
@@ -44,7 +44,7 @@ from PyQt6.QtWidgets import (
     QSlider, QListWidget, QListWidgetItem, QTabWidget, QFormLayout, QGroupBox,
     QInputDialog, QDateEdit, QSizePolicy, QApplication, QDialog, QProgressBar,
     QButtonGroup, QStyledItemDelegate, QStyle, QStackedWidget, QMenu,
-    QMessageBox,
+    QMessageBox, QRadioButton,
 )
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
@@ -60,7 +60,7 @@ from core.config import (
     tipo_activo_de_csv, PRESETS_FRICCION, TIPO_MAP,
     velas_por_anio as velas_por_anio_config,
     get_selector_recientes, set_selector_recientes,
-    velas_a_tiempo_legible,
+    velas_a_tiempo_legible, get_finnhub_api_key,
 )
 from core.backtest import (
     simular, dividir_is_oos, calcular_metricas, montecarlo, MOTIVOS_SALIDA,
@@ -74,9 +74,11 @@ from core.strategies import (
     ESTRATEGIAS, params_por_defecto, generar_senales_sistema,
     describir, describir_setup, codigo_sistema, defaults_setup, MAX_SETUPS,
     _INDICADORES_REGLA, _OPERADORES_REGLA, _filtros_por_defecto,
-    sma, ema, rsi, atr, bollinger,
+    _mascaras_condiciones_dir,
+    sma, ema, rsi, atr, bollinger, preparar_eventos_noticias,
 )
 from core.candle_patterns import detectar_patrones
+from core.data_providers import economic_calendar
 from gui.widgets.file_explorer import FileExplorer
 from gui.widgets.tf_common import TF_LABELS, parsear_tf_custom, regla_de_tf
 from gui.widgets.lwc_chart import LwcChart, WEBENGINE_OK
@@ -323,6 +325,43 @@ def _cargar_ohlc(csv_path, regla_resample=None):
     return df
 
 
+def _algun_setup_usa_noticias(setups):
+    return any((s.get('filtros') or {}).get('noticias', {}).get('activo') for s in setups)
+
+
+def _resolver_monedas_noticias(setups, csv_path):
+    """Copia superficial de `setups` con filtros.noticias.monedas=None
+    resuelto al instrumento del CSV (heurística por nombre de archivo). No se
+    persiste en el setup original: un sistema guardado sigue siendo portable
+    si se reutiliza con otro activo — la resolución es solo para esta
+    corrida."""
+    nombre_activo = os.path.splitext(os.path.basename(csv_path or ''))[0]
+    resueltas = None
+    out = []
+    for s in setups:
+        noticias = (s.get('filtros') or {}).get('noticias')
+        if noticias and noticias.get('activo') and noticias.get('monedas') is None:
+            if resueltas is None:
+                resueltas = economic_calendar.monedas_de_instrumento(nombre_activo)
+            s2 = dict(s)
+            s2['filtros'] = dict(s['filtros'])
+            s2['filtros']['noticias'] = dict(noticias)
+            s2['filtros']['noticias']['monedas'] = resueltas
+            out.append(s2)
+        else:
+            out.append(s)
+    return out
+
+
+def _cargar_eventos_noticias(df, csv_path):
+    """Descarga/cachea (Finnhub) los eventos económicos que cubren el rango
+    de `df`. Lanza la excepción tal cual si falla (sin API key, red, etc.) —
+    el llamador decide cómo mostrarla."""
+    return economic_calendar.obtener_eventos(
+        df['timestamp'].iloc[0], df['timestamp'].iloc[-1],
+        api_key=get_finnhub_api_key())
+
+
 def _velas_por_anio(df, csv_path=None):
     """Mediana del paso temporal -> nº de velas/año, para anualizar retorno
     y Sharpe. El factor anual usa la sesión real de la clase de activo del
@@ -366,7 +405,19 @@ class _BacktestThread(QThread):
                 self.computed.emit({'error': 'El sistema no tiene ningún setup'})
                 return
 
-            senales = generar_senales_sistema(df, self._setups)
+            df_eventos = None
+            eventos_prep = None
+            setups_senales = self._setups
+            if _algun_setup_usa_noticias(self._setups):
+                try:
+                    df_eventos = _cargar_eventos_noticias(df, self._csv)
+                except Exception as e:
+                    self.computed.emit({'error': f'Calendario económico: {e}'})
+                    return
+                eventos_prep = preparar_eventos_noticias(df_eventos)
+                setups_senales = _resolver_monedas_noticias(self._setups, self._csv)
+
+            senales = generar_senales_sistema(df, setups_senales, eventos_prep)
 
             # config del motor: cuenta global + riesgo/stop/TP/tiempo por setup
             config = dict(self._cfg_global)
@@ -380,8 +431,32 @@ class _BacktestThread(QThread):
                     'stop_atr': float(setup.get('stop_atr', 0.0)),
                     'tp_r': float(setup.get('tp_r', 0.0)),
                     'salida_n_velas': salida_n,
+                    'be_atr': float(setup.get('be_atr', 0.0)),
+                    'trailing_atr': float(setup.get('trailing_atr', 0.0)),
+                    'parciales': setup.get('parciales', []),
                 }
             config['config_por_setup'] = config_por_setup
+
+            # pre-computar máscaras de condiciones de salidas parciales
+            masks_long = []
+            masks_short = []
+            for k, setup in enumerate(self._setups):
+                parciales = setup.get('parciales', [])
+                ml = []
+                ms = []
+                for etapa in parciales:
+                    conds = etapa.get('condiciones')
+                    if conds and len(conds) > 0:
+                        m_l, m_s = _mascaras_condiciones_dir(df, conds)
+                        ml.append(np.asarray(m_l, dtype=bool))
+                        ms.append(np.asarray(m_s, dtype=bool))
+                    else:
+                        ml.append(np.ones(n, dtype=bool))
+                        ms.append(np.ones(n, dtype=bool))
+                masks_long.append(ml if ml else None)
+                masks_short.append(ms if ms else None)
+            config['parciales_masks_long'] = masks_long
+            config['parciales_masks_short'] = masks_short
 
             resultado = simular(df['open'].values, df['high'].values,
                                 df['low'].values, df['close'].values,
@@ -452,6 +527,7 @@ class _BacktestThread(QThread):
                 'config': config,
                 'setups': self._setups,
                 'tf': self._tf_label,
+                'eventos_noticias': df_eventos,
             })
         except Exception as e:
             import traceback
@@ -489,11 +565,22 @@ class _OptimizerThread(QThread):
                 self.terminado.emit({'error': f'Serie demasiado corta ({n} velas)'})
                 return
             velas_anio = _velas_por_anio(df, self._csv)
+            setup_base = self._setup_base
+            eventos_prep = None
+            if _algun_setup_usa_noticias([setup_base]):
+                try:
+                    df_eventos = _cargar_eventos_noticias(df, self._csv)
+                except Exception as e:
+                    self.terminado.emit({'error': f'Calendario económico: {e}'})
+                    return
+                eventos_prep = preparar_eventos_noticias(df_eventos)
+                setup_base = _resolver_monedas_noticias([setup_base], self._csv)[0]
             resultados = optimizar_setup(
-                df, self._setup_base, self._sweep_params, self._sweep_riesgo,
+                df, setup_base, self._sweep_params, self._sweep_riesgo,
                 self._cfg_global, self._pct_oos, metrica=self._metrica,
                 velas_por_anio=velas_anio,
-                progreso_cb=lambda i, total: self.progreso.emit(i, total))
+                progreso_cb=lambda i, total: self.progreso.emit(i, total),
+                eventos_noticias=eventos_prep)
             self.terminado.emit({
                 'resultados': resultados,
                 'metrica': self._metrica,
@@ -725,6 +812,8 @@ def _setup_por_defecto(plantilla='Cruce de medias'):
          'params': params_por_defecto(plantilla),
          'riesgo_pct': 0.01, 'stop_atr': 2.0, 'tp_r': 0.0,
          'salida_n_velas': 0, 'edge': False,
+         'be_atr': 0.0, 'trailing_atr': 0.0,
+         'parciales': [],   # lista de etapas de salida parcial
          'filtros': _filtros_por_defecto()}
     # la plantilla puede recomendar su propio stop/tp por defecto (p.ej. el
     # cruce de medias sale por cruce contrario: sin stop ATR)
@@ -744,6 +833,8 @@ _MAPA_SESION = {
 }
 _MAPA_REGIMEN_INV = {v: k for k, v in _MAPA_REGIMEN.items()}
 _MAPA_SESION_INV = {v: k for k, v in _MAPA_SESION.items()}
+_MAPA_IMPACTO_NOTICIAS = {'Bajo': 'bajo', 'Medio': 'medio', 'Alto': 'alto'}
+_MAPA_IMPACTO_NOTICIAS_INV = {v: k for k, v in _MAPA_IMPACTO_NOTICIAS.items()}
 
 # dirección de una condición de filtro (EditorCondiciones): a qué lado(s) se
 # aplica. 'Ambas' es el valor por defecto y restringe long y short por igual
@@ -754,8 +845,15 @@ _MAPA_DIRECCION_INV = {v: k for k, v in _MAPA_DIRECCION.items()}
 
 
 class TemplateCard(QFrame):
-    """Tarjeta visual seleccionable para elegir plantilla o sistema."""
+    """Tarjeta visual seleccionable para elegir plantilla o sistema.
+    `clicked` se emite con un solo click (usado por el diálogo «Elegir…» y
+    por Favoritos/Guardados, donde un click ya reemplaza el sistema como
+    acción deliberada de un solo paso). `activado` se emite solo con doble
+    click o Enter/Return con la tarjeta enfocada — usado donde un click
+    accidental no debe disparar la acción (recientes de Predeterminados,
+    que AÑADEN un setup en vez de reemplazar)."""
     clicked = pyqtSignal(str)
+    activado = pyqtSignal(str)
 
     def __init__(self, nombre, desc_corta, color, parent=None, categoria=None):
         super().__init__(parent)
@@ -766,6 +864,7 @@ class TemplateCard(QFrame):
         self.setMinimumWidth(130)
         self.setMinimumHeight(52)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
         vlay = QVBoxLayout(self)
         vlay.setContentsMargins(10, 6, 10, 6)
@@ -801,6 +900,10 @@ class TemplateCard(QFrame):
                 f"  border: 2px solid {c};"
                 f"  border-left: 5px solid {c};"
                 f"  border-radius: 6px;"
+                f"}}"
+                f"TemplateCard:focus {{"
+                f"  border: 2px dashed #4fc3f7;"
+                f"  border-left: 5px solid {c};"
                 f"}}")
         else:
             self.setStyleSheet(
@@ -814,12 +917,28 @@ class TemplateCard(QFrame):
                 f"  background-color: #162545;"
                 f"  border: 1px solid #3a5a8a;"
                 f"  border-left: 5px solid {c};"
+                f"}}"
+                f"TemplateCard:focus {{"
+                f"  border: 2px dashed #4fc3f7;"
+                f"  border-left: 5px solid {c};"
                 f"}}")
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
+            self.setFocus()
             self.clicked.emit(self._nombre)
         super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.activado.emit(self._nombre)
+        super().mouseDoubleClickEvent(event)
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self.activado.emit(self._nombre)
+        else:
+            super().keyPressEvent(event)
 
     def setSelected(self, selected):
         self._selected = selected
@@ -913,6 +1032,13 @@ class SelectorTarjetas(QWidget):
     def seleccion(self):
         return self._actual
 
+    def limpiar_seleccion(self):
+        """Quita el resaltado de la tarjeta actual sin emitir señal (se usa
+        cuando otro selector pasa a ser la fuente del sistema activo)."""
+        if self._actual is not None:
+            self._actual = None
+            self._rebuild()
+
     def set_seleccion(self, nombre, emitir=False):
         if nombre not in self._opciones or nombre == self._actual:
             if emitir and nombre in self._opciones:
@@ -959,7 +1085,9 @@ class SelectorTarjetas(QWidget):
 
         for nombre in self._recientes:
             card = self._make_card(nombre, False)
-            card.clicked.connect(lambda n: self.set_seleccion(n, emitir=True))
+            # doble click o Enter (no un solo click) para evitar añadir un
+            # setup por un click accidental al pasar por la tarjeta
+            card.activado.connect(lambda n: self.set_seleccion(n, emitir=True))
             self._lay.addWidget(card)
 
         btn = QPushButton("Elegir…")
@@ -1258,6 +1386,62 @@ class OptimizadorWidget(QWidget):
             "en Patrones de velas, 0 usa el lag de salida del patrón)")
         self.sp_tiempo.valueChanged.connect(self._guardar_setup_actual)
         f_set.addRow("Salida por tiempo (velas):", self.sp_tiempo)
+
+        # ── gestión de posición: break-even + trailing stop ──
+        self.sp_be = QDoubleSpinBox()
+        self.sp_be.setRange(0, 10)
+        self.sp_be.setDecimals(1)
+        self.sp_be.setValue(0.0)
+        self.sp_be.setSpecialValueText("Sin break-even")
+        self.sp_be.setToolTip(
+            "Break-even: mueve el stop al precio de entrada cuando el precio\n"
+            "avanza esta cantidad de ATR a favor.")
+        self.sp_be.valueChanged.connect(self._guardar_setup_actual)
+        f_set.addRow("Break-even (× ATR):", self.sp_be)
+        self.sp_trailing = QDoubleSpinBox()
+        self.sp_trailing.setRange(0, 10)
+        self.sp_trailing.setDecimals(1)
+        self.sp_trailing.setValue(0.0)
+        self.sp_trailing.setSpecialValueText("Sin trailing")
+        self.sp_trailing.setToolTip(
+            "Trailing stop: el stop sigue al precio a esta distancia (×ATR)\n"
+            "del máximo alcanzado. Solo se mueve a favor, nunca en contra.")
+        self.sp_trailing.valueChanged.connect(self._guardar_setup_actual)
+        f_set.addRow("Trailing stop (× ATR):", self.sp_trailing)
+
+        # ── entradas ──
+        grp_entradas = QGroupBox("Entradas del setup")
+        lay_ent = QVBoxLayout(grp_entradas)
+        self.editor_cond_entrada = EditorCondiciones("")
+        self.editor_cond_entrada.tabla.cellChanged.connect(
+            lambda *_: self._guardar_setup_actual())
+        lay_ent.addWidget(self.editor_cond_entrada)
+        f_set.addRow(grp_entradas)
+
+        # ── salida del setup ──
+        grp_parciales = QGroupBox("Salida del setup")
+        grp_parciales.setToolTip(
+            "Salidas escalonadas: cada etapa cierra un % de la posición cuando\n"
+            "el precio alcanza su R:R configurado. Tras cada etapa, se puede\n"
+            "activar BE o trailing que protege el resto de la posición.\n"
+            "Ejemplo: Etapa 1: 30% a 1.5R + BE  ATR → Etapa 2: 40% a 2R  + trail 0.5 ATR → resto a señal.")
+        lay_parc = QVBoxLayout(grp_parciales)
+        self.tabla_parciales = QTableWidget(0, 4)
+        self.tabla_parciales.setHorizontalHeaderLabels(["%", "R:R", "Condiciones", "Gestión"])
+        self.tabla_parciales.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.tabla_parciales.setMaximumHeight(120)
+        self.tabla_parciales.cellChanged.connect(self._guardar_setup_actual)
+        lay_parc.addWidget(self.tabla_parciales)
+        fila_p = QHBoxLayout()
+        for texto, slot in [("+ Etapa", self._add_etapa_parcial),
+                            ("− Quitar", self._del_etapa_parcial)]:
+            b = QPushButton(texto)
+            b.clicked.connect(slot)
+            fila_p.addWidget(b)
+        fila_p.addStretch()
+        lay_parc.addLayout(fila_p)
+        f_set.addRow(grp_parciales)
+
         # etiquetas de stop/TP: se oscurecen junto al campo en modo edge
         self._lbl_stop = f_set.labelForField(self.sp_stop)
         self._lbl_tp = f_set.labelForField(self.sp_tp)
@@ -1314,15 +1498,52 @@ class OptimizadorWidget(QWidget):
         self._fila_horas_widget = QWidget()
         self._fila_horas_widget.setLayout(fila_horas)
         f_filtros.addRow("Horas:", self._fila_horas_widget)
+        self._lbl_horas = f_filtros.labelForField(self._fila_horas_widget)
+        if self._lbl_horas is not None:
+            self._lbl_horas.setVisible(False)
 
-        self.editor_cond_entrada = EditorCondiciones("Condiciones extra de ENTRADA (AND)")
-        self.editor_cond_entrada.tabla.cellChanged.connect(
-            lambda *_: self._guardar_setup_actual())
-        f_filtros.addRow(self.editor_cond_entrada)
-        self.editor_cond_salida = EditorCondiciones("Condiciones extra de SALIDA (AND)")
-        self.editor_cond_salida.tabla.cellChanged.connect(
-            lambda *_: self._guardar_setup_actual())
-        f_filtros.addRow(self.editor_cond_salida)
+        self.chk_noticias = QCheckBox("Evitar noticias")
+        self.chk_noticias.setToolTip(
+            "No abre posiciones nuevas dentro de la ventana configurada "
+            "alrededor de eventos económicos históricos (requiere una API "
+            "key de Finnhub en Ajustes).")
+        self.chk_noticias.toggled.connect(self._on_noticias_toggled)
+        f_filtros.addRow(self.chk_noticias)
+
+        fila_noticias = QHBoxLayout()
+        self.sp_noticias_antes = QSpinBox()
+        self.sp_noticias_antes.setRange(0, 1440)
+        self.sp_noticias_antes.setValue(30)
+        self.sp_noticias_antes.setSuffix(" min")
+        self.sp_noticias_despues = QSpinBox()
+        self.sp_noticias_despues.setRange(0, 1440)
+        self.sp_noticias_despues.setValue(30)
+        self.sp_noticias_despues.setSuffix(" min")
+        self.sp_noticias_antes.valueChanged.connect(self._guardar_setup_actual)
+        self.sp_noticias_despues.valueChanged.connect(self._guardar_setup_actual)
+        fila_noticias.addWidget(QLabel("antes"))
+        fila_noticias.addWidget(self.sp_noticias_antes)
+        fila_noticias.addWidget(QLabel("después"))
+        fila_noticias.addWidget(self.sp_noticias_despues)
+        fila_noticias.addWidget(QLabel("impacto mínimo"))
+        self.cmb_noticias_impacto = QComboBox()
+        self.cmb_noticias_impacto.addItems(['Bajo', 'Medio', 'Alto'])
+        self.cmb_noticias_impacto.setCurrentText('Alto')
+        self.cmb_noticias_impacto.currentTextChanged.connect(self._on_noticias_impacto_changed)
+        fila_noticias.addWidget(self.cmb_noticias_impacto)
+        self.chk_noticias_cerrar = QCheckBox("Cerrar posiciones abiertas antes de la noticia")
+        self.chk_noticias_cerrar.setToolTip(
+            "Además de bloquear entradas nuevas, cierra cualquier posición "
+            "abierta de este setup al entrar en la ventana previa al evento "
+            "(por defecto solo se bloquean entradas, igual que el resto de "
+            "filtros del constructor).")
+        self.chk_noticias_cerrar.toggled.connect(self._guardar_setup_actual)
+        fila_noticias.addWidget(self.chk_noticias_cerrar)
+        fila_noticias.addStretch()
+        self._fila_noticias_widget = QWidget()
+        self._fila_noticias_widget.setLayout(fila_noticias)
+        f_filtros.addRow("Ventana:", self._fila_noticias_widget)
+        self.cmb_noticias_impacto.setToolTip(economic_calendar.DESCRIPCION_IMPACTO['alto'])
 
         f_set.addRow(grp_filtros)
         lay.addWidget(self.grp_setup)
@@ -1735,6 +1956,17 @@ class OptimizadorWidget(QWidget):
             self.sp_stop.setValue(s['stop_atr'])
             self.sp_tp.setValue(s['tp_r'])
             self.sp_tiempo.setValue(s['salida_n_velas'])
+            self.sp_be.setValue(s.get('be_atr', 0.0))
+            self.sp_trailing.setValue(s.get('trailing_atr', 0.0))
+            # migrar viejas condiciones_salida a parciales
+            parciales = s.get('parciales', [])
+            if not parciales:
+                old_conds = (s.get('filtros') or {}).get('condiciones_salida')
+                if old_conds and len(old_conds) > 0:
+                    parciales = [{'pct': 100, 'r': 0.0, 'condiciones': list(old_conds),
+                                  'gestion': {'tipo': 0, 'val': 0.0}}]
+                    s['parciales'] = parciales
+            self._cargar_parciales_tabla(parciales)
             edge = bool(s.get('edge', False))
             self.btn_edge.setChecked(edge)
             self._bloquear_stop_tp(edge)
@@ -1750,7 +1982,13 @@ class OptimizadorWidget(QWidget):
             self.sp_hora_ini.setValue(filtros.get('sesion', {}).get('hora_inicio', 0))
             self.sp_hora_fin.setValue(filtros.get('sesion', {}).get('hora_fin', 0))
             self.editor_cond_entrada.cargar_condiciones(filtros.get('condiciones_entrada'))
-            self.editor_cond_salida.cargar_condiciones(filtros.get('condiciones_salida'))
+            noticias = filtros.get('noticias') or {}
+            self.chk_noticias.setChecked(noticias.get('activo', False))
+            self.sp_noticias_antes.setValue(noticias.get('minutos_antes', 30))
+            self.sp_noticias_despues.setValue(noticias.get('minutos_despues', 30))
+            self.cmb_noticias_impacto.setCurrentText(
+                _MAPA_IMPACTO_NOTICIAS_INV.get(noticias.get('impacto_minimo', 'alto'), 'Alto'))
+            self.chk_noticias_cerrar.setChecked(noticias.get('cerrar_posiciones', False))
         finally:
             self._cargando = False
         self._actualizar_visibilidad_filtros()
@@ -1773,6 +2011,12 @@ class OptimizadorWidget(QWidget):
             self.sp_stop.setValue(s['stop_atr'])
             self.sp_tp.setValue(s['tp_r'])
             self.sp_tiempo.setValue(s['salida_n_velas'])
+            s['be_atr'] = 0.0
+            s['trailing_atr'] = 0.0
+            self.sp_be.setValue(0.0)
+            self.sp_trailing.setValue(0.0)
+            s['parciales'] = []
+            self._cargar_parciales_tabla([])
             # el modo edge sobrevive al cambio de plantilla: stop/TP siguen a 0
             if self.btn_edge.isChecked():
                 self.sp_stop.setValue(0.0)
@@ -1841,27 +2085,34 @@ class OptimizadorWidget(QWidget):
         return p
 
     def _bloquear_stop_tp(self, bloquear):
-        """Oscurece (deshabilita) los campos de stop y TP y sus etiquetas —
-        el estilo :disabled de STYLE_BACKTEST los pinta apagados."""
-        for w in (self.sp_stop, self.sp_tp, self._lbl_stop, self._lbl_tp):
+        """Oscurece (deshabilita) los campos de stop/TP/BE/trailing y sus
+        etiquetas — el estilo :disabled de STYLE_BACKTEST los pinta apagados."""
+        for w in (self.sp_stop, self.sp_tp, self.sp_be, self.sp_trailing,
+                  self._lbl_stop, self._lbl_tp):
             if w is not None:
                 w.setEnabled(not bloquear)
 
     @_no_crash
     def _on_edge_toggled(self, on):
-        """Modo edge: prueba la señal desnuda — bloquea stop y TP a 0 (el
-        motor los interpreta como desactivados) y al salir restaura los
+        """Modo edge: prueba la señal desnuda — bloquea stop/TP/BE/trailing a
+        0 (el motor los interpreta como desactivados) y al salir restaura los
         valores que tenía el setup."""
         s = None if self._cargando else self._setup_actual()
         if on:
             if s is not None:
                 s['edge_prev_stop'] = self.sp_stop.value()
                 s['edge_prev_tp'] = self.sp_tp.value()
+                s['edge_prev_be'] = self.sp_be.value()
+                s['edge_prev_trail'] = self.sp_trailing.value()
             self.sp_stop.setValue(0.0)
             self.sp_tp.setValue(0.0)
+            self.sp_be.setValue(0.0)
+            self.sp_trailing.setValue(0.0)
         elif s is not None:
             self.sp_stop.setValue(s.get('edge_prev_stop', s.get('stop_atr', 0.0)))
             self.sp_tp.setValue(s.get('edge_prev_tp', s.get('tp_r', 0.0)))
+            self.sp_be.setValue(s.get('edge_prev_be', s.get('be_atr', 0.0)))
+            self.sp_trailing.setValue(s.get('edge_prev_trail', s.get('trailing_atr', 0.0)))
         self._bloquear_stop_tp(on)
         self._guardar_setup_actual()
 
@@ -1894,7 +2145,13 @@ class OptimizadorWidget(QWidget):
 
     def _actualizar_visibilidad_filtros(self):
         self.sp_regimen_periodo.setEnabled(self.cmb_regimen.currentText() != 'Ninguno')
-        self._fila_horas_widget.setVisible(self.cmb_sesion.currentText() == 'Personalizada')
+        horas_visible = self.cmb_sesion.currentText() == 'Personalizada'
+        self._fila_horas_widget.setVisible(horas_visible)
+        if self._lbl_horas is not None:
+            self._lbl_horas.setVisible(horas_visible)
+        activo = self.chk_noticias.isChecked()
+        self._fila_noticias_widget.setEnabled(activo)
+        self.chk_noticias_cerrar.setEnabled(activo)
 
     @_no_crash
     def _on_regimen_changed(self, _texto):
@@ -1904,6 +2161,233 @@ class OptimizadorWidget(QWidget):
     @_no_crash
     def _on_sesion_changed(self, _texto):
         self._actualizar_visibilidad_filtros()
+        self._guardar_setup_actual()
+
+    @_no_crash
+    def _on_noticias_toggled(self, _activo):
+        self._actualizar_visibilidad_filtros()
+        self._guardar_setup_actual()
+
+    @_no_crash
+    def _on_noticias_impacto_changed(self, texto):
+        self.cmb_noticias_impacto.setToolTip(
+            economic_calendar.DESCRIPCION_IMPACTO.get(
+                _MAPA_IMPACTO_NOTICIAS.get(texto, 'alto'), ''))
+        self._guardar_setup_actual()
+
+    # ── salidas parciales ──
+    def _add_etapa_parcial(self):
+        s = self._setup_actual()
+        if s is None:
+            return
+        parciales = s.setdefault('parciales', [])
+        parciales.append({'pct': 50.0, 'r': 2.0, 'condiciones': [], 'gestion': {'tipo': 0, 'val': 0.0}})
+        self._cargar_parciales_tabla(parciales)
+
+    def _del_etapa_parcial(self):
+        s = self._setup_actual()
+        if s is None:
+            return
+        fila = self.tabla_parciales.currentRow()
+        parciales = s.get('parciales', [])
+        if 0 <= fila < len(parciales):
+            parciales.pop(fila)
+            self._cargar_parciales_tabla(parciales)
+        self._guardar_setup_actual()
+
+    def _abrir_dialogo_condiciones(self, fila):
+        s = self._setup_actual()
+        if s is None:
+            return
+        parciales = s.setdefault('parciales', [])
+        while len(parciales) <= fila:
+            parciales.append({'pct': 50.0, 'r': 2.0, 'condiciones': [], 'gestion': {'tipo': 0, 'val': 0.0}})
+        conds = list(parciales[fila].get('condiciones', []))
+
+        dlg = QDialog(self, Qt.WindowType.Popup)
+        dlg.setMinimumSize(650, 420)
+        dlg.setStyleSheet(
+            "QDialog { background-color: #0d1424; border: 2px solid #253a60; border-radius: 6px; }")
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(10, 10, 10, 10)
+        editor = EditorCondiciones(f'Disparador de la Salida {fila + 1} (todas AND)')
+        editor.cargar_condiciones(conds)
+        lay.addWidget(editor)
+        fila_btn = QHBoxLayout()
+        fila_btn.addStretch()
+        btn_ok = QPushButton('Aceptar')
+        btn_ok.clicked.connect(dlg.accept)
+        btn_cancel = QPushButton('Cancelar')
+        btn_cancel.clicked.connect(dlg.reject)
+        fila_btn.addWidget(btn_cancel)
+        fila_btn.addWidget(btn_ok)
+        lay.addLayout(fila_btn)
+
+        QShortcut(Qt.Key.Key_Return, dlg, dlg.accept)
+        QShortcut(Qt.Key.Key_Enter, dlg, dlg.accept)
+
+        btn = self.tabla_parciales.cellWidget(fila, 2)
+        if btn:
+            pos = btn.mapToGlobal(btn.rect().bottomLeft())
+            dlg.move(pos)
+
+        if dlg.exec():
+            parciales[fila]['condiciones'] = editor.condiciones()
+            self._cargar_parciales_tabla(parciales)
+            self._guardar_setup_actual()
+
+    def _cargar_parciales_tabla(self, parciales):
+        self.tabla_parciales.blockSignals(True)
+        self.tabla_parciales.setRowCount(0)
+        for e, ep in enumerate(parciales or []):
+            self.tabla_parciales.insertRow(e)
+            self.tabla_parciales.setItem(e, 0,
+                QTableWidgetItem(f'{ep.get("pct", 100):.0f}%'))
+            self.tabla_parciales.setItem(e, 1,
+                QTableWidgetItem(f'{ep.get("r", 0):.1f} R'))
+            # botón de condiciones
+            conds = ep.get('condiciones', [])
+            n_cond = len(conds)
+            btn_cond = QPushButton(f'{n_cond} cond' if n_cond else '+ Cond')
+            btn_cond.setStyleSheet(
+                'QPushButton { font-size: 9px; padding: 2px 6px; color: #4fc3f7; }'
+                if n_cond else
+                'QPushButton { font-size: 9px; padding: 2px 6px; color: #5a7a9a; }')
+            btn_cond.clicked.connect(lambda _, fila=e: self._abrir_dialogo_condiciones(fila))
+            self.tabla_parciales.setCellWidget(e, 2, btn_cond)
+            # botón de gestión
+            g = ep.get('gestion', {})
+            tipo = g.get('tipo', 0)
+            val = g.get('val', 0.0)
+            if tipo == 1:
+                label = f'BE {val:.1f}'
+            elif tipo == 2:
+                label = f'Trail {val:.1f}'
+            elif tipo == 3:
+                label = '-> Parcial'
+            else:
+                label = '+ Gestion'
+            btn_gest = QPushButton(label)
+            btn_gest.setStyleSheet(
+                'QPushButton { font-size: 9px; padding: 2px 6px; color: #4fc3f7; }'
+                if tipo != 0 else
+                'QPushButton { font-size: 9px; padding: 2px 6px; color: #5a7a9a; }')
+            btn_gest.clicked.connect(lambda _, fila=e: self._abrir_dialogo_gestion(fila))
+            self.tabla_parciales.setCellWidget(e, 3, btn_gest)
+        self.tabla_parciales.blockSignals(False)
+
+    def _leer_parciales_tabla(self):
+        s = self._setup_actual()
+        if s is None:
+            return []
+        parciales = []
+        for e in range(self.tabla_parciales.rowCount()):
+            try:
+                pct_str = self.tabla_parciales.item(e, 0).text().replace('%', '').strip()
+                r_str = self.tabla_parciales.item(e, 1).text().replace('R', '').strip()
+                pct = float(pct_str) if pct_str else 100.0
+                r = float(r_str) if r_str else 0.0
+                stored = s.get('parciales', [])
+                if e < len(stored):
+                    g = dict(stored[e].get('gestion', {'tipo': 0, 'val': 0.0}))
+                    conds = list(stored[e].get('condiciones', []))
+                else:
+                    g = {'tipo': 0, 'val': 0.0}
+                    conds = []
+                parciales.append({'pct': pct, 'r': r, 'condiciones': conds, 'gestion': g})
+            except (ValueError, AttributeError, IndexError):
+                pass
+        return parciales
+
+    def _abrir_dialogo_gestion(self, fila):
+        s = self._setup_actual()
+        if s is None:
+            return
+        parciales = s.setdefault('parciales', [])
+        while len(parciales) <= fila:
+            parciales.append({'pct': 50.0, 'r': 2.0, 'gestion': {'tipo': 0, 'val': 0.0}})
+        g_actual = parciales[fila].get('gestion', {'tipo': 0, 'val': 0.0})
+
+        dlg = QDialog(self, Qt.WindowType.Popup)
+        dlg.setStyleSheet(
+            "QDialog { background-color: #0d1424; border: 2px solid #253a60; border-radius: 6px; }")
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(12, 12, 12, 12)
+        grupo = QButtonGroup(dlg)
+
+        rb_none = QRadioButton('Sin gestión')
+        rb_be = QRadioButton('Break-even a')
+        rb_trail = QRadioButton('Trailing stop a')
+        rb_prev = QRadioButton('Mover al precio de la parcial anterior')
+
+        sp_val = QDoubleSpinBox()
+        sp_val.setRange(0.0, 10.0)
+        sp_val.setDecimals(1)
+        sp_val.setValue(0.5)
+        sp_val.setSuffix(' ×ATR')
+
+        for rb in (rb_none, rb_be, rb_trail, rb_prev):
+            grupo.addButton(rb)
+        g_tipo = g_actual.get('tipo', 0)
+        if g_tipo == 1:
+            rb_be.setChecked(True)
+            sp_val.setValue(g_actual.get('val', 0.5))
+        elif g_tipo == 2:
+            rb_trail.setChecked(True)
+            sp_val.setValue(g_actual.get('val', 0.5))
+        elif g_tipo == 3:
+            rb_prev.setChecked(True)
+        else:
+            rb_none.setChecked(True)
+
+        def _toggle_val():
+            sp_val.setEnabled(rb_be.isChecked() or rb_trail.isChecked())
+        rb_be.toggled.connect(lambda _: _toggle_val())
+        rb_trail.toggled.connect(lambda _: _toggle_val())
+        _toggle_val()
+
+        lay.addWidget(rb_none)
+        fila_be = QHBoxLayout()
+        fila_be.addWidget(rb_be)
+        fila_be.addWidget(sp_val)
+        fila_be.addStretch()
+        lay.addLayout(fila_be)
+        fila_tr = QHBoxLayout()
+        fila_tr.addWidget(rb_trail)
+        fila_tr.addWidget(sp_val)
+        fila_tr.addStretch()
+        lay.addLayout(fila_tr)
+        lay.addWidget(rb_prev)
+
+        fila_btn = QHBoxLayout()
+        fila_btn.addStretch()
+        btn_ok = QPushButton('Aceptar')
+        btn_ok.setDefault(True)
+        btn_ok.clicked.connect(dlg.accept)
+        btn_cancel = QPushButton('Cancelar')
+        btn_cancel.clicked.connect(dlg.reject)
+        fila_btn.addWidget(btn_cancel)
+        fila_btn.addWidget(btn_ok)
+        lay.addLayout(fila_btn)
+
+        btn = self.tabla_parciales.cellWidget(fila, 3)
+        if btn:
+            pos = btn.mapToGlobal(btn.rect().bottomLeft())
+            dlg.move(pos)
+
+        if not dlg.exec():
+            return
+
+        if rb_be.isChecked():
+            parciales[fila]['gestion'] = {'tipo': 1, 'val': sp_val.value()}
+        elif rb_trail.isChecked():
+            parciales[fila]['gestion'] = {'tipo': 2, 'val': sp_val.value()}
+        elif rb_prev.isChecked():
+            parciales[fila]['gestion'] = {'tipo': 3, 'val': 0.0}
+        else:
+            parciales[fila]['gestion'] = {'tipo': 0, 'val': 0.0}
+
+        self._cargar_parciales_tabla(parciales)
         self._guardar_setup_actual()
 
     @_no_crash
@@ -1920,6 +2404,9 @@ class OptimizadorWidget(QWidget):
         s['stop_atr'] = self.sp_stop.value()
         s['tp_r'] = self.sp_tp.value()
         s['salida_n_velas'] = self.sp_tiempo.value()
+        s['be_atr'] = self.sp_be.value()
+        s['trailing_atr'] = self.sp_trailing.value()
+        s['parciales'] = self._leer_parciales_tabla()
         s['edge'] = self.btn_edge.isChecked()
         elegidos = [i for i, chk in enumerate(self._chk_dias) if chk.isChecked()]
         dias_disponibles = self._dias_disponibles or set(range(7))
@@ -1935,7 +2422,15 @@ class OptimizadorWidget(QWidget):
                 'hora_fin': self.sp_hora_fin.value(),
             },
             'condiciones_entrada': self.editor_cond_entrada.condiciones(),
-            'condiciones_salida': self.editor_cond_salida.condiciones(),
+            'condiciones_salida': [],  # ahora en parciales[etapa]
+            'noticias': {
+                'activo': self.chk_noticias.isChecked(),
+                'minutos_antes': self.sp_noticias_antes.value(),
+                'minutos_despues': self.sp_noticias_despues.value(),
+                'impacto_minimo': _MAPA_IMPACTO_NOTICIAS[self.cmb_noticias_impacto.currentText()],
+                'monedas': None,
+                'cerrar_posiciones': self.chk_noticias_cerrar.isChecked(),
+            },
         }
         self._refresh_item_actual()
         self._refresh_definicion()
@@ -2040,13 +2535,23 @@ class OptimizadorWidget(QWidget):
 
     @_no_crash
     def _on_sistema_card_clicked(self, nombre):
-        """Carga un sistema predeterminado elegido en el selector."""
+        """Añade un setup nuevo (plantilla predeterminada elegida) al sistema
+        actual — no reemplaza los setups existentes."""
+        if len(self._setups) >= MAX_SETUPS:
+            self.lbl_estado.setText(f"Máximo {MAX_SETUPS} setups por sistema")
+            return
+        self._guardar_setup_actual()
         s = _setup_por_defecto(nombre)
         s['nombre'] = nombre
-        self._setups = [s]
+        self._setups.append(s)
         self._guardado_cargado = None
-        self.lbl_estado.setText(f"Sistema predeterminado «{nombre}» cargado")
-        self._refresh_lista(seleccionar=0)
+        self._favorito_cargado = None
+        for card in self._guardadas_cards.values():
+            card.setSelected(False)
+        for card in self._favoritos_cards.values():
+            card.setSelected(False)
+        self.lbl_estado.setText(f"Setup «{nombre}» añadido al sistema")
+        self._refresh_lista(seleccionar=len(self._setups) - 1)
 
     @_no_crash
     def _cargar_guardado(self, _idx=None):
@@ -2074,6 +2579,11 @@ class OptimizadorWidget(QWidget):
         self._guardado_cargado = valor
         for n, card in self._guardadas_cards.items():
             card.setSelected(n == valor)
+        # Deseleccionar favoritos y predeterminados: solo uno activo a la vez
+        self._favorito_cargado = None
+        for n, card in self._favoritos_cards.items():
+            card.setSelected(False)
+        self._selector_sistema.limpiar_seleccion()
         self.lbl_estado.setText(f"Sistema «{valor}» cargado")
         self._refresh_lista(seleccionar=0)
 
@@ -2170,6 +2680,11 @@ class OptimizadorWidget(QWidget):
         self._favorito_cargado = valor
         for n, card in self._favoritos_cards.items():
             card.setSelected(n == valor)
+        # Deseleccionar guardados y predeterminados: solo uno activo a la vez
+        self._guardado_cargado = None
+        for n, card in self._guardadas_cards.items():
+            card.setSelected(False)
+        self._selector_sistema.limpiar_seleccion()
         self.lbl_estado.setText(f"Favorito «{valor}» cargado")
         self._refresh_lista(seleccionar=0)
 
@@ -2181,6 +2696,11 @@ class OptimizadorWidget(QWidget):
         self._setups = [s]
         self._guardado_cargado = None
         self._favorito_cargado = None
+        for card in self._guardadas_cards.values():
+            card.setSelected(False)
+        for card in self._favoritos_cards.values():
+            card.setSelected(False)
+        self._selector_sistema.limpiar_seleccion()
         self.lbl_estado.setText(
             "Sistema nuevo: define las reglas del setup y añade más si quieres")
         self._refresh_lista(seleccionar=0)
@@ -2285,6 +2805,8 @@ class DialogoOptimizacion(QDialog):
         ('stop_atr', 'Stop (× ATR)', 'float', 1.0, 0.0, 20.0),
         ('tp_r', 'Take-profit (R)', 'float', 1.0, 0.0, 20.0),
         ('salida_n_velas', 'Salida por tiempo (velas)', 'int', 1.0, 0, 10000),
+        ('be_atr', 'Break-even (× ATR)', 'float', 1.0, 0.0, 10.0),
+        ('trailing_atr', 'Trailing stop (× ATR)', 'float', 1.0, 0.0, 10.0),
     ]
     # rango de barrido prellenado para campos concretos (en unidades del
     # widget): min, max, paso — el riesgo se explora de 0.25% a 2% en saltos
@@ -2632,6 +3154,15 @@ class ResultadosWidget(QWidget):
             "de cada operación (recorrido del trade).")
         self.chk_trayecto.toggled.connect(self._toggle_trayecto)
         fila_zoom.addWidget(self.chk_trayecto)
+        self.chk_noticias = QCheckBox("Mostrar noticias")
+        self.chk_noticias.setToolTip(
+            "Dibuja una línea vertical gris discontinua en cada evento "
+            "económico histórico dentro del rango del backtest (solo en la "
+            "vista Moderna).")
+        self.chk_noticias.toggled.connect(self._toggle_noticias)
+        if not WEBENGINE_OK:
+            self.chk_noticias.setEnabled(False)
+        fila_zoom.addWidget(self.chk_noticias)
         # conmutador de vista: matplotlib (Clásica) <-> Lightweight Charts (Moderna)
         self.btn_vista = QPushButton("🖥 Vista: Clásica")
         self.btn_vista.setCheckable(True)
@@ -3027,14 +3558,17 @@ class ResultadosWidget(QWidget):
 
     def _mostrar_lwc(self, payload):
         """Repinta la vista LWC reflejando los mismos checkboxes (trayecto/
-        stop-loss) que la vista clásica, para que ambas se vean coherentes al
-        conmutar entre ellas."""
+        stop-loss/noticias) que la vista clásica, para que ambas se vean
+        coherentes al conmutar entre ellas."""
         self.lwc.mostrar(
             payload,
             mostrar_trayecto=getattr(self, 'chk_trayecto', None) is not None
                              and self.chk_trayecto.isChecked(),
             mostrar_stop=getattr(self, 'chk_stop', None) is not None
-                        and self.chk_stop.isChecked())
+                        and self.chk_stop.isChecked(),
+            mostrar_noticias=getattr(self, 'chk_noticias', None) is not None
+                             and self.chk_noticias.isChecked(),
+            eventos_noticias=payload.get('eventos_noticias'))
 
     def _redibujar_principal_conservando_zoom(self):
         """Redibuja el gráfico principal preservando el rango temporal (zoom)
@@ -3050,6 +3584,9 @@ class ResultadosWidget(QWidget):
             self._mostrar_lwc(self._payload)
 
     def _toggle_trayecto(self, _=False):
+        self._redibujar_principal_conservando_zoom()
+
+    def _toggle_noticias(self, _=False):
         self._redibujar_principal_conservando_zoom()
 
     def _trades_visibles(self, x0, x1):

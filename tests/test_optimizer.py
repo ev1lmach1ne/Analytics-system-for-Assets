@@ -9,6 +9,7 @@ from core.optimizer import (
     fiabilidad_estadistica, _sharpe_expansivo, N_PUNTOS_SPARKLINE,
     MIN_BARRAS_SHARPE,
 )
+from core.strategies import preparar_eventos_noticias
 
 
 CONFIG_GLOBAL = {'capital_inicial': 10000.0, 'comision_pct': 0.0,
@@ -127,6 +128,34 @@ def test_optimizar_setup_respeta_limite_combos():
     with pytest.raises(ValueError):
         optimizar_setup(df, _setup_cruce(), sweep_params, {}, CONFIG_GLOBAL,
                         pct_oos=0.30, limite_combos=500)
+
+
+def test_optimizar_setup_respeta_filtro_de_noticias():
+    """eventos_noticias debe llegar hasta generar_senales_sistema y bloquear
+    entradas: una ventana de noticia que cubre TODO el tramo IS debe dejar el
+    barrido sin operaciones, frente al mismo setup sin el filtro."""
+    n = 250
+    df = _df_tendencia(n=n)
+    df['timestamp'] = pd.date_range('2024-01-01', periods=n, freq='1h', tz='UTC')
+
+    setup = _setup_cruce()
+    setup['filtros'] = {'noticias': {
+        'activo': True, 'minutos_antes': 999999, 'minutos_despues': 999999,
+        'impacto_minimo': 'alto', 'monedas': None, 'cerrar_posiciones': False,
+    }}
+    eventos_df = pd.DataFrame({
+        'timestamp': [df['timestamp'].iloc[n // 2]],
+        'pais': ['US'], 'evento': ['Evento'], 'impacto': ['alto'],
+    })
+    eventos = preparar_eventos_noticias(eventos_df)
+
+    res_sin_filtro = optimizar_setup(df, setup, {}, {}, CONFIG_GLOBAL, pct_oos=0.30,
+                                     eventos_noticias=None)
+    res_con_filtro = optimizar_setup(df, setup, {}, {}, CONFIG_GLOBAL, pct_oos=0.30,
+                                     eventos_noticias=eventos)
+
+    assert res_sin_filtro[0]['metricas']['n_trades'] > 0
+    assert res_con_filtro[0]['metricas']['n_trades'] == 0
 
 
 def test_optimizar_setup_solo_simula_tramo_is():

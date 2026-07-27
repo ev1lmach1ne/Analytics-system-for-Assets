@@ -42,6 +42,7 @@ _GRID = '#253a60'
 _VERDE = '#2ecc71'
 _ROJO = '#e74c3c'
 _GRIS = '#5a7a9a'
+_GRIS_NOTICIA = '#7a8a9a'  # distinto del gris del trayecto para no confundirlos
 _VERDE_FLECHA = '#00e676'   # compra (abre largo / cierra corto)
 _ROJO_FLECHA = '#ff1744'    # venta (abre corto / cierra largo)
 
@@ -56,6 +57,7 @@ const candles = __CANDLES__;
 const markers = __MARKERS__;
 const trayectos = __TRAYECTOS__;   // [[{time,value}, {time,value}], ...] por trade
 const stops = __STOPS__;           // idem, nivel de stop-loss por trade
+const eventos = __EVENTOS__;       // idem, una línea vertical por evento de noticia
 const chart = LightweightCharts.createChart(document.getElementById('c'), {
   layout: { background: { color: '__BG__' }, textColor: '__TXT__' },
   grid: { vertLines: { color: '__GRID__' }, horzLines: { color: '__GRID__' } },
@@ -85,6 +87,12 @@ stops.forEach(function (pts) {
                         crosshairMarkerVisible: false })
        .setData(pts);
 });
+eventos.forEach(function (pts) {
+  chart.addLineSeries({ color: '__GRIS_NOTICIA__', lineWidth: 1, lineStyle: 2,
+                        lastValueVisible: false, priceLineVisible: false,
+                        crosshairMarkerVisible: false })
+       .setData(pts);
+});
 chart.timeScale().fitContent();
 </script>
 </body></html>"""
@@ -100,16 +108,25 @@ class LwcChart(QWidget):
         self._html_path = os.path.join(
             tempfile.gettempdir(), f'lwc_backtest_{id(self)}.html')
         self._js_cache = None
+        self.view = None
+        self._view_ok = False
+
+    def _ensure_view(self):
+        """Crea el QWebEngineView bajo demanda (no en __init__) para no
+        disparar procesos Chromium durante el arranque de la app."""
+        if self._view_ok or self.view is not None:
+            return
         if WEBENGINE_OK:
             self.view = QWebEngineView(self)
             self.view.setMinimumHeight(300)
-            lay.addWidget(self.view)
+            self.layout().addWidget(self.view)
+            self._view_ok = True
         else:
-            self.view = None
+            self._view_ok = True
             aviso = QLabel("PyQt6-WebEngine no está instalado — vista moderna "
                            "no disponible.")
             aviso.setStyleSheet("color: #8fb3d9; padding: 20px;")
-            lay.addWidget(aviso)
+            self.layout().addWidget(aviso)
 
     def _leer_js(self):
         if self._js_cache is None:
@@ -117,30 +134,38 @@ class LwcChart(QWidget):
                 self._js_cache = f.read()
         return self._js_cache
 
-    def mostrar(self, payload, mostrar_trayecto=True, mostrar_stop=False):
+    def mostrar(self, payload, mostrar_trayecto=True, mostrar_stop=False,
+                mostrar_noticias=False, eventos_noticias=None):
         """Pinta velas + marcadores de operaciones del payload del backtest
         (mismo dict que consume ResultadosWidget). mostrar_trayecto/mostrar_stop
         reflejan los checkboxes homónimos de la vista clásica, para que ambas
-        vistas se comporten igual al conmutar entre ellas."""
+        vistas se comporten igual al conmutar entre ellas. eventos_noticias:
+        DataFrame crudo del calendario económico (columna timestamp UTC),
+        dibujado como líneas verticales grises discontinuas si
+        mostrar_noticias está activo."""
+        self._ensure_view()
         if self.view is None or payload is None:
             return
-        candles, markers, trayectos, stops = self._construir_datos(
-            payload, mostrar_trayecto, mostrar_stop)
+        candles, markers, trayectos, stops, eventos = self._construir_datos(
+            payload, mostrar_trayecto, mostrar_stop, mostrar_noticias, eventos_noticias)
         html = (_HTML
                 .replace('__JS__', self._leer_js())
                 .replace('__CANDLES__', json.dumps(candles))
                 .replace('__MARKERS__', json.dumps(markers))
                 .replace('__TRAYECTOS__', json.dumps(trayectos))
                 .replace('__STOPS__', json.dumps(stops))
+                .replace('__EVENTOS__', json.dumps(eventos))
                 .replace('__BG__', _BG).replace('__TXT__', _TXT)
                 .replace('__GRID__', _GRID).replace('__GRIS__', _GRIS)
+                .replace('__GRIS_NOTICIA__', _GRIS_NOTICIA)
                 .replace('__VERDE__', _VERDE).replace('__ROJO__', _ROJO))
         with open(self._html_path, 'w', encoding='utf-8') as f:
             f.write(html)
         self.view.load(QUrl.fromLocalFile(self._html_path))
 
     @staticmethod
-    def _construir_datos(payload, mostrar_trayecto=True, mostrar_stop=False):
+    def _construir_datos(payload, mostrar_trayecto=True, mostrar_stop=False,
+                          mostrar_noticias=False, eventos_noticias=None):
         ts = pd.DatetimeIndex(payload['timestamps'])
         unix = (ts.asi8 // 1_000_000_000).astype(np.int64)   # segundos UTC
         o = np.asarray(payload['open'], dtype=float)
@@ -193,4 +218,19 @@ class LwcChart(QWidget):
             markers_unicos.append(m)
         markers = markers_unicos
         markers.sort(key=lambda m: m['time'])   # LWC exige orden temporal
-        return candles, markers, trayectos, stops
+
+        eventos = []
+        if mostrar_noticias and eventos_noticias is not None and len(eventos_noticias) and n:
+            lo, hi = float(l.min()), float(h.max())
+            ts_ini, ts_fin = ts[0], ts[-1]
+            # payload['timestamps'] llega como numpy datetime64 naive (instante
+            # UTC sin etiqueta de tz, efecto de .values sobre una columna
+            # pandas tz-aware); se alinea quitando la tz del lado de eventos
+            # para poder comparar ambos índices.
+            ev_ts = pd.DatetimeIndex(eventos_noticias['timestamp']).tz_convert(None)
+            visibles = ev_ts[(ev_ts >= ts_ini) & (ev_ts <= ts_fin)]
+            ev_unix = (visibles.asi8 // 1_000_000_000).astype(np.int64)
+            for t_ev in ev_unix:
+                eventos.append([{'time': int(t_ev), 'value': lo},
+                                 {'time': int(t_ev), 'value': hi}])
+        return candles, markers, trayectos, stops, eventos

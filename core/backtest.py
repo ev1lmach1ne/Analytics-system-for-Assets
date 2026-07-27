@@ -28,28 +28,24 @@ Motivos de salida (columna 'motivo' de cada trade):
 import numpy as np
 from numba import njit
 
-MOTIVOS_SALIDA = {0: 'Señal', 1: 'Stop', 2: 'Take-profit', 3: 'Tiempo', 4: 'Fin datos'}
+MOTIVOS_SALIDA = {0: 'Señal', 1: 'Stop', 2: 'Take-profit', 3: 'Tiempo', 4: 'Fin datos', 5: 'Parcial'}
 
 # columnas del array de trades que devuelve _simular_numba
 (_T_IDX_IN, _T_IDX_OUT, _T_DIR, _T_SETUP, _T_PIN, _T_POUT, _T_PNL, _T_MOTIVO,
- _T_EQ_IN, _T_UNIDADES, _T_STOP) = range(11)
-_N_COLS_TRADE = 11
+ _T_EQ_IN, _T_UNIDADES, _T_STOP, _T_PARCIAL) = range(12)
+_N_COLS_TRADE = 12
 
 
 @njit(nogil=True)
 def _simular_numba(o, h, l, c, ent_long, ent_short, sal_long, sal_short,
                    setup_id, atr, riesgos_setup, stops_setup, tps_setup,
-                   tiempos_setup, capital_inicial, comision_pct, slippage_pct):
-    """Bucle del motor. Devuelve (trades[n,10], n_trades, equity[n]).
-
-    riesgos_setup/stops_setup/tps_setup/tiempos_setup: arrays[64] indexados
-    por setup_id — riesgo %, stop en ×ATR, take-profit en R y salida por
-    tiempo (velas) de cada setup (0 = desactivado en stop/tp/tiempo).
-    sal_long/sal_short: BITMASK int64 por vela — bit k activo = el setup k
-    pide salir; solo cierra la posición si el bit de SU setup está activo.
-    Una señal de entrada contraria solo revierte la posición si viene del
-    MISMO setup (setup_id de esa vela == setup de la posición).
-    """
+                   tiempos_setup, bes_setup, trails_setup,
+                   parc_pct_setup, parc_r_setup,
+                   parc_ml_setup, parc_ms_setup,
+                   parc_gt_setup, parc_gv_setup,
+                   parc_has_conds, n_parc_setup,
+                   capital_inicial, comision_pct, slippage_pct):
+    """Bucle del motor. Devuelve (trades[n,12], n_trades, equity[n])."""
     n = len(c)
     max_trades = n // 2 + 1
     trades = np.zeros((max_trades, _N_COLS_TRADE))
@@ -58,19 +54,23 @@ def _simular_numba(o, h, l, c, ent_long, ent_short, sal_long, sal_short,
 
     cap = capital_inicial
     en_pos = False
-    dir_pos = 0            # +1 long, -1 short
+    dir_pos = 0
     precio_in = 0.0
     unidades = 0.0
     stop_precio = 0.0
     tp_precio = 0.0
     idx_in = 0
     setup_in = 0
-    pendiente_entrada = 0   # 0 no, +1 long, -1 short (señal de la vela previa)
+    max_fav = 0.0
+    be_aplicado = False
+    etapa_actual = 0
+    precio_parcial = 0.0
+    pendiente_entrada = 0
     pendiente_salida = False
     pendiente_setup = 0
 
     for i in range(n):
-        # ── ejecutar al open lo pendiente de la vela anterior ──
+        # ── ejecutar al open lo pendiente ──
         if en_pos and pendiente_salida:
             precio_out = o[i] * (1.0 - slippage_pct * dir_pos)
             pnl = (precio_out - precio_in) * unidades * dir_pos
@@ -87,6 +87,7 @@ def _simular_numba(o, h, l, c, ent_long, ent_short, sal_long, sal_short,
             trades[n_trades, _T_EQ_IN] = cap - pnl
             trades[n_trades, _T_UNIDADES] = unidades
             trades[n_trades, _T_STOP] = stop_precio
+            trades[n_trades, _T_PARCIAL] = 0
             n_trades += 1
             en_pos = False
             pendiente_salida = False
@@ -108,13 +109,114 @@ def _simular_numba(o, h, l, c, ent_long, ent_short, sal_long, sal_short,
                 setup_in = pendiente_setup
                 stop_precio = precio - dist * d if stop_atr_s > 0 else 0.0
                 tp_precio = precio + tp_r_s * dist * d if tp_r_s > 0 else 0.0
+                max_fav = precio
+                be_aplicado = False
+                etapa_actual = 0
+                precio_parcial = 0.0
             pendiente_entrada = 0
 
         # ── gestión intra-vela de la posición abierta ──
         if en_pos:
+            ref_atr_pos = atr[i] if atr[i] > 0 else o[i] * 0.01
+            dist_pos = 2.0 * ref_atr_pos  # fallback si stop=0
+            if stops_setup[setup_in] > 0.0:
+                dist_pos = stops_setup[setup_in] * ref_atr_pos
+
+            # ── break-even + trailing stop ──
+            be_atr_s = bes_setup[setup_in]
+            trail_atr_s = trails_setup[setup_in]
+            if dir_pos > 0:
+                if h[i] > max_fav:
+                    max_fav = h[i]
+                if not be_aplicado and be_atr_s > 0.0 and max_fav - precio_in >= be_atr_s * ref_atr_pos:
+                    stop_precio = max(stop_precio, precio_in)
+                    be_aplicado = True
+                if trail_atr_s > 0.0:
+                    stop_precio = max(stop_precio, max_fav - trail_atr_s * ref_atr_pos)
+            else:
+                if l[i] < max_fav:
+                    max_fav = l[i]
+                if not be_aplicado and be_atr_s > 0.0 and precio_in - max_fav >= be_atr_s * ref_atr_pos:
+                    stop_precio = min(stop_precio, precio_in)
+                    be_aplicado = True
+                if trail_atr_s > 0.0:
+                    stop_precio = min(stop_precio, max_fav + trail_atr_s * ref_atr_pos)
+
+            # ── salidas parciales ──
+            n_parc = n_parc_setup[setup_in]
+            if etapa_actual < n_parc:
+                dispara = False
+                r_trig = parc_r_setup[setup_in, etapa_actual]
+                if r_trig > 0.0:
+                    if dir_pos > 0:
+                        if h[i] >= precio_in + r_trig * dist_pos:
+                            dispara = True
+                    else:
+                        if l[i] <= precio_in - r_trig * dist_pos:
+                            dispara = True
+                elif parc_has_conds[setup_in, etapa_actual]:
+                    # Sin R:R — dispara solo si se cumplen las condiciones
+                    dispara = True
+                # comprobar máscara de condiciones
+                if dispara:
+                    if dir_pos > 0:
+                        if not parc_ml_setup[setup_in, etapa_actual, i]:
+                            dispara = False
+                    else:
+                        if not parc_ms_setup[setup_in, etapa_actual, i]:
+                            dispara = False
+
+                if dispara:
+                    pct = parc_pct_setup[setup_in, etapa_actual] / 100.0
+                    if pct >= 1.0:
+                        pct = 1.0
+                    u_cerrar = unidades * pct
+                    precio_temp = max(precio_in, precio_in + r_trig * dist_pos * dir_pos) \
+                        if dir_pos > 0 else min(precio_in, precio_in + r_trig * dist_pos * dir_pos)
+                    if r_trig <= 0.0:
+                        precio_temp = c[i]
+                    precio_out = precio_temp * (1.0 - slippage_pct * dir_pos)
+                    pnl_parcial = (precio_out - precio_in) * u_cerrar * dir_pos
+                    pnl_parcial -= (precio_in + precio_out) * u_cerrar * comision_pct
+                    cap += pnl_parcial
+                    trades[n_trades, _T_IDX_IN] = idx_in
+                    trades[n_trades, _T_IDX_OUT] = i
+                    trades[n_trades, _T_DIR] = dir_pos
+                    trades[n_trades, _T_SETUP] = setup_in
+                    trades[n_trades, _T_PIN] = precio_in
+                    trades[n_trades, _T_POUT] = precio_out
+                    trades[n_trades, _T_PNL] = pnl_parcial
+                    trades[n_trades, _T_MOTIVO] = 5
+                    trades[n_trades, _T_EQ_IN] = cap - pnl_parcial
+                    trades[n_trades, _T_UNIDADES] = u_cerrar
+                    trades[n_trades, _T_STOP] = stop_precio
+                    trades[n_trades, _T_PARCIAL] = etapa_actual + 1
+                    n_trades += 1
+
+                    if pct >= 1.0:
+                        en_pos = False
+                        pendiente_salida = False
+                    else:
+                        unidades -= u_cerrar
+                        g_tipo = parc_gt_setup[setup_in, etapa_actual]
+                        g_val = parc_gv_setup[setup_in, etapa_actual]
+                        if g_tipo == 1:  # BE
+                            bes_setup[setup_in] = g_val if g_val > 0.0 else 0.0
+                            be_aplicado = False
+                        elif g_tipo == 2:  # trailing_ATR
+                            trails_setup[setup_in] = g_val
+                        elif g_tipo == 3:  # move_to_prev_parcial
+                            if precio_parcial > 0.0:
+                                if dir_pos > 0:
+                                    stop_precio = max(stop_precio, precio_parcial)
+                                else:
+                                    stop_precio = min(stop_precio, precio_parcial)
+                        precio_parcial = precio_temp
+                    etapa_actual += 1
+
+            # ── stop / TP / tiempo / fin de datos ──
             salida_precio = 0.0
             motivo = -1
-            # stop-loss contra low/high de la vela
             if stop_precio > 0.0:
                 if dir_pos > 0 and l[i] <= stop_precio:
                     salida_precio = stop_precio
@@ -122,7 +224,6 @@ def _simular_numba(o, h, l, c, ent_long, ent_short, sal_long, sal_short,
                 elif dir_pos < 0 and h[i] >= stop_precio:
                     salida_precio = stop_precio
                     motivo = 1
-            # take-profit (si el stop no saltó antes en esta vela)
             if motivo < 0 and tp_precio > 0.0:
                 if dir_pos > 0 and h[i] >= tp_precio:
                     salida_precio = tp_precio
@@ -130,7 +231,6 @@ def _simular_numba(o, h, l, c, ent_long, ent_short, sal_long, sal_short,
                 elif dir_pos < 0 and l[i] <= tp_precio:
                     salida_precio = tp_precio
                     motivo = 2
-            # salida por tiempo: al cierre de la vela n desde la entrada
             n_velas_s = tiempos_setup[setup_in]
             if motivo < 0 and n_velas_s > 0 and (i - idx_in) >= n_velas_s:
                 salida_precio = c[i]
@@ -155,6 +255,7 @@ def _simular_numba(o, h, l, c, ent_long, ent_short, sal_long, sal_short,
                 trades[n_trades, _T_EQ_IN] = cap - pnl
                 trades[n_trades, _T_UNIDADES] = unidades
                 trades[n_trades, _T_STOP] = stop_precio
+                trades[n_trades, _T_PARCIAL] = 0
                 n_trades += 1
                 en_pos = False
                 pendiente_salida = False
@@ -198,8 +299,10 @@ def simular(o, h, l, c, senales, config):
     defecto, máx. 63) y atr (float64[n]).
     config: dict — capital_inicial, riesgo_pct, comision_pct, slippage_pct,
     stop_atr, tp_r, salida_n_velas (defectos globales) y opcionalmente
-    config_por_setup: {id: {'riesgo_pct','stop_atr','tp_r','salida_n_velas'}}
+    config_por_setup: {id: {'riesgo_pct','stop_atr','tp_r','salida_n_velas',
+    'be_atr','trailing_atr'}}
     para que cada setup del sistema tenga su propio riesgo/stop/TP/tiempo
+    y gestión de posición (break-even y trailing stop en ×ATR, 0 = off)
     (riesgo_por_setup: {id: pct} se acepta como forma corta, compat v1).
     """
     o = np.ascontiguousarray(o, dtype=np.float64)
@@ -227,6 +330,8 @@ def simular(o, h, l, c, senales, config):
     stops = np.full(64, float(config.get('stop_atr', 0.0)))
     tps = np.full(64, float(config.get('tp_r', 0.0)))
     tiempos = np.full(64, int(config.get('salida_n_velas', 0)), dtype=np.int64)
+    bes = np.full(64, 0.0)
+    trails = np.full(64, 0.0)
     for sid, pct in (config.get('riesgo_por_setup') or {}).items():
         sid = int(sid)
         if 0 <= sid < 64:
@@ -243,6 +348,62 @@ def simular(o, h, l, c, senales, config):
             tps[sid] = float(cfg_s['tp_r'])
         if 'salida_n_velas' in cfg_s:
             tiempos[sid] = int(cfg_s['salida_n_velas'])
+        if 'be_atr' in cfg_s:
+            bes[sid] = float(cfg_s['be_atr'])
+        if 'trailing_atr' in cfg_s:
+            trails[sid] = float(cfg_s['trailing_atr'])
+
+    # ── salidas parciales ──
+    max_parc = 8
+    parc_pct_all = np.zeros((64, max_parc), dtype=np.float64)
+    parc_r_all = np.zeros((64, max_parc), dtype=np.float64)
+    parc_gt_all = np.zeros((64, max_parc), dtype=np.int64)
+    parc_gv_all = np.zeros((64, max_parc), dtype=np.float64)
+    parc_has_conds = np.zeros((64, max_parc), dtype=np.bool_)
+    n_parc_all = np.zeros(64, dtype=np.int64)
+
+    for sid, cfg_s in (config.get('config_por_setup') or {}).items():
+        sid = int(sid)
+        if not 0 <= sid < 64:
+            continue
+        parciales = cfg_s.get('parciales')
+        if parciales and len(parciales) > 0:
+            n_parc = min(len(parciales), max_parc)
+            n_parc_all[sid] = n_parc
+            for e in range(n_parc):
+                ep = parciales[e]
+                parc_pct_all[sid, e] = float(ep.get('pct', 100.0))
+                parc_r_all[sid, e] = float(ep.get('r', 0.0))
+                g = ep.get('gestion', {})
+                parc_gt_all[sid, e] = int(g.get('tipo', 0))
+                parc_gv_all[sid, e] = float(g.get('val', 0.0))
+                conds = ep.get('condiciones')
+                if conds and len(conds) > 0:
+                    parc_has_conds[sid, e] = True
+
+    # condition masks: 3D (64 setups × 8 stages × n bars). Padded with True.
+    parc_ml = np.ones((64, max_parc, n), dtype=np.bool_)
+    parc_ms = np.ones((64, max_parc, n), dtype=np.bool_)
+    masks_in = config.get('parciales_masks_long')
+    if masks_in and len(masks_in) > 0:
+        for sid in range(min(len(masks_in), 64)):
+            m = masks_in[sid]
+            if m is not None and len(m) > 0:
+                m = np.array(m, dtype=np.bool_)
+                if m.ndim == 1:
+                    m = m.reshape(1, -1)
+                stages = min(m.shape[0], max_parc)
+                parc_ml[sid, :stages, :] = m[:stages, :]
+    masks_in = config.get('parciales_masks_short')
+    if masks_in and len(masks_in) > 0:
+        for sid in range(min(len(masks_in), 64)):
+            m = masks_in[sid]
+            if m is not None and len(m) > 0:
+                m = np.array(m, dtype=np.bool_)
+                if m.ndim == 1:
+                    m = m.reshape(1, -1)
+                stages = min(m.shape[0], max_parc)
+                parc_ms[sid, :stages, :] = m[:stages, :]
 
     trades_arr, n_trades, equity = _simular_numba(
         o, h, l, c,
@@ -250,7 +411,9 @@ def simular(o, h, l, c, senales, config):
         np.ascontiguousarray(senales['entradas_short'], dtype=np.bool_),
         _mascara_salida(senales['salidas_long']),
         _mascara_salida(senales['salidas_short']),
-        setup, atr, riesgos, stops, tps, tiempos,
+        setup, atr, riesgos, stops, tps, tiempos, bes, trails,
+        parc_pct_all, parc_r_all, parc_ml, parc_ms, parc_gt_all, parc_gv_all,
+        parc_has_conds, n_parc_all,
         float(config.get('capital_inicial', 10000.0)),
         float(config.get('comision_pct', 0.0005)),
         float(config.get('slippage_pct', 0.0002)),
@@ -269,6 +432,7 @@ def simular(o, h, l, c, senales, config):
         'equity_entrada': t[:, _T_EQ_IN],
         'unidades': t[:, _T_UNIDADES],
         'precio_stop': t[:, _T_STOP],   # nivel de stop-loss del trade (0 = sin stop)
+        'parcial': t[:, _T_PARCIAL].astype(np.int64),   # 0=completa, 1+=etapa parcial
     }
     # retorno del trade como fracción del equity al entrar (para Montecarlo
     # y expectancy comparables entre trades con capital distinto)

@@ -193,7 +193,7 @@ class StatusBar(QFrame):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Analytics System for Assets")
+        self.setWindowTitle("Analytics System for Assets v0.6.2-alpha")
         # 1400x900 como tamaño deseado, recortado al área visible de la
         # pantalla (en portátiles pequeños 1400x900 no cabe) y centrado.
         disp = QApplication.primaryScreen().availableGeometry()
