@@ -31,6 +31,7 @@ import inspect
 import json
 import os
 import re
+import shutil
 
 import numpy as np
 import pandas as pd
@@ -42,7 +43,8 @@ from PyQt6.QtWidgets import (
     QHeaderView, QPushButton, QSplitter, QLineEdit, QSpinBox, QDoubleSpinBox,
     QSlider, QListWidget, QListWidgetItem, QTabWidget, QFormLayout, QGroupBox,
     QInputDialog, QDateEdit, QSizePolicy, QApplication, QDialog, QProgressBar,
-    QButtonGroup, QStyledItemDelegate, QStyle, QStackedWidget,
+    QButtonGroup, QStyledItemDelegate, QStyle, QStackedWidget, QMenu,
+    QMessageBox,
 )
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
@@ -58,6 +60,7 @@ from core.config import (
     tipo_activo_de_csv, PRESETS_FRICCION, TIPO_MAP,
     velas_por_anio as velas_por_anio_config,
     get_selector_recientes, set_selector_recientes,
+    velas_a_tiempo_legible,
 )
 from core.backtest import (
     simular, dividir_is_oos, calcular_metricas, montecarlo, MOTIVOS_SALIDA,
@@ -112,6 +115,11 @@ MODOS_EQUITY = [
     'Capital',
     'Log-retorno',
     'Drawdown',
+]
+
+MODOS_MFE_MAE = [
+    'Eficiencia MFE/MAE',
+    'Distribución MFE/MAE',
 ]
 
 RUTA_ESTRATEGIAS_GUARDADAS_LEGACY = os.path.join(LIMPIADOS_DIR, 'backtest_estrategias.json')
@@ -394,14 +402,14 @@ class _BacktestThread(QThread):
             for k, setup in enumerate(self._setups):
                 m = tr['setup'] == k
                 pnl = tr['pnl'][m]
-                ret = tr['ret_pct'][m]
+                r_setup = tr['r_multiple'][m]
                 metricas_setup.append({
                     'nombre': setup.get('nombre') or setup['plantilla'],
                     'riesgo_pct': float(setup.get('riesgo_pct', 0.01)),
                     'n_trades': int(m.sum()),
                     'win_rate': float((pnl > 0).mean()) if len(pnl) else None,
                     'pnl_total': float(pnl.sum()),
-                    'expectancy_pct': float(ret.mean()) * 100.0 if len(ret) else None,
+                    'expectancy_pct': float(r_setup.mean()) if len(r_setup) else None,
                 })
 
             wfa = None
@@ -1075,6 +1083,7 @@ class OptimizadorWidget(QWidget):
 
         # selector de sistemas guardados (combo si muchos, cards si pocos)
         self._guardadas_cards = {}
+        self._guardado_cargado = None          # último sistema guardado cargado
         self._guardadas_container = QWidget()
         self._guardadas_lay = QHBoxLayout(self._guardadas_container)
         self._guardadas_lay.setSpacing(6)
@@ -1097,6 +1106,9 @@ class OptimizadorWidget(QWidget):
         btn_guardar = QPushButton("Guardar…")
         btn_guardar.clicked.connect(self._guardar_sistema)
         fila_g.addWidget(btn_guardar)
+        btn_elim_g = QPushButton("Eliminar")
+        btn_elim_g.clicked.connect(self._eliminar_guardada_seleccion)
+        fila_g.addWidget(btn_elim_g)
         fila_g.addStretch()
         lay_sel.addLayout(fila_g)
         lay_sel.addWidget(self._guardadas_container)
@@ -1106,6 +1118,7 @@ class OptimizadorWidget(QWidget):
         # desde la pestaña Resultados (distinto de "Guardados": ahí solo se
         # guarda la estrategia, aquí se guarda con qué activo/tf se corrió)
         self._favoritos_cards = {}
+        self._favorito_cargado = None          # último favorito cargado
         self._favoritos_container = QWidget()
         self._favoritos_lay = QHBoxLayout(self._favoritos_container)
         self._favoritos_lay.setSpacing(6)
@@ -1119,6 +1132,9 @@ class OptimizadorWidget(QWidget):
         btn_cargar_fav = QPushButton("Cargar")
         btn_cargar_fav.clicked.connect(self._cargar_favorito)
         fila_f.addWidget(btn_cargar_fav)
+        btn_elim_f = QPushButton("Eliminar")
+        btn_elim_f.clicked.connect(self._eliminar_favorito_seleccion)
+        fila_f.addWidget(btn_elim_f)
         fila_f.addStretch()
         lay_sel.addLayout(fila_f)
         lay_sel.addWidget(self._favoritos_container)
@@ -2008,8 +2024,14 @@ class OptimizadorWidget(QWidget):
                 desc = f"{n_setups} setup{'s' if n_setups != 1 else ''}"
                 card = TemplateCard(nombre, desc, '#5a7a9a')
                 card.clicked.connect(lambda n=nombre: self._cargar_guardado_nombre(n))
+                card.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+                card.customContextMenuRequested.connect(
+                    lambda pos, n=nombre: self._menu_guardada(pos, n))
                 self._guardadas_cards[nombre] = card
                 self._guardadas_lay.addWidget(card)
+            if self._guardado_cargado is not None:
+                for n, card in self._guardadas_cards.items():
+                    card.setSelected(n == self._guardado_cargado)
             self._guardadas_container.setVisible(True)
             self.cmb_guardadas.setVisible(False)
         else:
@@ -2022,6 +2044,7 @@ class OptimizadorWidget(QWidget):
         s = _setup_por_defecto(nombre)
         s['nombre'] = nombre
         self._setups = [s]
+        self._guardado_cargado = None
         self.lbl_estado.setText(f"Sistema predeterminado «{nombre}» cargado")
         self._refresh_lista(seleccionar=0)
 
@@ -2048,6 +2071,9 @@ class OptimizadorWidget(QWidget):
             s['params'] = dict(params_por_defecto(datos['estrategia']),
                                **datos.get('params', {}))
             self._setups = [s]
+        self._guardado_cargado = valor
+        for n, card in self._guardadas_cards.items():
+            card.setSelected(n == valor)
         self.lbl_estado.setText(f"Sistema «{valor}» cargado")
         self._refresh_lista(seleccionar=0)
 
@@ -2092,8 +2118,14 @@ class OptimizadorWidget(QWidget):
                 desc = f"{tf} · {os.path.basename(datos.get('csv', ''))}"
                 card = TemplateCard(nombre, desc, AMBAR)
                 card.clicked.connect(lambda n=nombre: self._cargar_favorito_nombre(n))
+                card.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+                card.customContextMenuRequested.connect(
+                    lambda pos, n=nombre: self._menu_favorito(pos, n))
                 self._favoritos_cards[nombre] = card
                 self._favoritos_lay.addWidget(card)
+            if self._favorito_cargado is not None:
+                for n, card in self._favoritos_cards.items():
+                    card.setSelected(n == self._favorito_cargado)
             self._favoritos_container.setVisible(True)
             self.cmb_favoritos.setVisible(False)
         else:
@@ -2135,6 +2167,9 @@ class OptimizadorWidget(QWidget):
             self.sp_comision.setValue(cfg['comision_pct'] * 100.0)
         if 'slippage_pct' in cfg:
             self.sp_slippage.setValue(cfg['slippage_pct'] * 100.0)
+        self._favorito_cargado = valor
+        for n, card in self._favoritos_cards.items():
+            card.setSelected(n == valor)
         self.lbl_estado.setText(f"Favorito «{valor}» cargado")
         self._refresh_lista(seleccionar=0)
 
@@ -2144,6 +2179,8 @@ class OptimizadorWidget(QWidget):
         s = _setup_por_defecto('Custom (reglas)')
         s['nombre'] = 'Mi setup'
         self._setups = [s]
+        self._guardado_cargado = None
+        self._favorito_cargado = None
         self.lbl_estado.setText(
             "Sistema nuevo: define las reglas del setup y añade más si quieres")
         self._refresh_lista(seleccionar=0)
@@ -2162,6 +2199,70 @@ class OptimizadorWidget(QWidget):
             json.dump(datos, f, ensure_ascii=False, indent=2)
         self._recargar_guardadas()
         self.lbl_estado.setText(f"Sistema «{nombre}» guardado")
+
+    # ── eliminar sistemas guardados ──
+    def _menu_guardada(self, pos, nombre):
+        menu = QMenu(self)
+        accion = menu.addAction("🗑 Eliminar")
+        if menu.exec(self.sender().mapToGlobal(pos)) == accion:
+            self._eliminar_guardada_nombre(nombre)
+
+    @_no_crash
+    def _eliminar_guardada_seleccion(self):
+        dato = self.cmb_guardadas.currentData()
+        nombre = (dato[1] if dato else None) or self._guardado_cargado
+        if not nombre:
+            return
+        self._eliminar_guardada_nombre(nombre)
+        self._guardado_cargado = None
+
+    def _eliminar_guardada_nombre(self, nombre):
+        carpeta = os.path.join(SISTEMAS_DIR, _slug_sistema(nombre))
+        if not os.path.isdir(carpeta):
+            return
+        resp = QMessageBox.question(
+            self, "Eliminar sistema",
+            f"¿Eliminar definitivamente el sistema «{nombre}»?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if resp != QMessageBox.StandardButton.Yes:
+            return
+        shutil.rmtree(carpeta)
+        if self._guardado_cargado == nombre:
+            self._guardado_cargado = None
+        self._recargar_guardadas()
+        self.lbl_estado.setText(f"Sistema «{nombre}» eliminado")
+
+    # ── eliminar favoritos ──
+    def _menu_favorito(self, pos, nombre):
+        menu = QMenu(self)
+        accion = menu.addAction("🗑 Eliminar")
+        if menu.exec(self.sender().mapToGlobal(pos)) == accion:
+            self._eliminar_favorito_nombre(nombre)
+
+    @_no_crash
+    def _eliminar_favorito_seleccion(self):
+        dato = self.cmb_favoritos.currentData()
+        nombre = dato or self._favorito_cargado
+        if not nombre:
+            return
+        self._eliminar_favorito_nombre(nombre)
+        self._favorito_cargado = None
+
+    def _eliminar_favorito_nombre(self, nombre):
+        carpeta = os.path.join(FAVORITOS_DIR, _slug_sistema(nombre))
+        if not os.path.isdir(carpeta):
+            return
+        resp = QMessageBox.question(
+            self, "Eliminar favorito",
+            f"¿Eliminar definitivamente el favorito «{nombre}»?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if resp != QMessageBox.StandardButton.Yes:
+            return
+        shutil.rmtree(carpeta)
+        if self._favorito_cargado == nombre:
+            self._favorito_cargado = None
+        self._recargar_favoritos()
+        self.lbl_estado.setText(f"Favorito «{nombre}» eliminado")
 
 
 # ══════════════ diálogo: configurar el barrido de parámetros ══════════════
@@ -2381,18 +2482,18 @@ _FILAS_METRICAS = [
     ('retorno_anual_pct', 'Retorno anualizado', 2, ' %'),
     ('max_dd_pct', 'Max drawdown', 2, ' %'),
     ('sharpe', 'Sharpe', 2, ''),
-    ('expectancy_pct', 'Expectancy por trade', 3, ' %'),
+    ('expectancy_pct', 'Expectancy por trade', 3, ' R'),
     ('racha_perdedora', 'Racha perdedora máx.', 0, ''),
     ('duracion_media', 'Duración media (velas)', 1, ''),
     (None, '— Curva de capital —', None, None),
     ('r2_equity', 'R² de la equity curve', 3, ''),
     ('dd_promedio_pct', 'Drawdown promedio', 2, ' %'),
-    ('tiempo_recuperacion_medio', 'Tiempo recuperación medio (velas)', 1, ''),
-    ('tiempo_recuperacion_max', 'Tiempo recuperación máx. (velas)', 0, ''),
+    ('tiempo_recuperacion_medio', 'Tiempo recuperación medio', 1, ''),
+    ('tiempo_recuperacion_max', 'Tiempo recuperación máx.', 0, ''),
     (None, '— Robustez y costes —', None, None),
     ('sqn', 'SQN (>2 bueno, >3 excelente)', 2, ''),
     ('payoff_ratio', 'Payoff ratio (ganancia/pérdida media)', 2, ''),
-    ('pct_mejor_trade', '% PnL del mejor trade', 1, ' %'),
+    ('pct_mejor_trade', 'Beneficio Total Atribuible al mejor trade', 1, ' %'),
     ('slippage_minimo_pct', 'Slippage mínimo viable', 3, ' %'),
     ('impacto_comisiones_pct', 'Impacto de comisiones', 2, ' %'),
 ]
@@ -2571,6 +2672,14 @@ class ResultadosWidget(QWidget):
         lbl_eq.setObjectName("titulo")
         header_eq.addWidget(lbl_eq)
         header_eq.addStretch()
+        self.chk_bh = QCheckBox("Mostrar Buy && Hold")
+        self.chk_bh.setToolTip(
+            "Dibuja la evolución de una posición 'comprar y mantener' del "
+            "mismo activo durante todo el periodo, con el mismo capital "
+            "inicial, para comparar si el sistema generó alfa frente a una "
+            "estrategia pasiva.")
+        self.chk_bh.toggled.connect(lambda _: self._dibujar_equity(self._payload))
+        header_eq.addWidget(self.chk_bh)
         self.combo_eq_modo = QComboBox()
         self.combo_eq_modo.setMinimumWidth(130)
         for m in MODOS_EQUITY:
@@ -2648,10 +2757,10 @@ class ResultadosWidget(QWidget):
         fila_tr.addWidget(btn_lista_completa)
         lay.addLayout(fila_tr)
         self._dlg_trades = None
-        self.tabla_trades = QTableWidget(0, 8)
+        self.tabla_trades = QTableWidget(0, 10)
         self.tabla_trades.setHorizontalHeaderLabels(
             ['Entrada', 'Salida', 'Dir', 'Setup', 'P. entrada', 'P. salida',
-             'PnL', 'Motivo'])
+             'PnL', 'Motivo', 'MFE (R)', 'MAE (R)'])
         self.tabla_trades.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.tabla_trades.verticalHeader().setVisible(False)
         self.tabla_trades.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -2707,6 +2816,50 @@ class ResultadosWidget(QWidget):
         self.grp_mc.setVisible(False)
         lay.addWidget(self.grp_mc)
 
+        # Análisis de Eficiencia (MFE/MAE)
+        self.grp_mfe_mae = QGroupBox()
+        header_mfe = QHBoxLayout()
+        lbl_mfe_titulo = QLabel("Análisis de Eficiencia (MFE/MAE)")
+        lbl_mfe_titulo.setObjectName("titulo")
+        header_mfe.addWidget(lbl_mfe_titulo)
+        header_mfe.addStretch()
+        self.combo_mfe_modo = QComboBox()
+        self.combo_mfe_modo.setMinimumWidth(160)
+        for m in MODOS_MFE_MAE:
+            self.combo_mfe_modo.addItem(m)
+        self.combo_mfe_modo.currentIndexChanged.connect(
+            lambda _i: self._dibujar_mfe_mae(self._payload))
+        header_mfe.addWidget(self.combo_mfe_modo)
+        self.combo_mfe_filtro = QComboBox()
+        self.combo_mfe_filtro.addItems(['Todas', 'Ganadoras', 'Perdedoras'])
+        self.combo_mfe_filtro.currentIndexChanged.connect(
+            lambda _i: self._dibujar_mfe_mae(self._payload))
+        header_mfe.addWidget(self.combo_mfe_filtro)
+        header_mfe.addWidget(QLabel("Percentil:"))
+        self.slider_percentil = QSlider(Qt.Orientation.Horizontal)
+        self.slider_percentil.setRange(50, 99)
+        self.slider_percentil.setValue(80)
+        self.slider_percentil.setMaximumWidth(100)
+        self.spin_percentil = QSpinBox()
+        self.spin_percentil.setRange(50, 99)
+        self.spin_percentil.setValue(80)
+        self.spin_percentil.setSuffix('%')
+        self.slider_percentil.valueChanged.connect(self.spin_percentil.setValue)
+        self.spin_percentil.valueChanged.connect(self.slider_percentil.setValue)
+        self.spin_percentil.valueChanged.connect(
+            lambda _v: self._dibujar_mfe_mae(self._payload))
+        header_mfe.addWidget(self.slider_percentil)
+        header_mfe.addWidget(self.spin_percentil)
+        lay_mfe = QVBoxLayout(self.grp_mfe_mae)
+        lay_mfe.addLayout(header_mfe)
+        self.fig_mfe_mae = Figure(figsize=(9, 2.6), facecolor=FIG_BG)
+        self.canvas_mfe_mae = FigureCanvasQTAgg(self.fig_mfe_mae)
+        self.canvas_mfe_mae.setMinimumHeight(230)
+        self.canvas_mfe_mae.installEventFilter(self)
+        lay_mfe.addWidget(self.canvas_mfe_mae)
+        self.grp_mfe_mae.setVisible(False)
+        lay.addWidget(self.grp_mfe_mae)
+
         lay.addStretch()
 
     def eventFilter(self, obj, event):
@@ -2714,7 +2867,8 @@ class ResultadosWidget(QWidget):
         ser FigureCanvasQTAgg absorben la rueda del ratón igualmente y no la
         dejan pasar al QScrollArea de la pestaña — se reenvía a mano."""
         if event.type() == QEvent.Type.Wheel and obj in (
-                self.canvas_wfa, self.canvas_mc, self.canvas_equity):
+                self.canvas_wfa, self.canvas_mc, self.canvas_equity,
+                self.canvas_mfe_mae):
             sb = self._scroll.verticalScrollBar()
             sb.setValue(sb.value() - event.angleDelta().y())
             return True
@@ -2761,7 +2915,12 @@ class ResultadosWidget(QWidget):
             self.tabla_metricas.setItem(fila, 0, item_nombre)
             for col, tramo in enumerate(('IS', 'OOS', 'Total'), start=1):
                 v = met[tramo][clave]
-                if clave == 'win_rate':
+                if clave in ('tiempo_recuperacion_medio', 'tiempo_recuperacion_max'):
+                    tf_label = payload.get('tf')
+                    tiempo_str = velas_a_tiempo_legible(v, tf_label)
+                    velas_txt = str(int(v)) if dec == 0 and v is not None else _fmt(v, dec, '')
+                    texto = f"{tiempo_str}  —  {velas_txt} velas" if v is not None else '—'
+                elif clave == 'win_rate':
                     texto = _fmt(v * 100 if v is not None else None, 1, ' %')
                 elif dec == 0:
                     texto = str(int(v)) if v is not None else '—'
@@ -2799,7 +2958,7 @@ class ResultadosWidget(QWidget):
             wr = _fmt(s['win_rate'] * 100 if s['win_rate'] is not None else None, 1, ' %')
             vals = [f"S{r} · {s['nombre']}", f"{s['riesgo_pct'] * 100:g} %",
                     str(s['n_trades']), wr, f"{s['pnl_total']:+.2f}",
-                    _fmt(s['expectancy_pct'], 3, ' %')]
+                    _fmt(s['expectancy_pct'], 3, ' R')]
             for c_i, v in enumerate(vals):
                 it = QTableWidgetItem(v)
                 it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -2820,7 +2979,10 @@ class ResultadosWidget(QWidget):
         # Montecarlo
         self._dibujar_mc(payload.get('montecarlo'),
                          payload['config'].get('capital_inicial', 10000.0),
-                         payload['metricas']['Total'].get('max_dd_pct'))
+                         payload['metricas']['Total'].get('max_dd_pct'),
+                         payload['metricas']['Total'].get('retorno_pct'))
+        # Análisis de Eficiencia (MFE/MAE)
+        self._dibujar_mfe_mae(payload)
 
     @_no_crash
     def _guardar_favorito(self):
@@ -3482,6 +3644,8 @@ class ResultadosWidget(QWidget):
                 f"{tr['precio_salida'][r]:.4f}",
                 f"{tr['pnl'][r]:+.2f}",
                 MOTIVOS_SALIDA.get(int(tr['motivo'][r]), '?'),
+                f"{tr['mfe_r'][r]:+.2f}",
+                f"{tr['mae_r'][r]:+.2f}",
             ]
             for c_i, v in enumerate(vals):
                 it = QTableWidgetItem(v)
@@ -3498,10 +3662,10 @@ class ResultadosWidget(QWidget):
             dlg.setWindowTitle("Trades — lista completa")
             dlg.resize(900, 600)
             dlg_lay = QVBoxLayout(dlg)
-            tabla = QTableWidget(0, 8)
+            tabla = QTableWidget(0, 10)
             tabla.setHorizontalHeaderLabels(
                 ['Entrada', 'Salida', 'Dir', 'Setup', 'P. entrada', 'P. salida',
-                 'PnL', 'Motivo'])
+                 'PnL', 'Motivo', 'MFE (R)', 'MAE (R)'])
             tabla.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
             tabla.verticalHeader().setVisible(False)
             tabla.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -3548,6 +3712,19 @@ class ResultadosWidget(QWidget):
             ylabel = 'Retorno %'
             fmt_val = lambda v: f'{v:+.2f}%'
 
+        c = payload['close']
+        c0 = c[0] if c[0] else 1.0
+        bh_eq = cap0 * c / c0
+        if modo == 1:
+            y_bh = bh_eq
+        elif modo == 2:
+            y_bh = np.log(bh_eq / cap0) * 100.0
+        elif modo == 3:
+            bh_max = np.maximum.accumulate(bh_eq)
+            y_bh = (bh_eq / bh_max - 1.0) * 100.0
+        else:
+            y_bh = (bh_eq / cap0 - 1.0) * 100.0
+
         self.grp_equity.setVisible(True)
         self.fig_equity.clear()
         ax = self.fig_equity.add_subplot(111)
@@ -3578,6 +3755,12 @@ class ResultadosWidget(QWidget):
             if corte < n:
                 ax.fill_between(ts_oos, 0, y_oos_solo, color='#c0392b', alpha=0.35,
                                 label='OOS (aislado)')
+                # Total: drawdown continuo sobre todo el periodo (IS+OOS),
+                # calculado sobre el máximo acumulado de la equity completa
+                # — permite ver caídas que arrancan en IS y siguen en OOS,
+                # cosa que "OOS (aislado)" no muestra al rebasar su propio
+                # máximo al inicio del tramo OOS.
+                ax.plot(ts_oos, y[corte:], color=GRIS, linewidth=1.2, label='Total')
             ax.axhline(0, color=GRIS, linewidth=0.5, linestyle='--')
         else:
             ax.plot(ts_is, y_is, color=AZUL, linewidth=1.2, label='IS')
@@ -3589,6 +3772,13 @@ class ResultadosWidget(QWidget):
             if modo in (0, 2):
                 ax.axhline(0, color=GRIS, linewidth=0.5, linestyle='--')
 
+        if modo in (0, 1, 2) and getattr(self, 'chk_bh', None) is not None \
+                and self.chk_bh.isChecked():
+            ax.plot(ts, y_bh, color='#9b59b6', linewidth=1.1, linestyle='--',
+                    alpha=0.85, label='Buy & Hold')
+            ax.text(ts[-1], y_bh[-1], f'  B&H {fmt_val(y_bh[-1])}',
+                    color='#9b59b6', fontsize=7, ha='left', va='center')
+
         if 0 < corte < n:
             ax.axvline(ts[corte], color=GRIS, linewidth=0.8, linestyle='--', alpha=0.7)
             ylim = ax.get_ylim()
@@ -3597,10 +3787,10 @@ class ResultadosWidget(QWidget):
                     fontsize=7, color=GRIS, ha='left', va='top',
                     bbox=dict(facecolor=FIG_BG, alpha=0.7, edgecolor='none', pad=2))
 
-        if corte > 0 and modo in (0, 1, 2):
+        if corte > 0:
             ax.text(ts[corte], y_is[-1], f'  {fmt_val(y_is[-1])}',
                     color=AZUL, fontsize=7, ha='left', va='center')
-        if corte < n and modo in (0, 1, 2):
+        if corte < n:
             va_tot, va_oos = ('bottom', 'top') if y[-1] >= y_oos_solo[-1] else ('top', 'bottom')
             ax.text(ts[-1], y_oos_solo[-1], f'  OOS {fmt_val(y_oos_solo[-1])}',
                     color='#ff9900', fontsize=7, ha='left', va=va_oos)
@@ -3990,7 +4180,7 @@ class ResultadosWidget(QWidget):
                       + 2 * self.tabla_wfa.frameWidth())
         self.tabla_wfa.setFixedHeight(alto_total)
 
-    def _dibujar_mc(self, mc, capital, max_dd_base=None):
+    def _dibujar_mc(self, mc, capital, max_dd_base=None, retorno_base=None):
         if not mc or mc['n_sims'] == 0:
             self.grp_mc.setVisible(False)
             return
@@ -4021,6 +4211,8 @@ class ResultadosWidget(QWidget):
         ret_fin = (mc['finales'] / capital - 1) * 100
         ax2.hist(ret_fin, bins=40, color=VERDE, alpha=0.8)
         ax2.axvline(0, color=GRIS, linewidth=0.7, linestyle='--')
+        if retorno_base is not None:
+            ax2.axvline(retorno_base, color=VERDE, linewidth=0.9, linestyle='--')
         ax2.set_title('Retorno final %', fontsize=8, color=AX_FG)
 
         ax3.hist(mc['max_dds'], bins=40, color=ROJO, alpha=0.8)
@@ -4032,6 +4224,122 @@ class ResultadosWidget(QWidget):
         except Exception:
             pass
         self.canvas_mc.draw_idle()
+
+    def _dibujar_mfe_mae(self, payload):
+        if payload is None:
+            self.grp_mfe_mae.setVisible(False)
+            return
+        tr = payload['resultado']['trades']
+        if len(tr['pnl']) == 0:
+            self.grp_mfe_mae.setVisible(False)
+            return
+        self.grp_mfe_mae.setVisible(True)
+
+        filtro = self.combo_mfe_filtro.currentIndex()  # 0 todas, 1 ganadoras, 2 perdedoras
+        if filtro == 1:
+            mask = tr['pnl'] > 0
+        elif filtro == 2:
+            mask = tr['pnl'] <= 0
+        else:
+            mask = np.ones(len(tr['pnl']), dtype=bool)
+
+        mfe = tr['mfe_r'][mask]
+        mae = tr['mae_r'][mask]
+        r_realizado = tr['r_multiple'][mask]
+        pnl = tr['pnl'][mask]
+        percentil = self.spin_percentil.value()
+
+        self.fig_mfe_mae.clear()
+        if len(mfe) == 0:
+            ax = self.fig_mfe_mae.add_subplot(111)
+            _style_ax(ax)
+            ax.text(0.5, 0.5, 'Sin operaciones para este filtro', ha='center',
+                    va='center', color=AX_FG, fontsize=9, transform=ax.transAxes)
+            self.canvas_mfe_mae.draw_idle()
+            return
+
+        colores = np.where(pnl > 0, VERDE, ROJO)
+        modo = self.combo_mfe_modo.currentIndex()
+        ax1 = self.fig_mfe_mae.add_subplot(121)
+        ax2 = self.fig_mfe_mae.add_subplot(122)
+        for ax in (ax1, ax2):
+            _style_ax(ax)
+
+        if modo == 0:
+            p_mfe = np.percentile(mfe, percentil)
+            p_mae = np.percentile(mae, percentil)
+
+            ax1.scatter(mfe, r_realizado, c=colores, s=30, alpha=0.85,
+                       edgecolors=GRID_C, linewidths=0.4)
+            ax1.axvline(p_mfe, color=GRIS, linewidth=0.9, linestyle='--')
+            ax1.text(p_mfe, ax1.get_ylim()[1], f' P{percentil}={p_mfe:.2f}R',
+                     color=GRIS, fontsize=7, ha='left', va='top')
+            ax1.axhline(0, color=GRIS, linewidth=0.5, linestyle=':')
+            ax1.set_xlabel('MFE alcanzado (R)', fontsize=8, color=AX_FG)
+            ax1.set_ylabel('R realizado', fontsize=8, color=AX_FG)
+            ax1.set_title('Eficiencia MFE', fontsize=8, color=AX_FG)
+
+            ax2.scatter(-mae, r_realizado, c=colores, s=30, alpha=0.85,
+                       edgecolors=GRID_C, linewidths=0.4)
+            ax2.set_xlim(right=0)
+            ax2.axvline(-p_mae, color=GRIS, linewidth=0.9, linestyle='--')
+            ax2.text(-p_mae, ax2.get_ylim()[1], f'P{percentil}={-p_mae:.2f}R ',
+                     color=GRIS, fontsize=7, ha='right', va='top')
+            ax2.axhline(0, color=GRIS, linewidth=0.5, linestyle=':')
+            ax2.set_xlabel('MAE alcanzado (R)', fontsize=8, color=AX_FG)
+            ax2.set_ylabel('R realizado', fontsize=8, color=AX_FG)
+            ax2.set_title('Eficiencia MAE', fontsize=8, color=AX_FG)
+        else:
+            ax1.hist(mfe, bins=30, color=VERDE, alpha=0.8)
+            p_mfe = np.percentile(mfe, percentil)
+            ax1.axvline(p_mfe, color=GRIS, linewidth=0.9, linestyle='--')
+            ax1.text(p_mfe, ax1.get_ylim()[1], f' P{percentil}={p_mfe:.2f}R', color=GRIS,
+                     fontsize=7, ha='left', va='top')
+            ax1.set_title('Máxima Excursión Favorable (R)', fontsize=8, color=AX_FG)
+            ax1.set_xlabel('MFE (R)', fontsize=8, color=AX_FG)
+            ax1.set_ylabel('Nº Trades', fontsize=8, color=AX_FG)
+
+            subset_mfe = mfe[mfe <= p_mfe]
+            if len(subset_mfe) > 0:
+                mu = subset_mfe.mean()
+                sigma = subset_mfe.std()
+                ax1.axvline(mu, color=AZUL, linewidth=1.1, linestyle='-', alpha=0.9)
+                ax1.axvline(mu + sigma, color=AZUL, linewidth=0.8, linestyle='-', alpha=0.35)
+                ax1.axvline(mu - sigma, color=AZUL, linewidth=0.8, linestyle='-', alpha=0.35)
+                ax1.text(0.98, 0.02,
+                         f'μ={mu:.2f}R\n+σ={mu + sigma:.2f}R\n−σ={mu - sigma:.2f}R',
+                         transform=ax1.transAxes, color=AZUL, fontsize=7,
+                         ha='right', va='bottom',
+                         bbox=dict(facecolor=FIG_BG, alpha=0.75, edgecolor='none', pad=3))
+
+            ax2.hist(-mae, bins=30, color=ROJO, alpha=0.8)
+            ax2.set_xlim(right=0)
+            p_mae = np.percentile(mae, percentil)
+            ax2.axvline(-p_mae, color=GRIS, linewidth=0.9, linestyle='--')
+            ax2.text(-p_mae, ax2.get_ylim()[1], f'P{percentil}={-p_mae:.2f}R ', color=GRIS,
+                     fontsize=7, ha='right', va='top')
+            ax2.set_title('Máxima Excursión Adversa (R)', fontsize=8, color=AX_FG)
+            ax2.set_xlabel('MAE (R)', fontsize=8, color=AX_FG)
+            ax2.set_ylabel('Nº Trades', fontsize=8, color=AX_FG)
+
+            subset_mae = mae[mae <= p_mae]
+            if len(subset_mae) > 0:
+                mu = subset_mae.mean()
+                sigma = subset_mae.std()
+                ax2.axvline(-mu, color=AZUL, linewidth=1.1, linestyle='-', alpha=0.9)
+                ax2.axvline(-(mu - sigma), color=AZUL, linewidth=0.8, linestyle='-', alpha=0.35)
+                ax2.axvline(-(mu + sigma), color=AZUL, linewidth=0.8, linestyle='-', alpha=0.35)
+                ax2.text(0.98, 0.02,
+                         f'μ={-mu:.2f}R\n+σ={-(mu - sigma):.2f}R\n−σ={-(mu + sigma):.2f}R',
+                         transform=ax2.transAxes, color=AZUL, fontsize=7,
+                         ha='right', va='bottom',
+                         bbox=dict(facecolor=FIG_BG, alpha=0.75, edgecolor='none', pad=3))
+
+        try:
+            self.fig_mfe_mae.tight_layout(pad=0.6)
+        except Exception:
+            pass
+        self.canvas_mfe_mae.draw_idle()
 
 
 # ══════════════ sub-pestaña Optimizador (comparativa de combinaciones) ══════════════

@@ -1,6 +1,6 @@
 {
-  "nombre": "cruce dax 25-50",
-  "csv": "D:/DATOS/Activos/Limpiados/dax/dax_1d_limpiado.csv",
+  "nombre": "gold medias 50/110",
+  "csv": "A:/Datos/Analitics System Data/Limpiados/FUTURO/goldf/goldf_1d_limpiado.csv",
   "tf": "1d",
   "setups": [
     {
@@ -8,8 +8,8 @@
       "plantilla": "Cruce de medias",
       "params": {
         "tipo": "SMA",
-        "rapida": 25,
-        "lenta": 50,
+        "rapida": 50,
+        "lenta": 110,
         "direccion": "Ambas"
       },
       "riesgo_pct": 0.01,
@@ -35,8 +35,8 @@
   ],
   "config": {
     "capital_inicial": 10000.0,
-    "comision_pct": 0.0007000000000000001,
-    "slippage_pct": 0.0007000000000000001,
+    "comision_pct": 0.0003,
+    "slippage_pct": 0.0002,
     "config_por_setup": {
       "0": {
         "riesgo_pct": 0.01,

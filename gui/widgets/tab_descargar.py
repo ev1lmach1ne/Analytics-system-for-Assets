@@ -114,6 +114,39 @@ class _SymbolSearchThread(QThread):
         self.results_ready.emit(self._query, results)
 
 
+class _ReorganizarCategoriasThread(QThread):
+    """Mueve en segundo plano los activos descargados de <proveedor>/<activo>/
+    a <proveedor>/<categoria>/<activo>/, y a continuación hace lo mismo con
+    los activos ya limpiados (<categoria>/<activo>/ bajo Limpiados/,
+    reparando también las rutas guardadas en Favoritos y en la config del
+    Comparador). Silenciosa (no reporta nada a la UI) y sin bloquear el
+    hilo principal, ya que algunos proveedores resuelven la categoría
+    contra su catálogo (o buscador) en vivo. Ambas migraciones son
+    idempotentes y baratas de re-ejecutar: se lanzan en cada apertura de la
+    pestaña, tanto para ordenar lo nuevo como para reclasificar lo que haya
+    quedado sin categoría clara (carpeta OTROS) en una ejecución anterior.
+    Se ejecutan una tras otra en el mismo hilo (no en paralelo) para evitar
+    que compitan por los mismos archivos."""
+
+    def _ejecutar(self, nombre_script):
+        import importlib.util
+        script_path = os.path.join(SCRIPTS_DIR, nombre_script)
+        spec = importlib.util.spec_from_file_location(nombre_script[:-3], script_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        mod.main()
+
+    def run(self):
+        try:
+            self._ejecutar('reorganizar_categorias.py')
+        except Exception:
+            pass
+        try:
+            self._ejecutar('reorganizar_limpiados.py')
+        except Exception:
+            pass
+
+
 class TabDescargar(QWidget):
     download_completed = pyqtSignal(str)  # emite ruta del CSV
 
@@ -280,6 +313,11 @@ class TabDescargar(QWidget):
 
         # Cargar catalogo inicial
         self._load_catalog()
+
+        # Reorganizar en segundo plano los activos descargados por categoria
+        # (tambien reclasifica lo que haya quedado en OTROS anteriormente).
+        self._reorg_thread = _ReorganizarCategoriasThread(self)
+        self._reorg_thread.start()
 
     # --- Catalogo -------------------------------------------------------------
 
@@ -514,6 +552,7 @@ class TabDescargar(QWidget):
             'DOWNLOAD_PROVIDER': provider_key,
             'DOWNLOAD_SYMBOL': symbol,
             'DOWNLOAD_TF': tf,
+            'DOWNLOAD_CATEGORY': self._selected_symbol.category or '',
             'MPLBACKEND': 'Agg',
             'PYTHONIOENCODING': 'utf-8',
         }

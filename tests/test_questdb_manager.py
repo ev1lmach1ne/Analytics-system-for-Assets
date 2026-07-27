@@ -1,5 +1,6 @@
 import os
 import socket
+import subprocess
 
 import pytest
 
@@ -175,3 +176,70 @@ def test_descargar_throttle_progreso_por_mb(monkeypatch, tmp_path):
     ultimo_msg, ultimo_pct = llamadas[-1]
     assert ultimo_msg == "Descargando Test… 3 MB / 3 MB"
     assert ultimo_pct == 100
+
+
+def _preparar_runtime_mac_falso(tmp_path, monkeypatch):
+    """Crea un runtime/questdb/questdb.sh + runtime/jre/.../bin/java falsos y
+    apunta las carpetas del módulo a tmp_path, para poder ejercitar
+    arrancar_bundled() en la rama Darwin sin tocar disco real del usuario."""
+    monkeypatch.setattr(qm.platform, 'system', lambda: 'Darwin')
+    local_dir = tmp_path / 'local'
+    runtime_dir = local_dir / 'runtime'
+    datos_dir = local_dir / 'data'
+    qdb_dir = runtime_dir / 'questdb'
+    qdb_dir.mkdir(parents=True)
+    questdb_sh = qdb_dir / 'questdb.sh'
+    questdb_sh.write_text('#!/bin/bash\n')
+    java_bin = runtime_dir / 'jre' / 'Contents' / 'Home' / 'bin' / 'java'
+    java_bin.parent.mkdir(parents=True)
+    java_bin.write_text('')
+
+    monkeypatch.setattr(qm, '_carpeta_local', lambda: str(local_dir))
+    monkeypatch.setattr(qm, '_carpeta_runtime', lambda: str(runtime_dir))
+    monkeypatch.setattr(qm, '_carpeta_datos', lambda: str(datos_dir))
+    return str(datos_dir)
+
+
+def test_arrancar_bundled_mac_rc_no_cero_lanza_runtimeerror_con_stderr(monkeypatch, tmp_path):
+    _preparar_runtime_mac_falso(tmp_path, monkeypatch)
+
+    def fake_run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, returncode=1, stdout='', stderr='boom: JAVA_HOME inválido')
+
+    monkeypatch.setattr(qm.subprocess, 'run', fake_run)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        qm.arrancar_bundled()
+    assert 'boom: JAVA_HOME inválido' in str(exc_info.value)
+
+
+def test_arrancar_bundled_mac_rc_cero_no_lanza(monkeypatch, tmp_path):
+    _preparar_runtime_mac_falso(tmp_path, monkeypatch)
+
+    def fake_run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, returncode=0, stdout='ok', stderr='')
+
+    monkeypatch.setattr(qm.subprocess, 'run', fake_run)
+    qm.arrancar_bundled()   # no debe lanzar
+
+
+def test_ultimo_log_questdb_devuelve_tail_del_mas_reciente(tmp_path):
+    log_dir = tmp_path / 'log'
+    log_dir.mkdir()
+    viejo = log_dir / 'log-2024-01-01.txt'
+    viejo.write_text('viejo: todo bien\n')
+    nuevo = log_dir / 'log-2024-01-02.txt'
+    nuevo.write_text('\n'.join(f'linea {i}' for i in range(40)))
+
+    # asegurar que 'nuevo' tiene mtime posterior a 'viejo'
+    ahora = os.path.getmtime(str(nuevo))
+    os.utime(str(viejo), (ahora - 100, ahora - 100))
+
+    tail = qm._ultimo_log_questdb(str(tmp_path), n_lineas=5)
+    assert tail is not None
+    assert 'linea 39' in tail
+    assert 'viejo' not in tail
+
+
+def test_ultimo_log_questdb_sin_carpeta_log_devuelve_none(tmp_path):
+    assert qm._ultimo_log_questdb(str(tmp_path)) is None

@@ -294,6 +294,30 @@ def simular(o, h, l, c, senales, config):
         * trades['unidades']
     trades['costo_comision'] = trades['notional_redondo'] * comision_pct_v
 
+    # MFE/MAE: excursión favorable/adversa máxima durante la vida del trade,
+    # en múltiplos de R (mismo denominador que r_multiple) — aproximación
+    # estándar: usa el rango high/low de las velas [idx_entrada, idx_salida]
+    # inclusive, sin distinguir si el cierre fue a mercado o intra-vela.
+    mfe_precio = np.zeros(n_trades)
+    mae_precio = np.zeros(n_trades)
+    for i in range(n_trades):
+        i0, i1 = trades['idx_entrada'][i], trades['idx_salida'][i]
+        seg_h = h[i0:i1 + 1]
+        seg_l = l[i0:i1 + 1]
+        pin = trades['precio_entrada'][i]
+        if trades['dir'][i] > 0:
+            mfe_precio[i] = seg_h.max() - pin
+            mae_precio[i] = pin - seg_l.min()
+        else:
+            mfe_precio[i] = pin - seg_l.min()
+            mae_precio[i] = seg_h.max() - pin
+
+    with np.errstate(divide='ignore', invalid='ignore'):
+        trades['mfe_r'] = np.where(riesgo_absoluto > 0,
+            mfe_precio * trades['unidades'] / riesgo_absoluto, 0.0)
+        trades['mae_r'] = np.where(riesgo_absoluto > 0,
+            mae_precio * trades['unidades'] / riesgo_absoluto, 0.0)
+
     eq_max = np.maximum.accumulate(equity)
     with np.errstate(divide='ignore', invalid='ignore'):
         drawdown = np.where(eq_max > 0, equity / eq_max - 1.0, 0.0)
@@ -401,6 +425,7 @@ def calcular_metricas(resultado, idx_ini=0, idx_fin=None, velas_por_anio=None):
     m = (tr['idx_entrada'] >= idx_ini) & (tr['idx_entrada'] < idx_fin)
     pnl = tr['pnl'][m]
     ret_pct = tr['ret_pct'][m]
+    r_m = tr['r_multiple'][m]
     dur = (tr['idx_salida'][m] - tr['idx_entrada'][m])
 
     out = {'n_trades': int(m.sum()), 'win_rate': None, 'profit_factor': None,
@@ -450,7 +475,7 @@ def calcular_metricas(resultado, idx_ini=0, idx_fin=None, velas_por_anio=None):
         ganancia = float(pnl[ganadores].sum())
         perdida = float(-pnl[~ganadores].sum())
         out['profit_factor'] = (ganancia / perdida) if perdida > 0 else float('inf')
-        out['expectancy_pct'] = float(ret_pct.mean()) * 100.0
+        out['expectancy_pct'] = float(r_m.mean())
         out['duracion_media'] = float(dur.mean())
         # racha perdedora máxima
         racha = peor = 0

@@ -10,3 +10,6 @@ tick_vault_data/
 data/
 *.lnk
 venv/
+dist/
+cache/
+*.spec

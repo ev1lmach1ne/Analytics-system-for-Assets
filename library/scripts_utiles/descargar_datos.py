@@ -14,7 +14,7 @@ Variables de entorno:
   DOWNLOAD_OUTPUT    - (opcional) Ruta de salida. Default: auto
 
 Salida CSV:
-  D:\\DATOS\\Activos\\<symbol>\\<symbol>_<tf>_<MM-YYYY>_to_<MM-YYYY>.csv
+  D:\\DATOS\\Activos\\<fuente>\\<categoria>\\<simbolo>\\<simbolo>_<tf>_<MM-YYYY>_to_<MM-YYYY>.csv
   Columnas: timestamp,open,high,low,close,volume,spread
 
 Uso desde CLI:
@@ -28,7 +28,7 @@ from datetime import datetime, timezone
 # Path setup para poder importar core
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
-from core.config import BASE_DATA
+from core.config import BASE_DATA, normalizar_categoria_descarga
 from core.data_providers.dukascopy_provider import DukascopyProvider
 from core.data_providers.yfinance_provider import YFinanceProvider
 from core.data_providers.ccxt_provider import CCXTProvider
@@ -50,14 +50,16 @@ def _log(msg: str):
     print(msg, flush=True)
 
 
-def _determine_output_path(provider_name: str, symbol: str, tf: str, df) -> str:
+def _determine_output_path(provider_name: str, category_raw: str, symbol: str,
+                           tf: str, df) -> str:
     """
     Construye la ruta de salida:
-    D:\\DATOS\\Activos\\<fuente>\\<simbolo>\\<simbolo>_<tf>_<YYYY-MM-DD>_to_<YYYY-MM-DD>.csv
+    D:\\DATOS\\Activos\\<fuente>\\<categoria>\\<simbolo>\\<simbolo>_<tf>_<YYYY-MM-DD>_to_<YYYY-MM-DD>.csv
     """
+    categoria = normalizar_categoria_descarga(category_raw)
     symbol_slug = symbol.lower().translate(
         str.maketrans({k: '_' for k in '/:<>"|?*\\'}))
-    asset_dir = os.path.join(BASE_DATA, provider_name, symbol_slug)
+    asset_dir = os.path.join(BASE_DATA, provider_name, categoria, symbol_slug)
     os.makedirs(asset_dir, exist_ok=True)
 
     first_ts = df['timestamp'].iloc[0]
@@ -74,6 +76,7 @@ def main():
     provider_name = os.environ.get('DOWNLOAD_PROVIDER', 'dukascopy').lower()
     symbol = os.environ.get('DOWNLOAD_SYMBOL', '')
     tf = os.environ.get('DOWNLOAD_TF', '1h')
+    category_raw = os.environ.get('DOWNLOAD_CATEGORY', '')
     start_str = os.environ.get('DOWNLOAD_START', '')
     end_str = os.environ.get('DOWNLOAD_END', '')
     custom_output = os.environ.get('DOWNLOAD_OUTPUT', '')
@@ -82,6 +85,7 @@ def main():
     _log(f"DESCARGA DE DATOS")
     _log(f"  Provider: {provider_name}")
     _log(f"  Simbolo:  {symbol}")
+    _log(f"  Categoria: {normalizar_categoria_descarga(category_raw)}")
     _log(f"  TF:       {tf}")
     if start_str:
         _log(f"  Desde:    {start_str}")
@@ -165,7 +169,7 @@ def main():
         output_path = custom_output
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
     else:
-        output_path = _determine_output_path(provider_name, symbol, tf, df)
+        output_path = _determine_output_path(provider_name, category_raw, symbol, tf, df)
 
     # Guardar
     df_to_save.to_csv(output_path, index=False)

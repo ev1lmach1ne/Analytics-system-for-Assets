@@ -85,6 +85,47 @@ def test_trade_short_pnl_exacto():
     assert r['capital_final'] == pytest.approx(10250.0)
 
 
+def test_mfe_mae_long():
+    # mismo trade que test_trade_long_pnl_exacto (entra t=3 a 100, sale
+    # t=6 a 110, unidades=25, riesgo_absoluto=100) pero con una excursión
+    # intermedia: en t=4 el precio sube hasta 108 (favorable) y baja hasta
+    # 95 (adverso) antes de que la señal de salida se ejecute en t=6.
+    # mfe = 108-100 = 8 -> mfe_r = 8*25/100 = 2.0
+    # mae = 100-95 = 5  -> mae_r = 5*25/100 = 1.25
+    n = 10
+    o, h, l, c = _ohlc_plano(n)
+    o[6] = 110.0
+    h[4] = 108.0
+    l[4] = 95.0
+    s = _senales_vacias(n)
+    s['entradas_long'][2] = True
+    s['salidas_long'][5] = True
+    r = simular(o, h, l, c, s, CONFIG_BASE)
+    t = r['trades']
+    assert t['mfe_r'][0] == pytest.approx(2.0)
+    assert t['mae_r'][0] == pytest.approx(1.25)
+
+
+def test_mfe_mae_short():
+    # mismo trade que test_trade_short_pnl_exacto (entra corto t=3 a 100,
+    # sale t=6 a 90) con excursión intermedia en t=4: sube hasta 106
+    # (adverso para un corto) y baja hasta 93 (favorable).
+    # mfe = 100-93 = 7 -> mfe_r = 7*25/100 = 1.75
+    # mae = 106-100 = 6 -> mae_r = 6*25/100 = 1.5
+    n = 10
+    o, h, l, c = _ohlc_plano(n)
+    o[6] = 90.0
+    h[4] = 106.0
+    l[4] = 93.0
+    s = _senales_vacias(n)
+    s['entradas_short'][2] = True
+    s['salidas_short'][5] = True
+    r = simular(o, h, l, c, s, CONFIG_BASE)
+    t = r['trades']
+    assert t['mfe_r'][0] == pytest.approx(1.75)
+    assert t['mae_r'][0] == pytest.approx(1.5)
+
+
 def test_comision_en_corto_cobrada_una_vez_por_ambos_lados():
     n = 10
     o, h, l, c = _ohlc_plano(n)

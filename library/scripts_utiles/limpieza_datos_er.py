@@ -9,7 +9,7 @@ warnings.filterwarnings('ignore')
 import sys
 sys.stdout.reconfigure(encoding='utf-8')
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
-from core.config import CONFIG_PATH, LIMPIADOS_DIR, DB_CONFIG
+from core.config import CONFIG_PATH, LIMPIADOS_DIR, DB_CONFIG, normalizar_categoria_descarga
 from core.metrics import calcular_umbrales_er, contar_regimen_hurst, hurst_rs_numba, calcular_hurst_array
 
 
@@ -25,11 +25,13 @@ if os.path.exists(CONFIG_PATH):
     TABLA      = f"{sesion['nombre']}_candles_{sesion['tf']}"
     FRECUENCIA = sesion['tf']
     ACTIVO     = sesion['activo'].lower()
+    CATEGORIA  = normalizar_categoria_descarga(sesion.get('categoria', ''))
     print(f"↳ Config desde sesión: {TABLA}")
 else:
     TABLA      = 'xauusd_candles_1h'
     FRECUENCIA = '1h'
     ACTIVO     = 'futuro'
+    CATEGORIA  = 'OTROS'
     print("↳ Usando config manual (sin sesion_config.json)")
 
 # Mapear timeframe de usuario ('1m','5m','1h','1d') a frecuencia pandas ('1min','5min','1H','1D')
@@ -49,7 +51,8 @@ print(f"      Frecuencia pandas: {FRECUENCIA_PD}")
 
 OUTPUT_DIR  = LIMPIADOS_DIR
 nombre_activo = TABLA.split('_')[0]
-OUTPUT = os.path.join(OUTPUT_DIR, nombre_activo, f"{nombre_activo}_{FRECUENCIA}_limpiado.csv")
+OUTPUT = os.path.join(OUTPUT_DIR, CATEGORIA, nombre_activo,
+                       f"{nombre_activo}_{FRECUENCIA}_limpiado.csv")
 os.makedirs(os.path.dirname(OUTPUT), exist_ok=True)
 # ─────────────────────────────────────────────────────────
 # endregion

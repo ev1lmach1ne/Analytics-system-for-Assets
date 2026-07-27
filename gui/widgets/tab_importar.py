@@ -6,7 +6,8 @@ from PyQt6.QtCore import Qt, pyqtSignal
 from gui.widgets.file_explorer import FileExplorer
 from gui.widgets.console_widget import ConsoleWidget
 from gui.questdb_bootstrap import mostrar_bootstrap_questdb
-from core.config import get_base_data, LIMPIADOS_DIR, TF_LABELS, TIPO_LABELS, TIPO_MAP, SCRIPTS_DIR
+from core.config import (get_base_data, LIMPIADOS_DIR, TF_LABELS, TIPO_LABELS,
+                          TIPO_MAP, SCRIPTS_DIR, CATEGORIAS_DESCARGA_CONOCIDAS)
 
 STYLE_IMPORT = """
 QWidget { background-color: #141e30; }
@@ -177,6 +178,21 @@ class TabImportar(QWidget):
             self.btn_config.setEnabled(True)
             self.btn_delete.setEnabled(True)
 
+    def _detectar_categoria(self, src_path):
+        """Intenta extraer la categoria de descarga (FOREX/METAL/CRYPTO/...)
+        del path de origen, que si viene de Descargar ya trae la forma
+        <proveedor>/<categoria>/<activo>/archivo.csv. Si no se puede
+        determinar (archivo elegido a mano fuera de esa estructura),
+        devuelve 'OTROS'."""
+        try:
+            relativo = os.path.relpath(src_path, self._base_data)
+        except ValueError:
+            return 'OTROS'
+        for parte in os.path.normpath(relativo).split(os.sep):
+            if parte.upper() in CATEGORIAS_DESCARGA_CONOCIDAS:
+                return parte.upper()
+        return 'OTROS'
+
     def _run_import(self):
         if not self._selected_file:
             return
@@ -198,6 +214,7 @@ class TabImportar(QWidget):
             'nombre': nombre,
             'tf': self.tf_input.currentText(),
             'activo': TIPO_MAP[self.tipo_input.currentText()],
+            'categoria': self._detectar_categoria(self._selected_file),
             'rf_rate': rf_val,
         }
 
@@ -302,7 +319,7 @@ class TabImportar(QWidget):
         if not cfg:
             return
         cleaned_path = os.path.join(
-            LIMPIADOS_DIR, cfg['nombre'],
+            LIMPIADOS_DIR, cfg.get('categoria', 'OTROS'), cfg['nombre'],
             f"{cfg['nombre']}_{cfg['tf']}_limpiado.csv"
         )
         meta = {

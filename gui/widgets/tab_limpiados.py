@@ -287,13 +287,12 @@ class TabLimpiados(QWidget):
     def _scan_assets(self):
         assets = set()
         if os.path.isdir(self._limpiados_dir):
-            for entry in os.listdir(self._limpiados_dir):
-                sub = os.path.join(self._limpiados_dir, entry)
-                if os.path.isdir(sub):
-                    for f in os.listdir(sub):
-                        if f.endswith('_limpiado.csv') or f.endswith('_limpio.csv'):
-                            assets.add(entry)
-                            break
+            for root, dirs, files in os.walk(self._limpiados_dir):
+                if 'Informes' in root:
+                    continue
+                if any(f.endswith('_limpiado.csv') or f.endswith('_limpio.csv')
+                       for f in files):
+                    assets.add(os.path.basename(root))
         self.asset_combo.blockSignals(True)
         self.asset_combo.clear()
         self.asset_combo.addItem("-- Seleccionar activo --")
@@ -302,14 +301,30 @@ class TabLimpiados(QWidget):
         self.asset_combo.blockSignals(False)
         self.asset_table.setRowCount(0)
 
+    def _encontrar_carpeta_activo(self, nombre):
+        """Localiza la carpeta de un activo dentro de Limpiados, sin asumir
+        profundidad fija: puede estar directo bajo Limpiados/ (estructura
+        antigua, o migracion aun no ejecutada) o dentro de una carpeta de
+        categoria como Limpiados/FOREX/."""
+        directo = os.path.join(self._limpiados_dir, nombre)
+        if os.path.isdir(directo):
+            return directo
+        if os.path.isdir(self._limpiados_dir):
+            for root, dirs, _files in os.walk(self._limpiados_dir):
+                if 'Informes' in root:
+                    continue
+                if os.path.basename(root) == nombre:
+                    return root
+        return None
+
     def _on_asset_combo_changed(self, idx):
         if idx <= 0:
             self.asset_table.setRowCount(0)
             return
         nombre = self.asset_combo.currentText()
-        asset_dir = os.path.join(self._limpiados_dir, nombre)
+        asset_dir = self._encontrar_carpeta_activo(nombre)
         files = []
-        if os.path.isdir(asset_dir):
+        if asset_dir and os.path.isdir(asset_dir):
             for f in os.listdir(asset_dir):
                 if f.endswith('_limpiado.csv') or f.endswith('_limpio.csv'):
                     files.append(os.path.join(asset_dir, f))

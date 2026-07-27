@@ -117,6 +117,40 @@ TF_LABELS  = ['30s', '1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '1d']
 TIPO_LABELS = ['Futuro/Cfd', 'Forex', 'Stock', 'Crypto']
 TIPO_MAP    = {'Futuro/Cfd': 'FUTURO', 'Forex': 'FOREX', 'Stock': 'STOCK', 'Crypto': 'CRYPTO'}
 
+# Normalización del AssetInfo.category de los proveedores de descarga (cada
+# uno usa su propio vocabulario: 'Cripto', 'CRYPTOCURRENCY', 'Perps Crypto'...)
+# a una carpeta canónica, para organizar BASE_DATA/<proveedor>/<categoria>/<activo>/.
+# Independiente de TIPO_MAP (esa es para presets de fricción, no para carpetas).
+CATEGORIA_DESCARGA_MAP = {
+    'forex': 'FOREX', 'fx': 'FOREX', 'currency': 'FOREX',
+    'metal': 'METAL',
+    'metal-etf': 'METAL-ETF',
+    'cripto': 'CRYPTO', 'crypto': 'CRYPTO', 'cryptocurrency': 'CRYPTO',
+    'perps crypto': 'CRYPTO',
+    'indice': 'INDICE', 'indices': 'INDICE', 'index': 'INDICE',
+    'accion': 'ACCION', 'acciones': 'ACCION', 'equity': 'ACCION',
+    'etf': 'ETF',
+    'commodities': 'COMMODITIES',
+    'future': 'FUTURO',
+}
+
+
+def normalizar_categoria_descarga(categoria: str) -> str:
+    """Normaliza el 'category' de un AssetInfo (que varía de proveedor a
+    proveedor) a una carpeta canónica para organizar las descargas."""
+    if not categoria or categoria == 'Personalizado':
+        return 'OTROS'
+    clave = categoria.strip().lower()
+    return CATEGORIA_DESCARGA_MAP.get(clave, categoria.strip().upper())
+
+
+# Carpetas de categoría ya canónicas (valores de CATEGORIA_DESCARGA_MAP +
+# el cajón 'OTROS'). Se usa para detectar, dado un path, si alguno de sus
+# segmentos ya es una carpeta de categoría (en vez de una carpeta de
+# activo o de proveedor) — tanto en los scripts de reorganización como al
+# detectar la categoría de origen al importar un CSV.
+CATEGORIAS_DESCARGA_CONOCIDAS = set(CATEGORIA_DESCARGA_MAP.values()) | {'OTROS'}
+
 TF_PATTERN = re.compile(r'_(\d+[a-z]+)_limpiado|_(\d+[a-z]+)_limpio')
 
 # Fricción aproximada POR LADO (en %, como los muestran los spinboxes del
@@ -207,6 +241,29 @@ def tf_to_minutes(tf, activo=None):
     if unit == 'mo':
         return num * 43200
     return num
+
+
+def velas_a_tiempo_legible(velas, tf_label):
+    """Convierte N velas de una temporalidad a texto legible.
+    Ej: 120 velas M5 → '10h'  /  34 velas H1 → '1d 10h'."""
+    if velas is None or tf_label is None:
+        return "—"
+    min_vela = tf_to_minutes(tf_label)
+    if min_vela is None:
+        return "—"
+    total_min = velas * min_vela
+    dias = int(total_min // 1440)
+    resto = total_min % 1440
+    horas = int(resto // 60)
+    minutos = int(resto % 60)
+    partes = []
+    if dias > 0:
+        partes.append(f"{dias}d")
+    if horas > 0:
+        partes.append(f"{horas}h")
+    if minutos > 0 and not partes:
+        partes.append(f"{minutos}min")
+    return " ".join(partes) if partes else "0h"
 
 
 # minutos de sesión/día de trading y días de trading al año por clase de

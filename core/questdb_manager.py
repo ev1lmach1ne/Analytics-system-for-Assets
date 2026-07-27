@@ -199,12 +199,25 @@ def descargar_runtime(progress_cb=None):
             tar_jre = os.path.join(tmp_dir, 'jre-mac.tar.gz')
             _descargar(url_jre, tar_jre, progress_cb, 'Java (Temurin)')
             _extraer(tar_jre, os.path.join(runtime_dir, 'jre'), progress_cb, 'Java')
+            _quitar_cuarentena_mac(runtime_dir)
     finally:
         try:
             import shutil
             shutil.rmtree(tmp_dir, ignore_errors=True)
         except Exception:
             pass
+
+
+def _quitar_cuarentena_mac(runtime_dir):
+    """Best-effort: `urllib`/`tarfile` no marcan com.apple.quarantine, pero un
+    binario descargado y sin firmar puede acabar bloqueado por Gatekeeper de
+    todos modos según la versión de macOS. No debe romper la instalación si
+    `xattr` no existe o el atributo no está presente."""
+    try:
+        subprocess.run(['xattr', '-dr', 'com.apple.quarantine', runtime_dir],
+                       timeout=15, capture_output=True, text=True)
+    except Exception:
+        pass
 
 
 def _aplanar_subdirectorio_unico(carpeta):
@@ -253,6 +266,9 @@ def arrancar_bundled():
         if not os.path.isfile(questdb_sh) or not java_bin:
             raise RuntimeError("No se encontró el runtime de QuestDB descargado")
         os.chmod(questdb_sh, 0o755)
+        os.chmod(java_bin, 0o755)   # tarfile suele preservar el bit +x, pero si
+                                     # el JRE viene sin él, questdb.sh no puede
+                                     # lanzar java y falla de forma opaca
         java_home = os.path.dirname(os.path.dirname(java_bin))   # .../bin/java -> Home
         env = _env_puertos()
         env['JAVA_HOME'] = java_home
@@ -260,8 +276,26 @@ def arrancar_bundled():
         # (gestiona su propio start/status/stop con el PID por su cuenta) —
         # no hay un Popen "nuestro" que trackear, por eso detener_bundled()
         # en Mac llama a `questdb.sh stop` en vez de terminar un proceso.
-        subprocess.run(['bash', questdb_sh, 'start', '-d', datos_dir],
-                       env=env, timeout=30, capture_output=True, text=True)
+        resultado = subprocess.run(
+            ['/bin/bash', questdb_sh, 'start', '-d', datos_dir],
+            env=env, cwd=qdb_dir, timeout=30, capture_output=True, text=True)
+        # dejar rastro persistente igual que Windows vuelca a questdb.log
+        salida = ((resultado.stdout or '') + (resultado.stderr or '')).strip()
+        if salida:
+            try:
+                with open(os.path.join(_carpeta_local(), 'questdb.log'), 'a',
+                          encoding='utf-8') as log_file:
+                    log_file.write(f"\n--- questdb.sh start (rc={resultado.returncode}) ---\n")
+                    log_file.write(salida + "\n")
+            except OSError:
+                pass
+        # questdb.sh start devolviendo != 0 es un fallo claro (JAVA_HOME mal,
+        # permisos, script roto): propagarlo con su salida real en vez de
+        # dejar que ensure_running muestre solo "no respondió a tiempo".
+        if resultado.returncode != 0:
+            detalle = salida or "(sin salida)"
+            raise RuntimeError(
+                f"questdb.sh start falló (código {resultado.returncode}): {detalle}")
         return
 
     raise RuntimeError(f"Sistema operativo no soportado: {sistema}")
@@ -287,13 +321,36 @@ def detener_bundled():
         return
 
     if sistema == 'Darwin':
-        questdb_sh = os.path.join(_carpeta_runtime(), 'questdb', 'questdb.sh')
+        qdb_dir = os.path.join(_carpeta_runtime(), 'questdb')
+        questdb_sh = os.path.join(qdb_dir, 'questdb.sh')
         if os.path.isfile(questdb_sh):
             try:
-                subprocess.run(['bash', questdb_sh, 'stop', '-d', _carpeta_datos()],
-                               timeout=30, capture_output=True, text=True)
+                subprocess.run(['/bin/bash', questdb_sh, 'stop', '-d', _carpeta_datos()],
+                               cwd=qdb_dir, timeout=30, capture_output=True, text=True)
             except Exception:
                 pass
+
+
+def _ultimo_log_questdb(datos_dir, n_lineas=30):
+    """QuestDB escribe su propio log bajo <datos_dir>/log/*.log — a diferencia
+    de questdb.sh (que solo informa si pudo LANZAR el proceso), este log es
+    donde queda el motivo real si el servidor arranca y se cae durante el
+    boot (puerto ocupado, JRE incompatible, etc). Devuelve las últimas
+    `n_lineas` del fichero más reciente, o None si no hay ninguno."""
+    log_dir = os.path.join(datos_dir, 'log')
+    if not os.path.isdir(log_dir):
+        return None
+    try:
+        candidatos = [os.path.join(log_dir, f) for f in os.listdir(log_dir)
+                     if f.endswith(('.log', '.txt'))]
+        if not candidatos:
+            return None
+        mas_reciente = max(candidatos, key=os.path.getmtime)
+        with open(mas_reciente, encoding='utf-8', errors='replace') as fh:
+            lineas = fh.readlines()
+        return ''.join(lineas[-n_lineas:]).strip() or None
+    except OSError:
+        return None
 
 
 # ══════════════ orquestador ══════════════
@@ -329,4 +386,13 @@ def ensure_running(progress_cb=None, timeout_arranque=20):
         if is_reachable():
             return True, "QuestDB arrancada"
         time.sleep(0.5)
-    return False, "QuestDB no respondió a tiempo tras arrancarla"
+
+    mensaje = "QuestDB no respondió a tiempo tras arrancarla"
+    # en Mac, questdb.sh ya devolvió éxito con solo lanzar el proceso — si
+    # luego el servidor se cae durante el boot, el motivo real solo queda en
+    # su propio log, no en la salida de questdb.sh
+    if platform.system() == 'Darwin':
+        tail = _ultimo_log_questdb(_carpeta_datos())
+        if tail:
+            mensaje += f"\n\nÚltimas líneas del log de QuestDB:\n{tail}"
+    return False, mensaje
