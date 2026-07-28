@@ -1175,7 +1175,7 @@ def codigo_setup(setup, indice=0):
                 g_label += f' {g["val"]:g}×ATR'
             trigger = f'cuando el precio ≥ +{r:g} R' if r > 0 else 'a la señal del indicador'
             lineas.append(
-                f"    Salida {e} ({pct:g}%): {trigger}"
+                f"    Salida {e} ({pct:g}% del total): {trigger}"
                 f" → gestión: {g_label}")
 
     filtros_lineas = _desc_filtros(setup.get('filtros'))

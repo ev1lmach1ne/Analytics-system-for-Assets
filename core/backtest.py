@@ -57,6 +57,7 @@ def _simular_numba(o, h, l, c, ent_long, ent_short, sal_long, sal_short,
     dir_pos = 0
     precio_in = 0.0
     unidades = 0.0
+    unidades_iniciales = 0.0
     stop_precio = 0.0
     tp_precio = 0.0
     idx_in = 0
@@ -102,6 +103,7 @@ def _simular_numba(o, h, l, c, ent_long, ent_short, sal_long, sal_short,
             riesgo = riesgos_setup[pendiente_setup]
             if dist > 0 and riesgo > 0 and cap > 0:
                 unidades = (cap * riesgo) / dist
+                unidades_iniciales = unidades
                 en_pos = True
                 dir_pos = d
                 precio_in = precio
@@ -168,9 +170,10 @@ def _simular_numba(o, h, l, c, ent_long, ent_short, sal_long, sal_short,
 
                 if dispara:
                     pct = parc_pct_setup[setup_in, etapa_actual] / 100.0
-                    if pct >= 1.0:
-                        pct = 1.0
-                    u_cerrar = unidades * pct
+                    u_cerrar = unidades_iniciales * pct
+                    cierra_todo = u_cerrar >= unidades
+                    if cierra_todo:
+                        u_cerrar = unidades   # no queda más que esto: cierra el resto
                     precio_temp = max(precio_in, precio_in + r_trig * dist_pos * dir_pos) \
                         if dir_pos > 0 else min(precio_in, precio_in + r_trig * dist_pos * dir_pos)
                     if r_trig <= 0.0:
@@ -193,7 +196,7 @@ def _simular_numba(o, h, l, c, ent_long, ent_short, sal_long, sal_short,
                     trades[n_trades, _T_PARCIAL] = etapa_actual + 1
                     n_trades += 1
 
-                    if pct >= 1.0:
+                    if cierra_todo:
                         en_pos = False
                         pendiente_salida = False
                     else:

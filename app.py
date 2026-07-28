@@ -1,4 +1,4 @@
-import sys, os, ctypes, time
+import sys, os, ctypes, time, threading
 sys.path.insert(0, os.path.dirname(__file__))
 
 # Verificación temprana de dependencias: si falta alguna librería crítica
@@ -79,6 +79,11 @@ def main():
     app_icon = QIcon(icon_path)
     app.setWindowIcon(app_icon)
 
+    # Si falta la configuración inicial, mostrar el diálogo sin splash para
+    # que no quede una ventana encima del diálogo de primera apertura.
+    if not _ensure_config():
+        sys.exit(0)
+
     # Splash screen con fade-in mientras carga la app
     # Usamos pixmap(256,256) para obtener la mejor resolución del .ico
     splash_px = app_icon.pixmap(256, 256).scaled(300, 300,
@@ -92,16 +97,30 @@ def main():
         app.processEvents()
         time.sleep(0.03)
 
-    if not _ensure_config():
-        splash.close()
-        sys.exit(0)
-
     # Importar DESPUÉS de _ensure_config(): los módulos de las pestañas copian
     # LIMPIADOS_DIR al importarse, y en el primer arranque BASE_DATA no queda
     # fijado hasta que el usuario elige carpeta en el FirstLaunchDialog.
-    from gui.main_window import MainWindow
+    #
+    # Este import tarda varios segundos (scipy/pandas/matplotlib) — si se
+    # hiciera de forma síncrona, la app dejaría de procesar eventos durante
+    # todo ese tiempo y Windows la marcaría "sin responder", dibujando
+    # ventanas fantasma detrás del splash. Se hace en un hilo aparte
+    # (solo importa módulos Python, no crea widgets) mientras el hilo
+    # principal sigue bombeando el bucle de eventos.
+    _resultado_import = {}
 
-    window = MainWindow()
+    def _importar_main_window():
+        from gui.main_window import MainWindow
+        _resultado_import['MainWindow'] = MainWindow
+
+    hilo_import = threading.Thread(target=_importar_main_window, daemon=True)
+    hilo_import.start()
+    while hilo_import.is_alive():
+        app.processEvents()
+        time.sleep(0.03)
+    hilo_import.join()
+
+    window = _resultado_import['MainWindow']()
     window.setWindowIcon(app_icon)
 
     # Fade out del splash — luego mostramos la ventana
