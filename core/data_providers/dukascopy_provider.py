@@ -27,11 +27,12 @@ BASE_URL = "https://datafeed.dukascopy.com/datafeed/"
 HEADERS = {'User-Agent': 'Mozilla/5.0'}
 REQUEST_TIMEOUT = 30
 RETRY_BASE_DELAY = 2.0
-RETRY_MAX_DELAY = 60.0        # techo de backoff: un hueco de datos por
-                              # rate-limit es peor que tardar mas, asi que
-                              # los fallos transitorios se reintentan sin
-                              # limite de intentos (solo 404 = sin datos
-                              # real se acepta sin reintentar)
+RETRY_MAX_DELAY = 60.0        # techo de backoff exponencial por intento
+RETRY_MAX_ATTEMPTS = 8        # tope de reintentos ante fallos transitorios
+                              # (429/503/timeouts/conexion cortada); al
+                              # superarlo esa hora se cuenta como error y
+                              # la descarga sigue con las demas, en vez de
+                              # bloquear el worker para siempre
 _PARALLEL_WORKERS = 8         # conexiones simultáneas (Dukascopy es restrictivo).
                               # El pacing ya no es un sleep fijo entre requests
                               # (no escala para 2 décadas de datos): se logra
@@ -156,15 +157,23 @@ def _decode_bi5(content: bytes, hour_start: datetime, pipet_scale: float) -> np.
     return out
 
 
+class _MaxRetriesExceeded(Exception):
+    """Se agotaron los reintentos para un chunk sin obtener una respuesta valida."""
+
+
 def _fetch_chunk(url: str, progress_callback=None) -> Optional[bytes]:
     """Descarga un chunk .bi5.
 
-    404 = Dukascopy confirma que no hay datos en esa hora (fin de semana,
-    festivo...): respuesta legitima, no se reintenta.
+    404, o 200 con cuerpo vacio, confirman que no hay datos en esa hora
+    (fin de semana, festivo, par poco liquido...): respuesta legitima, no
+    se reintenta. Dukascopy no siempre usa 404 para esto; a menudo responde
+    200 con 0 bytes.
     Cualquier otro resultado (429/503, HTTP inesperado, timeout, conexion
-    cortada) se considera transitorio y se reintenta indefinidamente con
-    backoff exponencial acotado a RETRY_MAX_DELAY, para no dejar huecos
-    falsos en el historico por un rate-limit temporal.
+    cortada) se considera transitorio y se reintenta con backoff
+    exponencial acotado a RETRY_MAX_DELAY, hasta un maximo de
+    RETRY_MAX_ATTEMPTS intentos; superado ese limite se lanza
+    _MaxRetriesExceeded para que el llamador cuente la hora como error en
+    vez de bloquear el worker para siempre.
     """
     attempt = 0
     while True:
@@ -172,18 +181,26 @@ def _fetch_chunk(url: str, progress_callback=None) -> Optional[bytes]:
             r = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
             if r.status_code == 200 and r.content:
                 return r.content
-            elif r.status_code == 404:
+            elif r.status_code == 404 or r.status_code == 200:
                 return None  # No hay datos en esa hora (legitimo)
+            if attempt >= RETRY_MAX_ATTEMPTS:
+                raise _MaxRetriesExceeded(
+                    f"HTTP {r.status_code} tras {attempt} intentos: {url}"
+                )
             delay = min(RETRY_BASE_DELAY * (2 ** attempt), RETRY_MAX_DELAY)
             if progress_callback:
                 progress_callback(f"   HTTP {r.status_code}, reintentando en {delay:.0f}s (intento {attempt + 1})...")
             time.sleep(delay)
-        except (requests.Timeout, requests.ConnectionError) as e:
+        except requests.exceptions.RequestException as e:
+            if attempt >= RETRY_MAX_ATTEMPTS:
+                raise _MaxRetriesExceeded(
+                    f"{e.__class__.__name__} tras {attempt} intentos: {url}"
+                ) from e
             delay = min(RETRY_BASE_DELAY * (2 ** attempt), RETRY_MAX_DELAY)
             if progress_callback:
                 progress_callback(f"   Error de red ({e.__class__.__name__}), reintentando en {delay:.0f}s (intento {attempt + 1})...")
             time.sleep(delay)
-        attempt = min(attempt + 1, 10)  # evita crecer sin limite el exponente en fallos muy largos
+        attempt += 1
 
 
 def _generate_hourly_datetimes(start: datetime, end: datetime) -> List[datetime]:
@@ -319,7 +336,12 @@ class DukascopyProvider(BaseProvider):
 
         def _process_hour(hour_dt):
             url = _build_url(symbol, hour_dt)
-            content = _fetch_chunk(url, progress_callback)
+            try:
+                content = _fetch_chunk(url, progress_callback)
+            except Exception as e:
+                if progress_callback:
+                    progress_callback(f"   Error descarga {hour_dt}: {e}")
+                return _SENTINEL_ERROR
             if content is None:
                 return _SENTINEL_NODATA
             try:

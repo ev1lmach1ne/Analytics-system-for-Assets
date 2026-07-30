@@ -17,7 +17,9 @@ import itertools
 
 import numpy as np
 
-from core.backtest import dividir_is_oos, simular, calcular_metricas
+from core.backtest import (
+    dividir_is_oos, simular, calcular_metricas, MECANISMOS_SALIDA,
+)
 from core.strategies import generar_senales_sistema
 
 LIMITE_COMBOS_DEFECTO = 2000
@@ -154,9 +156,14 @@ def optimizar_setup(df, setup_base, sweep_params, sweep_riesgo, config_global,
             'tp_r': float(setup.get('tp_r', 0.0)),
             'salida_n_velas': int(setup.get('salida_n_velas', 0)),
             'be_atr': float(setup.get('be_atr', 0.0)),
+            'be_unidad': setup.get('be_unidad', 'atr'),
             'trailing_atr': float(setup.get('trailing_atr', 0.0)),
             'parciales': setup.get('parciales', []),
+            'tramos': setup.get('tramos', []),
         }}
+        for clave_mec in MECANISMOS_SALIDA:
+            if setup.get(clave_mec):
+                config['config_por_setup'][0][clave_mec] = setup[clave_mec]
         resultado = simular(o, h, l, c, senales, config)
         met = calcular_metricas(resultado, 0, n_is, velas_por_anio)
 

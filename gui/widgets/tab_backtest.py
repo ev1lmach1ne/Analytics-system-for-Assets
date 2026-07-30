@@ -26,6 +26,7 @@ Backtest y optimización corren en QThreads (las funciones numba usan nogil,
 la GUI no se congela). Payload y señales calculadas con core/backtest,
 core/optimizer y core/strategies.
 """
+import copy
 import html
 import inspect
 import json
@@ -35,8 +36,8 @@ import shutil
 
 import numpy as np
 import pandas as pd
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QDate, QSize, QEvent, QTimer
-from PyQt6.QtGui import QColor, QShortcut
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QDate, QSize, QEvent, QTimer, QRectF
+from PyQt6.QtGui import QColor, QShortcut, QKeySequence, QPainter, QPen, QPalette
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QComboBox,
     QCheckBox, QScrollArea, QFrame, QTableWidget, QTableWidgetItem,
@@ -49,7 +50,6 @@ from PyQt6.QtWidgets import (
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
-from matplotlib.widgets import RangeSlider
 from matplotlib.dates import date2num, num2date
 import matplotlib.dates as mdates
 from matplotlib.collections import PolyCollection, LineCollection
@@ -64,6 +64,7 @@ from core.config import (
 )
 from core.backtest import (
     simular, dividir_is_oos, calcular_metricas, montecarlo, MOTIVOS_SALIDA,
+    MECANISMOS_SALIDA,
 )
 from core.optimizer import (
     optimizar_setup, n_combinaciones, LIMITE_COMBOS_DEFECTO, PREFIJO_RIESGO,
@@ -74,7 +75,9 @@ from core.strategies import (
     ESTRATEGIAS, params_por_defecto, generar_senales_sistema,
     describir, describir_setup, codigo_sistema, defaults_setup, MAX_SETUPS,
     _INDICADORES_REGLA, _OPERADORES_REGLA, _filtros_por_defecto,
-    _mascaras_condiciones_dir,
+    _mascaras_condiciones_dir, etapa_salida_por_defecto, filas_plantilla,
+    trigger_etapa, salida_mecanismo_por_defecto, validar_parciales,
+    validar_tramos, validar_setup, AVISO_EXCESO_PARCIALES, tramo_entrada_por_defecto, trigger_tramo,
     sma, ema, rsi, atr, bollinger, stochastic, williams_r, cci, _kama_serie,
     preparar_eventos_noticias,
 )
@@ -94,8 +97,10 @@ AMBAR = '#f1c40f'
 AZUL = '#4fc3f7'
 
 # flechas de operaciones: tonos más saturados que las velas (VERDE/ROJO de
-# arriba) para que los marcadores no se camuflen sobre cuerpos del mismo color
-VERDE_FLECHA = '#00e676'   # compra (abre largo / cierra corto)
+# arriba) para que los marcadores no se camuflen sobre cuerpos del mismo color.
+# VERDE_FLECHA además se mantiene notablemente más oscuro que VERDE (vela
+# alcista) para que la flecha de compra no se confunda con el color de vela.
+VERDE_FLECHA = '#1b8a3a'   # compra (abre largo / cierra corto)
 ROJO_FLECHA = '#ff1744'    # venta (abre corto / cierra largo)
 
 # color fijo por periodo para las medias (SMA/EMA) dibujadas en el gráfico de
@@ -113,8 +118,11 @@ COLOR_MEDIA_FIJO = {20: '#2B7FFF', 50: '#FF8904', 200: '#800000'}
 PESO_PRECIO_DEFECTO = 3.0
 PESO_OSC_DEFECTO = 1.0
 PESO_PANEL_MIN = 0.15
-LEFT_PANEL, RIGHT_PANEL = 0.02, 0.92
-TOP_PANEL, BOTTOM_STACK = 0.94, 0.24
+# margen ajustado a la esquina (sin RangeSlider ya no hace falta reservar
+# BOTTOM_STACK para su franja) y RIGHT_PANEL casi al borde, igual que la
+# escala de precio de Lightweight Charts en la vista moderna.
+LEFT_PANEL, RIGHT_PANEL = 0.035, 0.95
+TOP_PANEL, BOTTOM_STACK = 0.94, 0.075
 GAP_PANEL = 0.018
 ETIQUETA_PANEL = {'precio': 'Precio', 'rsi': 'RSI', 'atr': 'ATR',
                   'stoch': 'Estocástico', 'williams': 'Williams %R', 'cci': 'CCI'}
@@ -449,20 +457,49 @@ class _BacktestThread(QThread):
                     'tp_r': float(setup.get('tp_r', 0.0)),
                     'salida_n_velas': salida_n,
                     'be_atr': float(setup.get('be_atr', 0.0)),
+                    'be_unidad': setup.get('be_unidad', 'atr'),
                     'trailing_atr': float(setup.get('trailing_atr', 0.0)),
                     'parciales': setup.get('parciales', []),
+                    'tramos': setup.get('tramos', []),
                 }
+                for clave_mec in MECANISMOS_SALIDA:
+                    if setup.get(clave_mec):
+                        config_por_setup[k][clave_mec] = setup[clave_mec]
             config['config_por_setup'] = config_por_setup
 
-            # pre-computar máscaras de condiciones de salidas parciales
-            masks_long = []
-            masks_short = []
-            for k, setup in enumerate(self._setups):
-                parciales = setup.get('parciales', [])
-                ml = []
-                ms = []
-                for etapa in parciales:
-                    conds = etapa.get('condiciones')
+            # pre-computar máscaras de condiciones (salidas parciales y
+            # entrada escalonada comparten el mismo patrón: una máscara por
+            # etapa/tramo, True en toda la serie si no tiene condiciones)
+            def _masks_por_etapas(clave_lista):
+                masks_long, masks_short = [], []
+                for setup in self._setups:
+                    ml, ms = [], []
+                    for etapa in setup.get(clave_lista, []):
+                        conds = etapa.get('condiciones')
+                        if conds and len(conds) > 0:
+                            m_l, m_s = _mascaras_condiciones_dir(df, conds)
+                            ml.append(np.asarray(m_l, dtype=bool))
+                            ms.append(np.asarray(m_s, dtype=bool))
+                        else:
+                            ml.append(np.ones(n, dtype=bool))
+                            ms.append(np.ones(n, dtype=bool))
+                    masks_long.append(ml if ml else None)
+                    masks_short.append(ms if ms else None)
+                return masks_long, masks_short
+
+            config['parciales_masks_long'], config['parciales_masks_short'] = \
+                _masks_por_etapas('parciales')
+            config['tramos_masks_long'], config['tramos_masks_short'] = \
+                _masks_por_etapas('tramos')
+
+            # los 4 mecanismos globales son dicts sueltos, no una lista: se
+            # ordenan según MECANISMOS_SALIDA para casar con los índices que
+            # espera el motor
+            mec_long, mec_short = [], []
+            for setup in self._setups:
+                ml, ms = [], []
+                for clave_mec in MECANISMOS_SALIDA:
+                    conds = (setup.get(clave_mec) or {}).get('condiciones')
                     if conds and len(conds) > 0:
                         m_l, m_s = _mascaras_condiciones_dir(df, conds)
                         ml.append(np.asarray(m_l, dtype=bool))
@@ -470,10 +507,10 @@ class _BacktestThread(QThread):
                     else:
                         ml.append(np.ones(n, dtype=bool))
                         ms.append(np.ones(n, dtype=bool))
-                masks_long.append(ml if ml else None)
-                masks_short.append(ms if ms else None)
-            config['parciales_masks_long'] = masks_long
-            config['parciales_masks_short'] = masks_short
+                mec_long.append(ml)
+                mec_short.append(ms)
+            config['mecanismos_masks_long'] = mec_long
+            config['mecanismos_masks_short'] = mec_short
 
             resultado = simular(df['open'].values, df['high'].values,
                                 df['low'].values, df['close'].values,
@@ -611,6 +648,147 @@ class _OptimizerThread(QThread):
             self.terminado.emit({'error': str(e)})
 
 
+# ══════════════ ayuda contextual (icono "?" por sección) ══════════════
+def _icono_ayuda(tooltip):
+    """QLabel «?» en forma de badge, con `tooltip` al pasar el ratón — el
+    icono de ayuda reutilizado en cada título de sección de Constructor y
+    Resultados."""
+    icono = QLabel("?")
+    icono.setFixedSize(16, 16)
+    icono.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    icono.setStyleSheet(
+        "QLabel { background-color: #253a60; color: #8fb3d9; "
+        "border-radius: 8px; font-size: 10px; font-weight: bold; }")
+    icono.setToolTip(tooltip)
+    icono.setCursor(Qt.CursorShape.WhatsThisCursor)
+    return icono
+
+
+def _fila_ayuda(tooltip):
+    """Fila nueva (icono alineado a la derecha) para insertar como primer
+    elemento de un QGroupBox con título nativo, sin tocar ese título."""
+    fila = QHBoxLayout()
+    fila.addStretch()
+    fila.addWidget(_icono_ayuda(tooltip))
+    return fila
+
+
+def _insertar_ayuda_form(form_layout, tooltip):
+    """Variante de _fila_ayuda para un QGroupBox cuyo layout es QFormLayout
+    (no admite insertLayout): envuelve la fila en un QWidget y la inserta
+    como primera fila de ancho completo."""
+    cont = QWidget()
+    cont.setLayout(_fila_ayuda(tooltip))
+    form_layout.insertRow(0, cont)
+
+
+# ══════════════ resaltado de fila completa en tablas de etapas/condiciones ══════════════
+# Qt solo resalta nativamente la celda bajo el ratón cuando es un
+# QTableWidgetItem real; las columnas con un widget embebido (setCellWidget:
+# combos, spins, botones) no participan en la selección nativa — un clic ahí
+# no llega a informar a la tabla de qué fila se tocó. _seleccionar_fila_al_clic
+# tapa ese hueco a mano, y _OverlayFilaSeleccionada dibuja el borde resultante.
+_COLOR_BORDE_FILA = '#4fc3f7'
+
+
+def _seleccionar_fila_al_clic(widget, tabla, fila):
+    """Envuelve el mousePressEvent de `widget` (una celda embebida de
+    `tabla`, fila `fila`) para que, antes de su comportamiento normal (abrir
+    el desplegable, etc.), seleccione esa fila en la tabla — así un clic en
+    CUALQUIER columna resalta la fila entera, no solo la celda con un
+    QTableWidgetItem plano."""
+    original = widget.mousePressEvent
+    def _clic(event):
+        tabla.selectRow(fila)
+        original(event)
+    widget.mousePressEvent = _clic
+    return widget
+
+
+class _OverlayFilaSeleccionada(QWidget):
+    """Dibuja UN único rectángulo alrededor de la fila seleccionada, de la
+    primera columna a la última.
+
+    Va como hijo del viewport, cubriéndolo entero y transparente al ratón, en
+    vez de estilar celda a celda: los widgets embebidos son opacos y taparían
+    los tramos de borde que caen bajo ellos, dejando un contorno partido y
+    visible solo en algunas columnas."""
+
+    def __init__(self, tabla):
+        super().__init__(tabla.viewport())
+        self.tabla = tabla
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setGeometry(tabla.viewport().rect())
+        tabla.viewport().installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.Resize:
+            self.setGeometry(obj.rect())
+        return False
+
+    def paintEvent(self, _evento):
+        fila = self.tabla.currentRow()
+        if fila < 0 or not self.tabla.selectionModel().selectedIndexes():
+            return
+        modelo = self.tabla.model()
+        rect = self.tabla.visualRect(modelo.index(fila, 0)).united(
+            self.tabla.visualRect(modelo.index(fila, self.tabla.columnCount() - 1)))
+        # las columnas pueden sumar algo más que el viewport (redondeo del
+        # reparto de anchos): sin recortar, el lado derecho caería fuera
+        rect = rect.intersected(self.rect())
+        if rect.isEmpty():
+            return
+        pintor = QPainter(self)
+        pintor.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pintor.setPen(QPen(QColor(_COLOR_BORDE_FILA), 1))
+        # medio píxel adentro: un trazo de 1px sobre coordenadas enteras cae
+        # justo en la frontera entre dos filas de píxeles y el antialiasing lo
+        # reparte a medias entre ambas, dejándolo descolorido
+        pintor.drawRoundedRect(QRectF(rect).adjusted(0.5, 0.5, -0.5, -0.5), 3, 3)
+
+
+def _repintar_seleccion_fila(tabla):
+    """Redibuja el contorno de la fila seleccionada — conectado a
+    tabla.itemSelectionChanged. El overlay se crea la primera vez y se sube
+    por encima de las celdas en cada repintado: los widgets embebidos que
+    añade cada recarga de la tabla entran al viewport por encima de él."""
+    overlay = getattr(tabla, '_overlay_fila', None)
+    if overlay is None:
+        overlay = _OverlayFilaSeleccionada(tabla)
+        tabla._overlay_fila = overlay
+        overlay.show()
+    overlay.raise_()
+    overlay.update()
+
+
+class _SinPintadoSeleccion(QStyledItemDelegate):
+    """Pinta las celdas como si nunca estuvieran seleccionadas, dejando el
+    contorno del overlay como único indicador de fila activa.
+
+    El resaltado nativo solo alcanza a las celdas con item plano —en estas
+    tablas, la del %—, que es precisamente el resaltado a medias que el
+    contorno viene a sustituir; además reemplaza el color de texto propio del
+    item (el de las filas de stop/TP/BE/trailing) por el de selección."""
+
+    def initStyleOption(self, option, index):
+        super().initStyleOption(option, index)
+        option.state &= ~QStyle.StateFlag.State_Selected
+
+
+def _activar_borde_fila(tabla):
+    """Selección por fila señalada únicamente con el contorno del overlay.
+
+    Hacen falta las dos piezas: la vista rellena la celda seleccionada con el
+    brush Highlight de su paleta sin pasar por el delegate, y el delegate es
+    quien decide el color del texto."""
+    tabla.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+    paleta = tabla.palette()
+    paleta.setColor(QPalette.ColorRole.Highlight, QColor(0, 0, 0, 0))
+    tabla.setPalette(paleta)
+    tabla.setItemDelegate(_SinPintadoSeleccion(tabla))
+    tabla.itemSelectionChanged.connect(lambda: _repintar_seleccion_fila(tabla))
+
+
 # ══════════════ editor de reglas custom ══════════════
 def _combo_regla(opciones, actual=None):
     cb = QComboBox()
@@ -667,6 +845,11 @@ class EditorReglas(QGroupBox):
     def __init__(self, parent=None):
         super().__init__("Reglas custom (mismo setup = AND, setups distintos = OR)", parent)
         lay = QVBoxLayout(self)
+        lay.insertLayout(0, _fila_ayuda(
+            "Solo para la plantilla «Custom (reglas)»: construye las "
+            "condiciones de entrada/salida a mano combinando indicadores. "
+            "Las condiciones del mismo bloque se exigen todas a la vez "
+            "(AND); bloques distintos son alternativas entre sí (OR)."))
         self.tabla = QTableWidget(0, 7)
         self.tabla.setHorizontalHeaderLabels(
             ['Regla', 'Setup', 'Indicador', 'Periodo', 'Operador',
@@ -746,7 +929,20 @@ class EditorCondiciones(QGroupBox):
     """Tabla de condiciones planas (todas AND entre sí) — versión simplificada
     de EditorReglas sin agrupación por regla/setup: se usa como filtro extra
     de un setup (entrada o salida), aplicable sobre CUALQUIER plantilla, no
-    solo 'Custom (reglas)'."""
+    solo 'Custom (reglas)'.
+
+    Por encima de esas condiciones del usuario puede pintar las filas de la
+    SEÑAL de la plantilla (ver core/strategies.filas_plantilla): son la lógica
+    que el sistema ya ejecuta de por sí, así que no se guardan como filtro
+    —duplicarlas como AND sería redundante— pero sí son editables: cada celda
+    mapeada escribe en el parámetro correspondiente de la plantilla."""
+
+    COL_INDICADOR, COL_PERIODO, COL_OP, COL_DER, COL_VALOR, COL_DIR = range(6)
+    # qué parámetro de la plantilla edita cada celda, según el 'mapeo' del
+    # descriptor (ver core/strategies._fila)
+    _CELDA_MAPEO = {COL_INDICADOR: 'izq.tipo', COL_PERIODO: 'izq.periodo',
+                    COL_DER: 'der.tipo', COL_VALOR: 'der.valor'}
+    _FONDO_PLANTILLA = QColor('#16233b')
 
     def __init__(self, titulo, parent=None):
         super().__init__(titulo, parent)
@@ -758,6 +954,7 @@ class EditorCondiciones(QGroupBox):
         self.tabla.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.tabla.verticalHeader().setVisible(False)
         self.tabla.setMinimumHeight(90)
+        _activar_borde_fila(self.tabla)
         lay.addWidget(self.tabla)
         fila = QHBoxLayout()
         btn_add = QPushButton("+ Condición")
@@ -768,17 +965,193 @@ class EditorCondiciones(QGroupBox):
         fila.addWidget(btn_del)
         fila.addStretch()
         lay.addLayout(fila)
+        # expuesto para que quien use esta tabla como "Entrada del setup"
+        # (no en los diálogos transitorios de Condiciones) pueda añadir aquí
+        # su propio botón de deshacer — ver OptimizadorWidget.__init__
+        self.fila_botones = fila
+        # filas de la señal de la plantilla, siempre al principio de la tabla
+        self._filas_plantilla = []
+        self._plantilla = None
+        self._on_param = None
+        self._sincronizando = False
+
+    # ── filas de la señal de la plantilla ──
+    @property
+    def n_filas_plantilla(self):
+        return len(self._filas_plantilla)
+
+    def cargar(self, condiciones, filas=None, plantilla=None, on_param=None):
+        """Repinta la tabla entera: primero las filas de la señal de la
+        plantilla (`filas`, descriptores de core/strategies.filas_plantilla) y
+        debajo las condiciones del usuario. `on_param(clave, valor)` recibe las
+        ediciones que caen sobre un parámetro de la plantilla."""
+        self._plantilla = plantilla
+        self._on_param = on_param
+        self._filas_plantilla = list(filas or [])
+        self._sincronizando = True
+        # setItem (fila de texto) emitiría cellChanged y realimentaría el
+        # guardado del setup mientras se está repintando
+        self.tabla.blockSignals(True)
+        try:
+            self.tabla.clearSpans()
+            self.tabla.setRowCount(0)
+            for i, desc in enumerate(self._filas_plantilla):
+                self._add_fila_plantilla(i, desc)
+            self.cargar_condiciones(condiciones)
+        finally:
+            self.tabla.blockSignals(False)
+            self._sincronizando = False
+            _repintar_seleccion_fila(self.tabla)
+
+    def _widget_param(self, clave, valor):
+        """Widget para una celda mapeada a un parámetro de la plantilla, con
+        el rango/opciones que declara ESTRATEGIAS. None si el parámetro no
+        existe o no es editable con un widget simple."""
+        specs = ESTRATEGIAS.get(self._plantilla, {}).get('params', [])
+        spec = next((s for s in specs if s['clave'] == clave), None)
+        if spec is None:
+            return None, None
+        if spec['tipo'] == 'choice':
+            w = _combo_regla(spec['opciones'], str(valor))
+            return w, w.currentText
+        if spec['tipo'] == 'int':
+            w = QSpinBox()
+            w.setRange(spec.get('min', 1), spec.get('max', 100000))
+            w.setValue(int(valor))
+            return w, w.value
+        if spec['tipo'] == 'float':
+            w = QDoubleSpinBox()
+            w.setRange(spec.get('min', -1e9), spec.get('max', 1e9))
+            w.setDecimals(2)
+            w.setValue(float(valor))
+            return w, w.value
+        return None, None
+
+    def _add_fila_plantilla(self, r, desc):
+        self.tabla.insertRow(r)
+        mapeo = desc.get('mapeo') or {}
+        tooltip = ("Esta es la señal de la plantilla: lo que el sistema hace de "
+                   "por sí. Las celdas activas editan sus parámetros.")
+        if desc.get('nota'):
+            tooltip += f"\n⚠ {desc['nota']}"
+
+        if desc.get('izq') is None:
+            # la tabla no sabe representar este indicador (Stochastic, %R,
+            # CCI, patrones): una sola celda de texto a lo ancho
+            item = QTableWidgetItem(f"▸ señal de la plantilla · {desc['texto']}")
+            item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            item.setBackground(self._FONDO_PLANTILLA)
+            item.setToolTip(tooltip + "\n(no representable como fila de "
+                            "indicador: edítala desde «Parámetros»)")
+            self.tabla.setItem(r, 0, item)
+            self.tabla.setSpan(r, 0, 1, 6)
+            return
+
+        izq, der = desc['izq'], desc['der']
+        es_valor = der['tipo'] == 'valor'
+        # 'der.valor' y 'der.periodo' comparten la misma celda (col. 4)
+        mapeo = dict(mapeo)
+        if 'der.periodo' in mapeo:
+            mapeo['der.valor'] = mapeo.pop('der.periodo')
+        base = {
+            self.COL_INDICADOR: _combo_regla(_INDICADORES_REGLA, izq['tipo']),
+            self.COL_PERIODO: _spin_regla(izq.get('periodo', 14), 1, 5000),
+            self.COL_OP: _combo_regla(_OPERADORES_REGLA, desc['op']),
+            self.COL_DER: _combo_regla(['Valor'] + _INDICADORES_REGLA,
+                                       'Valor' if es_valor else der['tipo']),
+            self.COL_VALOR: _spin_regla(
+                der.get('valor', der.get('periodo', 0.0)), dec=4),
+            self.COL_DIR: _combo_regla(
+                list(_MAPA_DIRECCION),
+                _MAPA_DIRECCION_INV.get(desc.get('direccion', 'ambas'), 'Ambas')),
+        }
+        for col, w in base.items():
+            clave = mapeo.get(self._CELDA_MAPEO.get(col))
+            if clave:
+                editable, leer = self._widget_param(clave, self._valor_celda(col, desc))
+                if editable is not None:
+                    w = editable
+                    w.setToolTip(tooltip)
+                    self._conectar_param(w, clave, leer)
+                else:
+                    w.setEnabled(False)
+            else:
+                w.setEnabled(False)
+                w.setToolTip(tooltip)
+            self.tabla.setCellWidget(r, col, w)
+
+    @staticmethod
+    def _valor_celda(col, desc):
+        izq, der = desc['izq'], desc['der']
+        if col == EditorCondiciones.COL_INDICADOR:
+            return izq['tipo']
+        if col == EditorCondiciones.COL_PERIODO:
+            return izq.get('periodo', 14)
+        if col == EditorCondiciones.COL_DER:
+            return der['tipo']
+        return der.get('valor', der.get('periodo', 0.0))
+
+    def _conectar_param(self, w, clave, leer):
+        def _emitir(*_):
+            if self._sincronizando or self._on_param is None:
+                return
+            self._on_param(clave, leer())
+        if isinstance(w, QComboBox):
+            w.currentTextChanged.connect(_emitir)
+        else:
+            w.valueChanged.connect(_emitir)
+
+    def sincronizar_filas_plantilla(self, filas):
+        """Refresca los valores de las filas de plantilla sin recrearlas
+        (así no se destruye el widget que el usuario esté editando). Devuelve
+        False si la estructura cambió —p. ej. al pasar de Ambas a solo Long— y
+        hace falta un `cargar` completo."""
+        filas = list(filas or [])
+        if len(filas) != len(self._filas_plantilla):
+            return False
+        self._sincronizando = True
+        try:
+            for r, desc in enumerate(filas):
+                anterior = self._filas_plantilla[r]
+                if (desc.get('izq') is None) != (anterior.get('izq') is None):
+                    return False
+                if desc.get('izq') is None:
+                    item = self.tabla.item(r, 0)
+                    if item is not None:
+                        item.setText(f"▸ señal de la plantilla · {desc['texto']}")
+                    continue
+                for col in (self.COL_INDICADOR, self.COL_PERIODO, self.COL_OP,
+                            self.COL_DER, self.COL_VALOR):
+                    w = self.tabla.cellWidget(r, col)
+                    if w is None:
+                        continue
+                    if col == self.COL_OP:
+                        w.setCurrentText(desc['op'])
+                    elif col == self.COL_DER:
+                        w.setCurrentText('Valor' if desc['der']['tipo'] == 'valor'
+                                         else desc['der']['tipo'])
+                    else:
+                        valor = self._valor_celda(col, desc)
+                        if isinstance(w, QComboBox):
+                            w.setCurrentText(str(valor))
+                        elif isinstance(w, QSpinBox):
+                            w.setValue(int(valor))
+                        else:
+                            w.setValue(float(valor))
+        finally:
+            self._sincronizando = False
+        self._filas_plantilla = filas
+        return True
 
     def _add_fila(self, _=False, datos=None):
         r = self.tabla.rowCount()
         self.tabla.insertRow(r)
         d = datos or {}
-        self.tabla.setCellWidget(r, 0, _combo_regla(_INDICADORES_REGLA, d.get('izq', 'close')))
-        self.tabla.setCellWidget(r, 1, _spin_regla(d.get('izq_periodo', 14), 1, 5000))
-        self.tabla.setCellWidget(r, 2, _combo_regla(_OPERADORES_REGLA, d.get('op', '>')))
-        self.tabla.setCellWidget(r, 3, _combo_regla(['Valor'] + _INDICADORES_REGLA,
-                                                    d.get('der', 'Valor')))
-        self.tabla.setCellWidget(r, 4, _spin_regla(d.get('der_valor', 0.0), dec=4))
+        w0 = _combo_regla(_INDICADORES_REGLA, d.get('izq', 'close'))
+        w1 = _spin_regla(d.get('izq_periodo', 14), 1, 5000)
+        w2 = _combo_regla(_OPERADORES_REGLA, d.get('op', '>'))
+        w3 = _combo_regla(['Valor'] + _INDICADORES_REGLA, d.get('der', 'Valor'))
+        w4 = _spin_regla(d.get('der_valor', 0.0), dec=4)
         cmb_dir = _combo_regla(list(_MAPA_DIRECCION), d.get('direccion', 'Ambas'))
         cmb_dir.setToolTip(
             "A qué lado se aplica esta condición: 'Ambas' la exige tanto para "
@@ -786,20 +1159,35 @@ class EditorCondiciones(QGroupBox):
             "'Long'/'Short' la restringe solo a ese lado, sin afectar al otro "
             "— p.ej. close > SMA(200) en Long y close < SMA(200) en Short "
             "dentro del mismo setup.")
-        self.tabla.setCellWidget(r, 5, cmb_dir)
+        for col, w in enumerate((w0, w1, w2, w3, w4, cmb_dir)):
+            _seleccionar_fila_al_clic(w, self.tabla, r)
+            self.tabla.setCellWidget(r, col, w)
+        _repintar_seleccion_fila(self.tabla)
 
     def _del_fila(self):
+        # las filas de la señal de la plantilla no se pueden quitar: son la
+        # lógica del sistema, no un filtro añadido
+        primera = self.n_filas_plantilla
+        if self.tabla.rowCount() <= primera:
+            return
         r = self.tabla.currentRow()
-        if r >= 0:
+        if r >= primera:
             self.tabla.removeRow(r)
-        elif self.tabla.rowCount():
+        else:
             self.tabla.removeRow(self.tabla.rowCount() - 1)
 
     def condiciones(self):
         """Lista plana de condiciones (AND entre sí dentro de su misma
-        dirección; ver 'direccion' de cada una)."""
+        dirección; ver 'direccion' de cada una). Las filas de la señal de la
+        plantilla quedan fuera: el motor ya las ejecuta, y repetirlas como
+        filtro AND solo podría restringir de más."""
         out = []
-        for r in range(self.tabla.rowCount()):
+        for r in range(self.n_filas_plantilla, self.tabla.rowCount()):
+            if self.tabla.cellWidget(r, 0) is None:
+                # fila recién insertada (rowsInserted dispara el guardado antes
+                # de que _add_fila termine de poner sus cellWidget): se ignora
+                # aquí, la próxima señal real ya la incluirá completa.
+                continue
             izq = self.tabla.cellWidget(r, 0).currentText()
             izq_per = self.tabla.cellWidget(r, 1).value()
             op = self.tabla.cellWidget(r, 2).currentText()
@@ -811,7 +1199,10 @@ class EditorCondiciones(QGroupBox):
         return out
 
     def cargar_condiciones(self, condiciones):
-        self.tabla.setRowCount(0)
+        """Repuebla solo las condiciones del usuario, conservando las filas de
+        la señal de la plantilla que haya encima."""
+        while self.tabla.rowCount() > self.n_filas_plantilla:
+            self.tabla.removeRow(self.tabla.rowCount() - 1)
         for cond in (condiciones or []):
             izq, der = cond['izq'], cond['der']
             self._add_fila(datos={
@@ -829,8 +1220,13 @@ def _setup_por_defecto(plantilla='Cruce de medias'):
          'params': params_por_defecto(plantilla),
          'riesgo_pct': 0.01, 'stop_atr': 2.0, 'tp_r': 0.0,
          'salida_n_velas': 0, 'edge': False,
-         'be_atr': 0.0, 'trailing_atr': 0.0,
-         'parciales': [],   # lista de etapas de salida parcial
+         'be_atr': 0.0, 'be_unidad': 'atr', 'trailing_atr': 0.0,
+         # la salida implícita de la plantilla, explícita y editable: 100% a
+         # su señal de salida. Equivale a no tener etapas (ver core/backtest).
+         'parciales': [etapa_salida_por_defecto()],
+         # idem para la entrada: un solo tramo al 100% a la señal equivale a
+         # no tener entrada escalonada.
+         'tramos': [tramo_entrada_por_defecto()],
          'filtros': _filtros_por_defecto()}
     # la plantilla puede recomendar su propio stop/tp por defecto (p.ej. el
     # cruce de medias sale por cruce contrario: sin stop ATR)
@@ -859,6 +1255,87 @@ _MAPA_IMPACTO_NOTICIAS_INV = {v: k for k, v in _MAPA_IMPACTO_NOTICIAS.items()}
 # sin el campo 'direccion').
 _MAPA_DIRECCION = {'Ambas': 'ambas', 'Long': 'long', 'Short': 'short'}
 _MAPA_DIRECCION_INV = {v: k for k, v in _MAPA_DIRECCION.items()}
+
+# ── mecanismos globales de salida dentro de la tabla «Salida del setup» ──
+# Son las cuatro redes de seguridad del setup (stop/TP/BE/trailing): no son
+# etapas secuenciales, así que se pintan al final de la tabla, con un color
+# propio para distinguirlas de un vistazo, y se marcan con este rol para que
+# _leer_tabla_etapas y _validar_pct_parciales las ignoren al reconstruir
+# 'parciales'.
+# unidad de la distancia de activación del break-even. '× ATR' es el defecto
+# por compatibilidad: es lo que hacían los setups guardados antes de existir
+# esta opción (ver core/backtest, 'be_unidad').
+_MAPA_BE_UNIDAD = {'× ATR': 'atr', 'R': 'r'}
+_MAPA_BE_UNIDAD_INV = {v: k for k, v in _MAPA_BE_UNIDAD.items()}
+
+_ROL_MECANISMO = 'mecanismo_salida'
+# la clave del mecanismo va en la celda 0 para localizar su fila sin depender
+# de comparar textos (ver _fila_de_mecanismo)
+_ROL_CLAVE_MECANISMO = int(Qt.ItemDataRole.UserRole) + 1
+ROJO_OSCURO = '#8b1a1a'   # trailing: rojo apagado, para no competir con el stop
+
+# clave del setup -> (etiqueta, atributo del spin que lo activa, sufijo, color).
+# sufijo None = lo decide un combo de la propia fila (el break-even, cuya
+# unidad depende de cmb_be_unidad).
+_MECANISMOS_SALIDA_UI = {
+    'salida_stop':     ('Stop-loss', 'sp_stop', ' ×ATR', ROJO),
+    'salida_tp':       ('Take-profit', 'sp_tp', ' R', VERDE),
+    'salida_be':       ('Break-even', 'sp_be', None, AZUL),
+    'salida_trailing': ('Trailing stop', 'sp_trailing', ' ×ATR', ROJO_OSCURO),
+    'salida_tiempo':   ('Tiempo', 'sp_tiempo', ' velas', AMBAR),
+}
+# mínimo del spin de la fila: nunca 0, para que la fila no se autodestruya
+# mientras la editas (para apagar el mecanismo se usa su campo de arriba)
+_MIN_VALOR_MECANISMO = {'salida_tiempo': 1}
+
+# disparador de una etapa de salida parcial (ver core/strategies.trigger_etapa)
+_MAPA_TRIGGER = {'Señal de la plantilla': 'senal', 'R:R alcanzado': 'r',
+                 'Solo condiciones': 'cond',
+                 'Estancamiento (N velas sin R)': 'estancamiento'}
+_MAPA_TRIGGER_INV = {v: k for k, v in _MAPA_TRIGGER.items()}
+# unidad del spin 1 (siempre visible salvo señal/condiciones), por disparador
+_SUFIJOS_TRIGGER_ETAPA = {'r': ' R', 'estancamiento': ' velas'}
+# 'estancamiento' es el único disparador con un SEGUNDO número (N velas en el
+# spin 1 de arriba + R mínimo aquí); campo2 = (sufijo del 2º spin, valor defecto)
+_CAMPO2_TRIGGER_ETAPA = {'estancamiento': (' R', 1.0)}
+# tooltip por opción del combo de disparador (etapas de Salida): al pasar el
+# ratón por una opción concreta del desplegable, o al dejar el combo cerrado
+# en esa opción, se muestra SOLO su propia explicación — no un bloque con
+# las 4 juntas.
+_TOOLTIPS_TRIGGER_ETAPA = {
+    'senal': ("La etapa cierra su % cuando la plantilla da su señal de "
+             "salida (el cruce contrario, la vuelta a la media...), al "
+             "open de la vela siguiente."),
+    'r': ("Cierra intra-vela al tocar ese múltiplo del riesgo inicial de "
+         "la operación."),
+    'cond': ("Cierra intra-vela en cuanto se cumplan las «Condiciones» de "
+            "la etapa, al margen de la plantilla."),
+    'estancamiento': ("Cierra si, tras el nº de velas indicado desde la "
+                      "entrada, el precio no ha llegado a alcanzar (en su "
+                      "mejor momento) el R mínimo indicado — para cortar "
+                      "operaciones que no arrancan sin esperar al stop."),
+}
+
+# disparador de un tramo de entrada escalonada (ver core/strategies.trigger_tramo)
+_MAPA_TRIGGER_ENTRADA = {
+    'Señal de la plantilla': 'senal', 'A +N velas': 'velas',
+    'Retroceso (promediar)': 'retroceso', 'Avance (pirámide)': 'avance',
+    'Solo condiciones': 'cond',
+}
+_MAPA_TRIGGER_ENTRADA_INV = {v: k for k, v in _MAPA_TRIGGER_ENTRADA.items()}
+_SUFIJOS_TRIGGER_ENTRADA = {'velas': ' velas', 'retroceso': ' ×ATR', 'avance': ' R'}
+# igual que _TOOLTIPS_TRIGGER_ETAPA, pero para el combo de tramos de
+# entrada escalonada
+_TOOLTIPS_TRIGGER_ENTRADA = {
+    'senal': ("El tramo se construye cuando se repite la señal de entrada "
+             "(mismo lado), al open de la vela siguiente."),
+    'velas': ("Entra N velas después de la 1ª entrada — reparte la "
+             "ejecución para no depender de un solo open."),
+    'retroceso': ("Promedia cuando el precio va N×ATR en contra de la 1ª "
+                 "entrada (reversión a la media)."),
+    'avance': "Piramida cuando el precio avanza +N R a favor (tendencia).",
+    'cond': "Entra en cuanto se cumplan sus «Condiciones».",
+}
 
 
 class TemplateCard(QFrame):
@@ -1186,6 +1663,10 @@ class OptimizadorWidget(QWidget):
         # bloqueados ──
         grp_tf = QGroupBox("Temporalidad del backtest")
         lay_tf = QVBoxLayout(grp_tf)
+        lay_tf.insertLayout(0, _fila_ayuda(
+            "Elige la temporalidad de las velas que usará el backtest: la "
+            "nativa del CSV cargado, o un múltiplo agregado (p.ej. 1h → 4h). "
+            "No cambia el activo, solo cómo se agrupan sus velas."))
         fila_tf = QHBoxLayout()
         fila_tf.setSpacing(4)
         self._tf_group = QButtonGroup(self)
@@ -1218,6 +1699,11 @@ class OptimizadorWidget(QWidget):
         # ── selector de sistema (predeterminados / guardados / nuevo) ──
         grp_sel = QGroupBox("Sistema")
         lay_sel = QVBoxLayout(grp_sel)
+        lay_sel.insertLayout(0, _fila_ayuda(
+            "Carga un sistema de partida: una plantilla predefinida (Cruce "
+            "de medias, RSI...), uno de tus sistemas guardados, o un "
+            "favorito marcado desde Resultados. Cargar uno reemplaza los "
+            "setups actuales del constructor."))
 
         # selector de sistemas predeterminados (tarjeta actual + recientes +
         # botón «Elegir…» que abre la ventana con todos)
@@ -1295,6 +1781,11 @@ class OptimizadorWidget(QWidget):
         # ── sistema: lista de setups ──
         grp_sis = QGroupBox("Setups del sistema (cada uno con su propio riesgo)")
         lay_sis = QVBoxLayout(grp_sis)
+        lay_sis.insertLayout(0, _fila_ayuda(
+            "Un sistema puede combinar varios setups (plantillas) a la vez, "
+            "cada uno con su propio riesgo, stop, TP y filtros. Añade, "
+            "duplica, reordena o elimina setups aquí; el backtest los corre "
+            "todos juntos sobre el mismo activo."))
         self.lista_setups = QListWidget()
         self.lista_setups.setMaximumHeight(120)
         self.lista_setups.currentRowChanged.connect(self._on_setup_selected)
@@ -1315,6 +1806,10 @@ class OptimizadorWidget(QWidget):
         # ── editor del setup seleccionado ──
         self.grp_setup = QGroupBox("Setup seleccionado")
         f_set = QFormLayout(self.grp_setup)
+        _insertar_ayuda_form(f_set,
+            "Edición completa del setup marcado en la lista de arriba: "
+            "plantilla y sus parámetros, riesgo, entrada, salida y filtros. "
+            "Los cambios se guardan automáticamente al cambiar de setup.")
         self.txt_nombre = QLineEdit()
         self.txt_nombre.textEdited.connect(self._guardar_setup_actual)
         f_set.addRow("Nombre:", self.txt_nombre)
@@ -1418,9 +1913,22 @@ class OptimizadorWidget(QWidget):
         self.sp_be.setSpecialValueText("Sin break-even")
         self.sp_be.setToolTip(
             "Break-even: mueve el stop al precio de entrada cuando el precio\n"
-            "avanza esta cantidad de ATR a favor.")
+            "avanza esta distancia a favor. La unidad la eliges al lado.")
         self.sp_be.valueChanged.connect(self._guardar_setup_actual)
-        f_set.addRow("Break-even (× ATR):", self.sp_be)
+        self.cmb_be_unidad = QComboBox()
+        self.cmb_be_unidad.addItems(list(_MAPA_BE_UNIDAD))
+        self.cmb_be_unidad.setToolTip(
+            "Unidad de la distancia de activación:\n"
+            "· × ATR — múltiplos del ATR de la vela (comportamiento histórico).\n"
+            "· R — múltiplos de tu distancia de riesgo real (stop × ATR), la\n"
+            "  misma vara que el disparador «R:R alcanzado» de las salidas.\n"
+            "Solo coinciden si el stop está a 1×ATR: con el stop a 2×ATR,\n"
+            "«1×ATR de avance» es 0.5R, no 1R.")
+        self.cmb_be_unidad.currentTextChanged.connect(self._guardar_setup_actual)
+        fila_be = QHBoxLayout()
+        fila_be.addWidget(self.sp_be)
+        fila_be.addWidget(self.cmb_be_unidad)
+        f_set.addRow("Break-even:", fila_be)
         self.sp_trailing = QDoubleSpinBox()
         self.sp_trailing.setRange(0, 10)
         self.sp_trailing.setDecimals(1)
@@ -1435,35 +1943,113 @@ class OptimizadorWidget(QWidget):
         # ── entradas ──
         grp_entradas = QGroupBox("Entrada del setup")
         lay_ent = QVBoxLayout(grp_entradas)
+        grp_entradas.setToolTip(
+            "Arriba, la señal de la plantilla: lo que dispara la entrada por "
+            "sí solo (el cruce, la ruptura de banda...). Sus celdas activas "
+            "editan los parámetros de la plantilla.\n"
+            "Debajo, tus condiciones extra: se exigen ADEMÁS de la señal (AND) "
+            "y solo restringen entradas nuevas, nunca cierran una posición.")
+        lay_ent.insertLayout(0, _fila_ayuda(grp_entradas.toolTip()))
         self.editor_cond_entrada = EditorCondiciones("")
         self.editor_cond_entrada.tabla.cellChanged.connect(
             lambda *_: self._guardar_setup_actual())
+        # insertRow/removeRow (+ Condición / − Quitar) no emiten cellChanged
+        # — sin esto, añadir/quitar una fila no queda guardado (ni, por
+        # tanto, capturado por deshacer) hasta que otra edición lo dispare
+        self.editor_cond_entrada.tabla.model().rowsInserted.connect(
+            lambda *_: self._guardar_setup_actual())
+        self.editor_cond_entrada.tabla.model().rowsRemoved.connect(
+            lambda *_: self._guardar_setup_actual())
+        self.btn_deshacer_entrada = self._crear_boton_deshacer()
+        # insertar ANTES del stretch (índice 2: tras +Condición/−Quitar), no
+        # al final — si no, el botón queda empujado al extremo derecho en
+        # vez de pegado a "− Quitar" como en Entrada escalonada/Salida
+        self.editor_cond_entrada.fila_botones.insertWidget(2, self.btn_deshacer_entrada)
         lay_ent.addWidget(self.editor_cond_entrada)
+        self.lbl_resumen_entrada = QLabel("")
+        self.lbl_resumen_entrada.setWordWrap(True)
+        self.lbl_resumen_entrada.setStyleSheet(
+            "color: #8fb3d9; font-size: 10px; padding-top: 2px;")
+        lay_ent.addWidget(self.lbl_resumen_entrada)
+
+        # ── entrada escalonada: construir la posición en varios tramos ──
+        grp_tramos = QGroupBox("Entrada escalonada")
+        grp_tramos.setToolTip(
+            "Construye la posición en varios tramos: por velas, promediando a la\n"
+            "baja, o piramidando a favor.\n"
+            "• «Entrar %» = % del RIESGO TOTAL (no del tamaño); cada tramo se\n"
+            "  dimensiona contra el stop vigente en ese momento.\n"
+            "• Por defecto: un tramo, 100% a la señal (igual que sin tramos).\n"
+            "Ejemplo: Tramo 1 50% a la señal → Tramo 2 50% si retrocede 1×ATR.")
+        lay_tram = QVBoxLayout(grp_tramos)
+        lay_tram.insertLayout(0, _fila_ayuda(grp_tramos.toolTip()))
+        self.tabla_tramos = QTableWidget(0, 4)
+        self.tabla_tramos.setHorizontalHeaderLabels(
+            ["Entrar %", "Disparador", "Condiciones", "Gestión"])
+        self.tabla_tramos.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        _activar_borde_fila(self.tabla_tramos)
+        # sin límite de altura fijo: ver _ajustar_alto_tabla, llamado al
+        # recargar la tabla en _cargar_tramos_tabla
+        self.tabla_tramos.cellChanged.connect(self._guardar_setup_actual)
+        lay_tram.addWidget(self.tabla_tramos)
+        fila_t = QHBoxLayout()
+        for texto, slot in [("+ Tramo", self._add_tramo),
+                            ("− Quitar", self._del_tramo)]:
+            b = QPushButton(texto)
+            b.clicked.connect(slot)
+            fila_t.addWidget(b)
+        self.btn_deshacer_tramos = self._crear_boton_deshacer()
+        fila_t.addWidget(self.btn_deshacer_tramos)
+        fila_t.addStretch()
+        lay_tram.addLayout(fila_t)
+        self.lbl_resumen_tramos = QLabel("")
+        self.lbl_resumen_tramos.setWordWrap(True)
+        self.lbl_resumen_tramos.setStyleSheet(
+            "color: #8fb3d9; font-size: 10px; padding-top: 2px;")
+        self.lbl_resumen_tramos.setVisible(False)
+        lay_tram.addWidget(self.lbl_resumen_tramos)
+        self.lbl_aviso_tramos = QLabel("")
+        self.lbl_aviso_tramos.setWordWrap(True)
+        self.lbl_aviso_tramos.setStyleSheet(
+            "color: #e74c3c; font-size: 10px; font-weight: bold; padding-top: 2px;")
+        self.lbl_aviso_tramos.setVisible(False)
+        lay_tram.addWidget(self.lbl_aviso_tramos)
+        lay_ent.addWidget(grp_tramos)
+
         f_set.addRow(grp_entradas)
 
         # ── salida del setup ──
         grp_parciales = QGroupBox("Salida del setup")
         grp_parciales.setToolTip(
-            "Salidas escalonadas: cada etapa cierra un % del TAMAÑO ORIGINAL\n"
-            "de la posición (no de lo que quede en ese momento), cuando el\n"
-            "precio alcanza su R:R configurado. Tras cada etapa, se puede\n"
-            "activar BE o trailing que protege el resto de la posición.\n"
-            "Ejemplo: Etapa 1: 30% a 1.5R + BE ATR → Etapa 2: 40% a 2R + trail\n"
-            "0.5 ATR (queda 30% abierto) → resto a señal.")
+            "Reparte el cierre en varias salidas: cada una cierra un % del TAMAÑO\n"
+            "ORIGINAL de la posición, con su propio disparador (señal, R:R,\n"
+            "condiciones o estancamiento) y gestión (BE/trailing) sobre el resto.\n"
+            "Debajo, si están activos, también aparecen Stop/TP/BE/Trailing/Tiempo:\n"
+            "esos cierran % de lo que QUEDE, no del tamaño original.\n"
+            "Por defecto: una salida, 100% a la señal (igual que sin configurar nada).\n"
+            "Ejemplo: Salida 1 50% a la señal → Salida 2 50% a 2R + BE.")
         lay_parc = QVBoxLayout(grp_parciales)
+        lay_parc.insertLayout(0, _fila_ayuda(grp_parciales.toolTip()))
         self.tabla_parciales = QTableWidget(0, 4)
-        self.tabla_parciales.setHorizontalHeaderLabels(["Cerrar %", "R:R", "Condiciones", "Gestión"])
+        self.tabla_parciales.setHorizontalHeaderLabels(
+            ["Cerrar %", "Disparador", "Condiciones", "Gestión"])
         self.tabla_parciales.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        self.tabla_parciales.setMaximumHeight(120)
+        _activar_borde_fila(self.tabla_parciales)
+        # sin límite de altura fijo: ver _ajustar_alto_tabla, llamado al
+        # recargar la tabla en _cargar_parciales_tabla (tras pintar también
+        # las filas de mecanismo)
         self.tabla_parciales.cellChanged.connect(self._guardar_setup_actual)
         lay_parc.addWidget(self.tabla_parciales)
         fila_p = QHBoxLayout()
-        for texto, slot in [("+ Etapa", self._add_etapa_parcial),
+        for texto, slot in [("+ Salida", self._add_etapa_parcial),
                             ("− Quitar", self._del_etapa_parcial)]:
             b = QPushButton(texto)
             b.clicked.connect(slot)
             fila_p.addWidget(b)
+        self.btn_deshacer_parciales = self._crear_boton_deshacer()
+        fila_p.addWidget(self.btn_deshacer_parciales)
         fila_p.addStretch()
+        QShortcut(QKeySequence("Ctrl+Z"), self, self._deshacer)
         lay_parc.addLayout(fila_p)
         self.lbl_resumen_parciales = QLabel("")
         self.lbl_resumen_parciales.setWordWrap(True)
@@ -1491,6 +2077,7 @@ class OptimizadorWidget(QWidget):
             "entrada/salida, más abajo, sí pueden aplicarse también a la "
             "salida si así se configuran.")
         f_filtros = QFormLayout(grp_filtros)
+        _insertar_ayuda_form(f_filtros, grp_filtros.toolTip())
 
         fila_dias = QHBoxLayout()
         self._chk_dias = []
@@ -1517,6 +2104,11 @@ class OptimizadorWidget(QWidget):
 
         self.cmb_sesion = QComboBox()
         self.cmb_sesion.addItems(list(_MAPA_SESION))
+        self.cmb_sesion.setToolTip(
+            "Solo se abren posiciones NUEVAS mientras la vela cae dentro de "
+            "la sesión elegida — fuera de ese horario no se abre nada (no es "
+            "un filtro para EVITAR esa sesión). 'Ninguna' desactiva el "
+            "filtro y permite operar a cualquier hora.")
         self.cmb_sesion.currentTextChanged.connect(self._on_sesion_changed)
         f_filtros.addRow("Sesión horaria:", self.cmb_sesion)
         fila_horas = QHBoxLayout()
@@ -1588,6 +2180,13 @@ class OptimizadorWidget(QWidget):
         # ── código del sistema (siempre visible, se regenera en vivo) ──
         grp_cod = QGroupBox("Código del sistema (variables, entrada y salida de cada setup)")
         lay_cod = QVBoxLayout(grp_cod)
+        lay_cod.insertLayout(0, _fila_ayuda(
+            "Pseudocódigo generado automáticamente a partir de la "
+            "configuración actual: variables de cada setup, condición de "
+            "entrada, condición de salida y todas las reglas adicionales "
+            "(stop, TP, parciales, filtros). Se actualiza en vivo — sirve "
+            "para verificar que el sistema hace lo que crees que hace, "
+            "antes de correrlo."))
         from PyQt6.QtWidgets import QPlainTextEdit
         self.txt_codigo = QPlainTextEdit()
         self.txt_codigo.setReadOnly(True)
@@ -1602,6 +2201,10 @@ class OptimizadorWidget(QWidget):
         # ── cuenta (global, no del setup) ──
         grp_ej = QGroupBox("Cuenta")
         f_ej = QFormLayout(grp_ej)
+        _insertar_ayuda_form(f_ej,
+            "Configuración global de la cuenta simulada: capital inicial, "
+            "comisión por lado y slippage. Se aplica igual a todos los "
+            "setups del sistema.")
         self.sp_capital = QDoubleSpinBox()
         self.sp_capital.setRange(100, 1e9)
         self.sp_capital.setValue(10000)
@@ -1637,6 +2240,11 @@ class OptimizadorWidget(QWidget):
         # ── IS/OOS + WFA ──
         grp_split = QGroupBox("Muestra (In-Sample / Out-Of-Sample)")
         lay_sp = QVBoxLayout(grp_split)
+        lay_sp.insertLayout(0, _fila_ayuda(
+            "Divide la serie histórica en dos tramos: In-Sample (donde "
+            "ajustas el sistema) y Out-of-Sample (donde lo validas sin "
+            "haberlo tocado). El slider cambia qué % del final de la serie "
+            "se reserva como OOS."))
         self.lbl_split = QLabel("IS 70% / OOS 30%")
         self.lbl_split.setObjectName("campo")
         self.slider_oos = QSlider(Qt.Orientation.Horizontal)
@@ -1721,8 +2329,32 @@ class OptimizadorWidget(QWidget):
         self._actualizar_dias_checkboxes()
         self._configurar_botones_tf()
         self._aplicar_preset_friccion(path)
-        self.btn_run.setEnabled(True)
-        self.btn_optimizar.setEnabled(True)
+        self._actualizar_boton_ejecutable()
+
+    def _validar_sistema(self):
+        """(válido, motivo) del sistema COMPLETO: recorre todos los setups, no
+        solo el abierto en el editor, porque el backtest los corre todos."""
+        for k, setup in enumerate(self._setups):
+            avisos = validar_setup(setup)
+            if avisos:
+                nombre = setup.get('nombre') or f'Setup {k + 1}'
+                return False, f"«{nombre}»: {avisos[0]}"
+        return True, ''
+
+    def _actualizar_boton_ejecutable(self):
+        """Habilita «Ejecutar backtest» y «Prueba de parametrización» solo si
+        hay un CSV cargado Y ningún setup tiene una configuración imposible
+        (etapas que cierran más del 100%, tramos que arriesgan de más): correr
+        el motor con eso daría resultados engañosos."""
+        if not hasattr(self, 'btn_run'):
+            return   # aún construyendo la UI
+        hay_csv = bool(self.csv_path)
+        valido, motivo = self._validar_sistema()
+        habilitado = hay_csv and valido
+        self.btn_run.setEnabled(habilitado)
+        self.btn_optimizar.setEnabled(habilitado)
+        if hay_csv and not valido:
+            self.lbl_estado.setText(f"⚠ No se puede ejecutar — {motivo}")
 
     def _aplicar_preset_friccion(self, path):
         """Prellena slippage/comisión con una aproximación según la clase de
@@ -1847,7 +2479,12 @@ class OptimizadorWidget(QWidget):
         # volcar lo que haya en los widgets antes de leer (la tabla de
         # reglas custom no emite señales al editar sus combos internos)
         self._guardar_setup_actual()
-        return [dict(s, params=dict(s['params'])) for s in self._setups]
+        resultado = []
+        for s in self._setups:
+            copia = dict(s, params=dict(s['params']))
+            copia.pop('_deshacer', None)   # historial de sesión, no del sistema
+            resultado.append(copia)
+        return resultado
 
     def _setup_actual(self):
         fila = self._fila_editada
@@ -1917,6 +2554,7 @@ class OptimizadorWidget(QWidget):
             self.lista_setups.setCurrentRow(fila)
             self._on_setup_selected(fila)
         self._refresh_codigo()
+        self._actualizar_boton_ejecutable()
 
     def _refresh_item_actual(self):
         fila = self._fila_editada
@@ -1994,16 +2632,33 @@ class OptimizadorWidget(QWidget):
             self.sp_tp.setValue(s['tp_r'])
             self.sp_tiempo.setValue(s['salida_n_velas'])
             self.sp_be.setValue(s.get('be_atr', 0.0))
+            self.cmb_be_unidad.setCurrentText(
+                _MAPA_BE_UNIDAD_INV.get(s.get('be_unidad', 'atr'), '× ATR'))
             self.sp_trailing.setValue(s.get('trailing_atr', 0.0))
             # migrar viejas condiciones_salida a parciales
             parciales = s.get('parciales', [])
             if not parciales:
                 old_conds = (s.get('filtros') or {}).get('condiciones_salida')
                 if old_conds and len(old_conds) > 0:
-                    parciales = [{'pct': 100, 'r': 0.0, 'condiciones': list(old_conds),
-                                  'gestion': {'tipo': 0, 'val': 0.0}}]
-                    s['parciales'] = parciales
+                    parciales = [dict(etapa_salida_por_defecto(), trigger='cond',
+                                      condiciones=list(old_conds))]
+                else:
+                    # sistema guardado antes de que la salida por señal fuera
+                    # una etapa explícita: mostrar la que ya tenía de hecho
+                    parciales = [etapa_salida_por_defecto()]
+                s['parciales'] = parciales
             self._cargar_parciales_tabla(parciales)
+            # sistemas guardados antes de la entrada escalonada: un solo
+            # tramo al 100% a la señal (idéntico a lo que ya hacían)
+            tramos = s.get('tramos', [])
+            if not tramos:
+                tramos = [tramo_entrada_por_defecto()]
+                s['tramos'] = tramos
+            self._cargar_tramos_tabla(tramos)
+            # setups guardados antes del cierre parcial por mecanismo: los
+            # cuatro arrancan al 100%, que es lo que hacían de siempre
+            for clave_mec in MECANISMOS_SALIDA:
+                self._mecanismo_setup(s, clave_mec)
             edge = bool(s.get('edge', False))
             self.btn_edge.setChecked(edge)
             self._bloquear_stop_tp(edge)
@@ -2018,7 +2673,7 @@ class OptimizadorWidget(QWidget):
                 _MAPA_SESION_INV.get(filtros.get('sesion', {}).get('tipo', 'ninguna'), 'Ninguna'))
             self.sp_hora_ini.setValue(filtros.get('sesion', {}).get('hora_inicio', 0))
             self.sp_hora_fin.setValue(filtros.get('sesion', {}).get('hora_fin', 0))
-            self.editor_cond_entrada.cargar_condiciones(filtros.get('condiciones_entrada'))
+            self._recargar_filas_plantilla(s, filtros.get('condiciones_entrada'))
             noticias = filtros.get('noticias') or {}
             self.chk_noticias.setChecked(noticias.get('activo', False))
             self.sp_noticias_antes.setValue(noticias.get('minutos_antes', 30))
@@ -2030,6 +2685,64 @@ class OptimizadorWidget(QWidget):
             self._cargando = False
         self._actualizar_visibilidad_filtros()
         self._refresh_definicion()
+        self._actualizar_boton_deshacer()
+
+    # ── señal de la plantilla dentro de la tabla de entrada ──
+    def _recargar_filas_plantilla(self, s, condiciones=None):
+        """Repinta por completo la tabla de entrada (filas de la señal de la
+        plantilla + condiciones del usuario). Se usa al abrir un setup o
+        cuando cambia la estructura de la señal (p. ej. Ambas → solo Long)."""
+        if condiciones is None:
+            condiciones = (s.get('filtros') or {}).get('condiciones_entrada')
+        self.editor_cond_entrada.cargar(
+            condiciones, filas_plantilla(s['plantilla'], s['params']),
+            plantilla=s['plantilla'], on_param=self._on_param_desde_fila)
+        self._refresh_resumen_entrada()
+
+    def _sincronizar_filas_plantilla(self, s):
+        """Refresca los valores de las filas de la señal tras un cambio de
+        parámetros, sin recrear los widgets (si la estructura cambió, recarga)."""
+        filas = filas_plantilla(s['plantilla'], s['params'])
+        if not self.editor_cond_entrada.sincronizar_filas_plantilla(filas):
+            self._recargar_filas_plantilla(s)
+        self._refresh_resumen_entrada()
+
+    def _refresh_resumen_entrada(self):
+        """Qué tamaño abre la señal y con qué riesgo — lo que la tabla de
+        condiciones por sí sola no dice."""
+        riesgo = self.sp_riesgo.value()
+        stop = self.sp_stop.value()
+        dist = f"stop {stop:g}×ATR" if stop else "sin stop (dimensiona con 2×ATR de referencia)"
+        self.lbl_resumen_entrada.setText(
+            f"→ abre el 100% de la posición al open de la vela siguiente · "
+            f"riesgo {riesgo:g}% del equity · {dist}")
+
+    @_no_crash
+    def _on_param_desde_fila(self, clave, valor):
+        """Una celda editable de las filas de la señal ha cambiado: escribe el
+        parámetro en el setup y propaga el valor al formulario «Parámetros» y
+        al resto de filas, sin recrear el widget que se está editando."""
+        s = self._setup_actual()
+        if s is None or self._cargando:
+            return
+        s['params'][clave] = valor
+        tipo_w = self._param_widgets.get(clave)
+        if tipo_w is not None:
+            t, w = tipo_w
+            w.blockSignals(True)
+            try:
+                if t == 'choice':
+                    w.setCurrentText(str(valor))
+                elif t == 'int':
+                    w.setValue(int(valor))
+                elif t == 'float':
+                    w.setValue(float(valor))
+            finally:
+                w.blockSignals(False)
+        self._sincronizar_filas_plantilla(s)
+        self._refresh_item_actual()
+        self._refresh_definicion()
+        self._refresh_codigo()
 
     @_no_crash
     def _on_plantilla_changed(self, plantilla):
@@ -2052,14 +2765,17 @@ class OptimizadorWidget(QWidget):
             s['trailing_atr'] = 0.0
             self.sp_be.setValue(0.0)
             self.sp_trailing.setValue(0.0)
-            s['parciales'] = []
-            self._cargar_parciales_tabla([])
+            s['parciales'] = [etapa_salida_por_defecto()]
+            self._cargar_parciales_tabla(s['parciales'])
+            s['tramos'] = [tramo_entrada_por_defecto()]
+            self._cargar_tramos_tabla(s['tramos'])
             # el modo edge sobrevive al cambio de plantilla: stop/TP siguen a 0
             if self.btn_edge.isChecked():
                 self.sp_stop.setValue(0.0)
                 self.sp_tp.setValue(0.0)
             if plantilla == 'Custom (reglas)':
                 self.editor_reglas.cargar_reglas(s['params'].get('reglas'))
+            self._recargar_filas_plantilla(s)
         finally:
             self._cargando = False
         self._guardar_setup_actual()
@@ -2213,33 +2929,109 @@ class OptimizadorWidget(QWidget):
         self._guardar_setup_actual()
 
     # ── salidas parciales ──
+    def _empujar_deshacer(self, s, clave):
+        """Guarda una copia del valor ACTUAL de s[clave] (o de
+        s['filtros']['condiciones_entrada'] para clave='condiciones_entrada')
+        en la pila de deshacer del setup — llamar SIEMPRE antes de mutar la
+        lista en sitio (.append/.pop/asignación a un elemento), nunca
+        después: el diffing de _guardar_setup_actual no detecta estas
+        mutaciones porque ocurren por referencia sobre el mismo objeto que
+        él compararía como "antes"."""
+        if clave == 'condiciones_entrada':
+            valor = (s.get('filtros') or {}).get('condiciones_entrada', [])
+        else:
+            valor = s.get(clave, [])
+        pila = s.setdefault('_deshacer', [])
+        pila.append((clave, copy.deepcopy(valor)))
+        del pila[:-20]
+        self._actualizar_boton_deshacer()
+
     def _add_etapa_parcial(self):
         s = self._setup_actual()
         if s is None:
             return
         parciales = s.setdefault('parciales', [])
-        parciales.append({'pct': 50.0, 'r': 2.0, 'condiciones': [], 'gestion': {'tipo': 0, 'val': 0.0}})
+        self._empujar_deshacer(s, 'parciales')
+        parciales.append({'pct': 50.0, 'r': 2.0, 'trigger': 'r',
+                          'condiciones': [], 'gestion': {'tipo': 0, 'val': 0.0}})
         self._cargar_parciales_tabla(parciales)
+        self._guardar_setup_actual()
 
     def _del_etapa_parcial(self):
         s = self._setup_actual()
         if s is None:
             return
-        fila = self.tabla_parciales.currentRow()
         parciales = s.get('parciales', [])
+        if len(parciales) <= 1:
+            # sin etapas el setup solo cerraría por stop/TP/tiempo: la última
+            # etapa ES la salida del sistema, así que no se puede borrar
+            self.lbl_estado.setText(
+                "La configuración necesita al menos una salida (pon 100% "
+                "para cerrar toda la posición de una vez)")
+            return
+        self._empujar_deshacer(s, 'parciales')
+        fila = self.tabla_parciales.currentRow()
         if 0 <= fila < len(parciales):
             parciales.pop(fila)
-            self._cargar_parciales_tabla(parciales)
+        else:
+            parciales.pop()
+        self._cargar_parciales_tabla(parciales)
         self._guardar_setup_actual()
 
-    def _abrir_dialogo_condiciones(self, fila):
+    # ── entrada escalonada (tramos) ──
+    def _add_tramo(self):
         s = self._setup_actual()
         if s is None:
             return
-        parciales = s.setdefault('parciales', [])
-        while len(parciales) <= fila:
-            parciales.append({'pct': 50.0, 'r': 2.0, 'condiciones': [], 'gestion': {'tipo': 0, 'val': 0.0}})
-        conds = list(parciales[fila].get('condiciones', []))
+        tramos = s.setdefault('tramos', [])
+        self._empujar_deshacer(s, 'tramos')
+        tramos.append({'pct': 50.0, 'trigger': 'retroceso', 'val': 1.0,
+                       'condiciones': [], 'gestion': {'tipo': 0, 'val': 0.0}})
+        self._cargar_tramos_tabla(tramos)
+        self._guardar_setup_actual()
+
+    def _del_tramo(self):
+        s = self._setup_actual()
+        if s is None:
+            return
+        tramos = s.get('tramos', [])
+        if len(tramos) <= 1:
+            # el 1er tramo ES la entrada del sistema: sin él no habría forma
+            # de abrir la posición
+            self.lbl_estado.setText(
+                "La entrada necesita al menos un tramo (pon 100% para "
+                "construir toda la posición de una vez)")
+            return
+        self._empujar_deshacer(s, 'tramos')
+        fila = self.tabla_tramos.currentRow()
+        if 0 <= fila < len(tramos):
+            tramos.pop(fila)
+        else:
+            tramos.pop()
+        self._cargar_tramos_tabla(tramos)
+        self._guardar_setup_actual()
+
+    def _abrir_dialogo_condiciones_generico(self, fila, tabla, clave_lista, default_factory,
+                                            cargar_fn, titulo):
+        """Diálogo de condiciones (todas AND) de una etapa/tramo — idéntico
+        para salidas parciales y entrada escalonada, solo cambia a qué lista
+        del setup escribe y el título del diálogo."""
+        s = self._setup_actual()
+        if s is None:
+            return
+        lista = s.setdefault(clave_lista, [])
+        self._empujar_deshacer(s, clave_lista)
+        while len(lista) <= fila:
+            lista.append(default_factory())
+        self._editar_condiciones_de(lista[fila], titulo, tabla, fila,
+                                    lambda: cargar_fn(lista))
+
+    def _editar_condiciones_de(self, destino, titulo, tabla, fila, tras_aceptar):
+        """Diálogo de condiciones sobre un dict cualquiera con clave
+        'condiciones' — sirve tanto para una etapa de una lista
+        (parciales/tramos) como para uno de los cuatro mecanismos globales de
+        salida, que son dicts sueltos del setup."""
+        conds = list(destino.get('condiciones', []))
 
         dlg = QDialog(self, Qt.WindowType.Popup)
         dlg.setMinimumSize(650, 420)
@@ -2247,7 +3039,7 @@ class OptimizadorWidget(QWidget):
             "QDialog { background-color: #0d1424; border: 2px solid #253a60; border-radius: 6px; }")
         lay = QVBoxLayout(dlg)
         lay.setContentsMargins(10, 10, 10, 10)
-        editor = EditorCondiciones(f'Disparador de la Salida {fila + 1} (todas AND)')
+        editor = EditorCondiciones(titulo)
         editor.cargar_condiciones(conds)
         lay.addWidget(editor)
         fila_btn = QHBoxLayout()
@@ -2263,37 +3055,153 @@ class OptimizadorWidget(QWidget):
         QShortcut(Qt.Key.Key_Return, dlg, dlg.accept)
         QShortcut(Qt.Key.Key_Enter, dlg, dlg.accept)
 
-        btn = self.tabla_parciales.cellWidget(fila, 2)
+        btn = tabla.cellWidget(fila, 2)
         if btn:
             pos = btn.mapToGlobal(btn.rect().bottomLeft())
             dlg.move(pos)
 
         if dlg.exec():
-            parciales[fila]['condiciones'] = editor.condiciones()
-            self._cargar_parciales_tabla(parciales)
+            destino['condiciones'] = editor.condiciones()
+            tras_aceptar()
             self._guardar_setup_actual()
 
-    def _cargar_parciales_tabla(self, parciales):
-        self.tabla_parciales.blockSignals(True)
-        self.tabla_parciales.setRowCount(0)
-        for e, ep in enumerate(parciales or []):
-            self.tabla_parciales.insertRow(e)
-            self.tabla_parciales.setItem(e, 0,
-                QTableWidgetItem(f'{ep.get("pct", 100):.0f}%'))
-            self.tabla_parciales.setItem(e, 1,
-                QTableWidgetItem(f'{ep.get("r", 0):.1f} R'))
+    def _abrir_dialogo_condiciones(self, fila):
+        self._abrir_dialogo_condiciones_generico(
+            fila, self.tabla_parciales, 'parciales', etapa_salida_por_defecto,
+            self._cargar_parciales_tabla, f'Disparador de la Salida {fila + 1} (todas AND)')
+
+    def _abrir_dialogo_condiciones_tramo(self, fila):
+        self._abrir_dialogo_condiciones_generico(
+            fila, self.tabla_tramos, 'tramos', tramo_entrada_por_defecto,
+            self._cargar_tramos_tabla, f'Disparador del Tramo {fila + 1} (todas AND)')
+
+    def _widget_disparador_generico(self, mapa_trigger, mapa_trigger_inv, trigger_actual,
+                                    valor_actual, sufijos, tooltips_por_trigger,
+                                    campo2=None, valor2_actual=0.0):
+        """Celda «Disparador» genérica: combo + spin de valor numérico, oculto
+        para los disparadores que no necesitan un número (señal/condiciones).
+        Compartida entre las etapas de salida (R:R) y los tramos de entrada
+        escalonada (velas/retroceso/avance): solo cambian las opciones del
+        combo y la unidad (sufijo) del spin.
+
+        'tooltips_por_trigger': dict {trigger: texto_breve} — cada opción del
+        desplegable muestra SOLO su propia explicación (Qt.ItemDataRole.
+        ToolTipRole), y el combo cerrado sigue la de la opción actualmente
+        elegida, en vez de un único bloque con todas las opciones juntas.
+
+        'campo2' (opcional): dict {trigger: (sufijo, valor_defecto)} para el
+        único caso que necesita un SEGUNDO número (hoy, 'estancamiento': N
+        velas + R mínimo) — añade un segundo spin, visible solo para esos
+        disparadores."""
+        cont = QWidget()
+        lay = QHBoxLayout(cont)
+        lay.setContentsMargins(2, 0, 2, 0)
+        lay.setSpacing(4)
+        etiqueta_actual = mapa_trigger_inv.get(trigger_actual, next(iter(mapa_trigger)))
+        cmb = _combo_regla(list(mapa_trigger), etiqueta_actual)
+        for i, texto_opcion in enumerate(mapa_trigger):
+            cmb.setItemData(i, tooltips_por_trigger.get(mapa_trigger[texto_opcion], ''),
+                           Qt.ItemDataRole.ToolTipRole)
+        cmb.setToolTip(tooltips_por_trigger.get(trigger_actual, ''))
+        sp = _spin_regla(valor_actual or 1.0, dec=1)
+        sp.setRange(0.1, 1000.0)
+
+        sp2 = None
+        if campo2:
+            sp2 = _spin_regla(valor2_actual or 1.0, dec=1)
+            sp2.setRange(0.1, 1000.0)
+            sp2.valueChanged.connect(self._guardar_setup_actual)
+
+        def _actualizar_spin(texto):
+            trigger = mapa_trigger[texto]
+            sufijo = sufijos.get(trigger)
+            sp.setVisible(sufijo is not None)
+            if sufijo is not None:
+                sp.setSuffix(sufijo)
+            if sp2 is not None:
+                info2 = campo2.get(trigger)
+                sp2.setVisible(info2 is not None)
+                if info2 is not None:
+                    sp2.setSuffix(info2[0])
+            cmb.setToolTip(tooltips_por_trigger.get(trigger, ''))
+        cmb.currentTextChanged.connect(
+            lambda texto: (_actualizar_spin(texto), self._guardar_setup_actual()))
+        # ojo: _actualizar_spin llama a sp.setVisible(...) — hay que añadir sp
+        # (y sp2) al layout ANTES de esa llamada. Si no, en ese instante son
+        # QDoubleSpinBox sin padre (top-level) y setVisible(True) los muestra
+        # como una ventana de Windows suelta (con su icono) durante un
+        # instante, hasta que el addWidget de más abajo los reparenta.
+        lay.addWidget(cmb)
+        lay.addWidget(sp)
+        if sp2 is not None:
+            lay.addWidget(sp2)
+        lay.addStretch()
+        _actualizar_spin(cmb.currentText())
+        sp.valueChanged.connect(self._guardar_setup_actual)
+        cont.cmb, cont.sp, cont.sp2 = cmb, sp, sp2
+        return cont
+
+    def _widget_disparador_etapa(self, ep):
+        trigger = trigger_etapa(ep)
+        if trigger == 'estancamiento':
+            valor1 = ep.get('velas_max', 0.0) or 10.0
+            valor2 = ep.get('r_min', 0.0) or 1.0
+        else:
+            valor1 = ep.get('r', 0.0) or 2.0
+            valor2 = 0.0
+        return self._widget_disparador_generico(
+            _MAPA_TRIGGER, _MAPA_TRIGGER_INV, trigger, valor1,
+            _SUFIJOS_TRIGGER_ETAPA, _TOOLTIPS_TRIGGER_ETAPA,
+            campo2=_CAMPO2_TRIGGER_ETAPA, valor2_actual=valor2)
+
+    def _widget_disparador_tramo(self, tr):
+        return self._widget_disparador_generico(
+            _MAPA_TRIGGER_ENTRADA, _MAPA_TRIGGER_ENTRADA_INV, trigger_tramo(tr),
+            tr.get('val', 0.0) or 1.0, _SUFIJOS_TRIGGER_ENTRADA, _TOOLTIPS_TRIGGER_ENTRADA)
+
+    def _ajustar_alto_tabla(self, tabla, filas_min=1):
+        """Fija la altura de la tabla a la suma real de cabecera + todas sus
+        filas, en vez de un límite fijo: así se ven todas sin scroll interno
+        propio. El scroll, si hace falta, lo da la página (ya vive dentro de
+        un QScrollArea con setWidgetResizable(True))."""
+        alto = tabla.horizontalHeader().height() + 2 * tabla.frameWidth()
+        for r in range(tabla.rowCount()):
+            alto += tabla.rowHeight(r)
+        if tabla.rowCount() < filas_min:
+            alto += (filas_min - tabla.rowCount()) * tabla.verticalHeader().defaultSectionSize()
+        tabla.setFixedHeight(alto)
+
+    def _cargar_tabla_etapas(self, tabla, etapas, widget_disparador_fn, abrir_cond_fn,
+                             abrir_gest_fn, label_ref_anterior):
+        """Repuebla una tabla de 4 columnas (Cerrar/Entrar % · Disparador ·
+        Condiciones · Gestión) — misma estructura para «Salida del setup»
+        (parciales) y «Entrada escalonada» (tramos), solo cambia el
+        disparador y a qué lista del setup apuntan los botones."""
+        tabla.blockSignals(True)
+        tabla.setRowCount(0)
+        for e, etapa in enumerate(etapas or []):
+            tabla.insertRow(e)
+            tabla.setItem(e, 0, QTableWidgetItem(f'{etapa.get("pct", 100):.0f}%'))
+            disp = widget_disparador_fn(etapa)
+            _seleccionar_fila_al_clic(disp, tabla, e)
+            _seleccionar_fila_al_clic(disp.cmb, tabla, e)
+            _seleccionar_fila_al_clic(disp.sp, tabla, e)
+            if disp.sp2 is not None:
+                _seleccionar_fila_al_clic(disp.sp2, tabla, e)
+            tabla.setCellWidget(e, 1, disp)
             # botón de condiciones
-            conds = ep.get('condiciones', [])
+            conds = etapa.get('condiciones', [])
             n_cond = len(conds)
             btn_cond = QPushButton(f'{n_cond} cond' if n_cond else '+ Cond')
             btn_cond.setStyleSheet(
                 'QPushButton { font-size: 9px; padding: 2px 6px; color: #4fc3f7; }'
                 if n_cond else
                 'QPushButton { font-size: 9px; padding: 2px 6px; color: #5a7a9a; }')
-            btn_cond.clicked.connect(lambda _, fila=e: self._abrir_dialogo_condiciones(fila))
-            self.tabla_parciales.setCellWidget(e, 2, btn_cond)
+            btn_cond.clicked.connect(lambda _, fila=e: abrir_cond_fn(fila))
+            _seleccionar_fila_al_clic(btn_cond, tabla, e)
+            tabla.setCellWidget(e, 2, btn_cond)
             # botón de gestión
-            g = ep.get('gestion', {})
+            g = etapa.get('gestion', {})
             tipo = g.get('tipo', 0)
             val = g.get('val', 0.0)
             if tipo == 1:
@@ -2301,7 +3209,7 @@ class OptimizadorWidget(QWidget):
             elif tipo == 2:
                 label = f'Trail {val:.1f}'
             elif tipo == 3:
-                label = '-> Parcial'
+                label = label_ref_anterior
             else:
                 label = '+ Gestion'
             btn_gest = QPushButton(label)
@@ -2309,10 +3217,255 @@ class OptimizadorWidget(QWidget):
                 'QPushButton { font-size: 9px; padding: 2px 6px; color: #4fc3f7; }'
                 if tipo != 0 else
                 'QPushButton { font-size: 9px; padding: 2px 6px; color: #5a7a9a; }')
-            btn_gest.clicked.connect(lambda _, fila=e: self._abrir_dialogo_gestion(fila))
-            self.tabla_parciales.setCellWidget(e, 3, btn_gest)
-        self.tabla_parciales.blockSignals(False)
+            btn_gest.clicked.connect(lambda _, fila=e: abrir_gest_fn(fila))
+            _seleccionar_fila_al_clic(btn_gest, tabla, e)
+            tabla.setCellWidget(e, 3, btn_gest)
+        tabla.blockSignals(False)
+
+    def _cargar_parciales_tabla(self, parciales):
+        self._cargar_tabla_etapas(
+            self.tabla_parciales, parciales, self._widget_disparador_etapa,
+            self._abrir_dialogo_condiciones, self._abrir_dialogo_gestion, '-> Parcial')
+        self._pintar_filas_mecanismo()
         self._validar_pct_parciales()
+        # altura al final: _pintar_filas_mecanismo añade filas DESPUÉS de las
+        # etapas normales, así que medir antes dejaría la tabla corta
+        self._ajustar_alto_tabla(self.tabla_parciales)
+        _repintar_seleccion_fila(self.tabla_parciales)
+
+    # ── mecanismos globales de salida (stop / TP / BE / trailing) ──
+    def _mecanismo_setup(self, s, clave):
+        """El dict del mecanismo dentro del setup, creándolo con los valores
+        de siempre (cerrar el 100%) si el setup viene de una versión previa."""
+        mec = s.get(clave)
+        if not isinstance(mec, dict):
+            mec = salida_mecanismo_por_defecto()
+            s[clave] = mec
+        return mec
+
+    def _pintar_filas_mecanismo(self):
+        """Añade al final de «Salida del setup» una fila por cada mecanismo
+        global ACTIVO (stop/TP/BE/trailing con su spin > 0), coloreada y
+        editable. No son etapas secuenciales: van marcadas con _ROL_MECANISMO
+        para que _leer_tabla_etapas y _validar_pct_parciales las ignoren."""
+        s = self._setup_actual()
+        if s is None:
+            return
+        tabla = self.tabla_parciales
+        tabla.blockSignals(True)
+        try:
+            for clave, (etiqueta, attr_spin, sufijo, color) in _MECANISMOS_SALIDA_UI.items():
+                spin = getattr(self, attr_spin, None)
+                if spin is None or spin.value() <= 0.0:
+                    continue
+                mec = self._mecanismo_setup(s, clave)
+                fila = tabla.rowCount()
+                tabla.insertRow(fila)
+
+                item_pct = QTableWidgetItem(f'{float(mec.get("pct", 100.0)):.0f}%')
+                item_pct.setData(Qt.ItemDataRole.UserRole, _ROL_MECANISMO)
+                item_pct.setData(_ROL_CLAVE_MECANISMO, clave)
+                item_pct.setForeground(QColor(color))
+                item_pct.setToolTip(
+                    f"% de lo que quede ABIERTO que cierra el {etiqueta.lower()} "
+                    "al dispararse.\nCon 100% cierra toda la posición (lo de "
+                    "siempre). Con menos, cierra esa parte UNA SOLA VEZ por "
+                    "operación y el resto sigue vivo.")
+                tabla.setItem(fila, 0, item_pct)
+
+                valor_mec = self._widget_valor_mecanismo(clave)
+                _seleccionar_fila_al_clic(valor_mec, tabla, fila)
+                _seleccionar_fila_al_clic(valor_mec.sp, tabla, fila)
+                if valor_mec.cmb is not None:
+                    _seleccionar_fila_al_clic(valor_mec.cmb, tabla, fila)
+                tabla.setCellWidget(fila, 1, valor_mec)
+
+                conds = mec.get('condiciones', [])
+                btn_cond = QPushButton(f'{len(conds)} cond' if conds else '+ Cond')
+                btn_cond.setStyleSheet(
+                    'QPushButton { font-size: 9px; padding: 2px 6px; color: '
+                    + (color if conds else '#5a7a9a') + '; }')
+                btn_cond.clicked.connect(
+                    lambda _, k=clave, t=etiqueta: self._abrir_dialogo_condiciones_mecanismo(k, t))
+                _seleccionar_fila_al_clic(btn_cond, tabla, fila)
+                tabla.setCellWidget(fila, 2, btn_cond)
+
+                g = mec.get('gestion', {})
+                tipo, val = g.get('tipo', 0), g.get('val', 0.0)
+                if tipo == 1:
+                    label = f'BE {val:.1f}'
+                elif tipo == 2:
+                    label = f'Trail {val:.1f}'
+                elif tipo == 3:
+                    label = '-> Cierre ant.'
+                else:
+                    label = '+ Gestion'
+                btn_gest = QPushButton(label)
+                btn_gest.setStyleSheet(
+                    'QPushButton { font-size: 9px; padding: 2px 6px; color: '
+                    + (color if tipo else '#5a7a9a') + '; }')
+                btn_gest.clicked.connect(
+                    lambda _, k=clave, t=etiqueta: self._abrir_dialogo_gestion_mecanismo(k, t))
+                _seleccionar_fila_al_clic(btn_gest, tabla, fila)
+                tabla.setCellWidget(fila, 3, btn_gest)
+        finally:
+            tabla.blockSignals(False)
+
+    def _sufijo_mecanismo(self, clave):
+        """Unidad que muestra el spin de la fila. Vacía en el break-even: su
+        unidad no es fija y la lleva el combo de la propia fila, así que
+        repetirla en el spin la mostraría dos veces."""
+        return _MECANISMOS_SALIDA_UI[clave][2] or ''
+
+    def _widget_valor_mecanismo(self, clave):
+        """Celda «Disparador» de un mecanismo: su valor, editable, con la misma
+        unidad que el campo de arriba. Editarlo escribe en ese campo (y, en el
+        break-even, también su combo de unidad), de modo que los dos sitios
+        quedan sincronizados en ambos sentidos — mismo patrón que
+        _on_param_desde_fila usa para las filas de señal de la tabla de Entrada.
+
+        El mínimo nunca es 0: para apagar el mecanismo se usa su campo de
+        arriba, así la fila no se borra sola mientras la estás editando."""
+        etiqueta, attr_spin, _sufijo, color = _MECANISMOS_SALIDA_UI[clave]
+        origen = getattr(self, attr_spin)
+        cont = QWidget()
+        lay = QHBoxLayout(cont)
+        lay.setContentsMargins(2, 0, 2, 0)
+        lay.setSpacing(4)
+
+        lbl = QLabel(etiqueta)
+        lbl.setStyleSheet(f'color: {color}; font-size: 10px;')
+        lay.addWidget(lbl)
+
+        # QDoubleSpinBox no hereda de QSpinBox: ambos cuelgan de QAbstractSpinBox
+        entero = isinstance(origen, QSpinBox)
+        minimo = _MIN_VALOR_MECANISMO.get(clave, 0.1)
+        if entero:
+            sp = QSpinBox()
+            sp.setRange(int(minimo), origen.maximum())
+            sp.setValue(int(origen.value()))
+        else:
+            sp = QDoubleSpinBox()
+            sp.setDecimals(origen.decimals())
+            sp.setRange(minimo, origen.maximum())
+            sp.setValue(float(origen.value()))
+        sp.setSuffix(self._sufijo_mecanismo(clave))
+        sp.setToolTip(
+            f"Mismo valor que «{etiqueta}» arriba: editarlo aquí lo cambia allí "
+            f"y al revés.\nPara desactivar el mecanismo, ponlo a 0 en el campo "
+            f"de arriba (aquí el mínimo es {minimo:g}).")
+        sp.valueChanged.connect(lambda v, k=clave: self._on_valor_mecanismo(k, v))
+        lay.addWidget(sp)
+
+        cmb = None
+        if clave == 'salida_be':
+            cmb = _combo_regla(list(_MAPA_BE_UNIDAD), self.cmb_be_unidad.currentText())
+            cmb.setToolTip(self.cmb_be_unidad.toolTip())
+            cmb.currentTextChanged.connect(self._on_unidad_be_desde_fila)
+            lay.addWidget(cmb)
+        lay.addStretch()
+        cont.sp, cont.cmb = sp, cmb
+        return cont
+
+    @_no_crash
+    def _on_valor_mecanismo(self, clave, valor):
+        """Vuelca a su campo de arriba el valor editado en la fila."""
+        if self._cargando:
+            return
+        origen = getattr(self, _MECANISMOS_SALIDA_UI[clave][1])
+        origen.blockSignals(True)
+        try:
+            origen.setValue(valor)
+        finally:
+            origen.blockSignals(False)
+        self._guardar_setup_actual()
+
+    @_no_crash
+    def _on_unidad_be_desde_fila(self, texto):
+        """La unidad del break-even editada desde su fila: la propaga al combo
+        de arriba y refresca el sufijo del spin de la fila."""
+        if self._cargando:
+            return
+        self.cmb_be_unidad.blockSignals(True)
+        try:
+            self.cmb_be_unidad.setCurrentText(texto)
+        finally:
+            self.cmb_be_unidad.blockSignals(False)
+        self._guardar_setup_actual()
+
+    def _sincronizar_filas_mecanismo(self):
+        """Refresca las filas de mecanismo tras cambiar un campo de arriba: si
+        cambió el CONJUNTO de mecanismos activos (se encendió/apagó uno)
+        repinta la tabla; si solo cambió un valor, lo vuelca al spin de la fila
+        sin recrear el widget, para no destruir el que se esté editando."""
+        s = self._setup_actual()
+        if s is None or self._cargando:
+            return
+        activos = [c for c, (_e, attr, _s, _c) in _MECANISMOS_SALIDA_UI.items()
+                   if getattr(self, attr, None) is not None
+                   and getattr(self, attr).value() > 0.0]
+        pintados = [c for c in _MECANISMOS_SALIDA_UI if self._fila_de_mecanismo(c) >= 0]
+        if activos != pintados:
+            self._cargar_parciales_tabla(s.get('parciales'))
+            return
+        for clave in activos:
+            cont = self.tabla_parciales.cellWidget(self._fila_de_mecanismo(clave), 1)
+            if cont is None:
+                continue
+            origen = getattr(self, _MECANISMOS_SALIDA_UI[clave][1])
+            cont.sp.blockSignals(True)
+            try:
+                cont.sp.setSuffix(self._sufijo_mecanismo(clave))
+                if origen.value() >= cont.sp.minimum():
+                    cont.sp.setValue(origen.value())
+            finally:
+                cont.sp.blockSignals(False)
+            if cont.cmb is not None:
+                cont.cmb.blockSignals(True)
+                try:
+                    cont.cmb.setCurrentText(self.cmb_be_unidad.currentText())
+                finally:
+                    cont.cmb.blockSignals(False)
+
+    def _fila_de_mecanismo(self, clave):
+        """Índice de fila que ocupa un mecanismo en tabla_parciales (-1 si no
+        está pintado). Se localiza por la clave guardada en la celda 0, no
+        comparando textos: la celda del valor es un widget, no un item."""
+        for fila in range(self.tabla_parciales.rowCount()):
+            item = self.tabla_parciales.item(fila, 0)
+            if item is not None and item.data(_ROL_CLAVE_MECANISMO) == clave:
+                return fila
+        return -1
+
+    @_no_crash
+    def _abrir_dialogo_condiciones_mecanismo(self, clave, etiqueta):
+        s = self._setup_actual()
+        if s is None:
+            return
+        self._editar_condiciones_de(
+            self._mecanismo_setup(s, clave),
+            f'Condiciones del cierre por {etiqueta} (todas AND)',
+            self.tabla_parciales, self._fila_de_mecanismo(clave),
+            lambda: self._cargar_parciales_tabla(s.get('parciales')))
+
+    @_no_crash
+    def _abrir_dialogo_gestion_mecanismo(self, clave, etiqueta):
+        s = self._setup_actual()
+        if s is None:
+            return
+        self._editar_gestion_de(
+            self._mecanismo_setup(s, clave), 'Mover al precio del cierre anterior',
+            self.tabla_parciales, self._fila_de_mecanismo(clave),
+            lambda: self._cargar_parciales_tabla(s.get('parciales')))
+
+    def _cargar_tramos_tabla(self, tramos):
+        self._cargar_tabla_etapas(
+            self.tabla_tramos, tramos, self._widget_disparador_tramo,
+            self._abrir_dialogo_condiciones_tramo, self._abrir_dialogo_gestion_tramo,
+            '-> Tramo ant.')
+        self._validar_pct_tramos()
+        self._ajustar_alto_tabla(self.tabla_tramos)
+        _repintar_seleccion_fila(self.tabla_tramos)
 
     def _validar_pct_parciales(self):
         """Avisa si alguna etapa pide cerrar más de lo que queda de la
@@ -2325,74 +3478,154 @@ class OptimizadorWidget(QWidget):
         que Qt ignore el setBackground() por celda, así que un fondo rojo
         ahí no se vería."""
         self.tabla_parciales.blockSignals(True)
-        etapas_invalidas = []
+        pcts = []
         resumen = []
         queda = 100.0
         for e in range(self.tabla_parciales.rowCount()):
             item = self.tabla_parciales.item(e, 0)
-            if item is None:
-                continue
+            if item is None or item.data(Qt.ItemDataRole.UserRole) == _ROL_MECANISMO:
+                continue   # las filas de stop/TP/BE/trailing no son secuenciales
             try:
                 val = float(item.text().replace('%', '').strip())
             except ValueError:
                 val = 0.0
-            if val > queda + 1e-9:
-                etapas_invalidas.append(e + 1)
-                item.setToolTip(
-                    "Pides cerrar más de lo que queda de la posición en "
-                    "esta etapa: no se puede cerrar más de lo que hay.")
-            else:
-                item.setToolTip('')
+            pcts.append({'pct': val})
+            item.setToolTip('' if val <= queda + 1e-9 else AVISO_EXCESO_PARCIALES)
             # cada etapa cierra `val`% del tamaño ORIGINAL, no de lo que quede
             queda -= min(max(val, 0.0), queda)
-            resumen.append(f"Etapa {e + 1}: cierra {val:g}% → queda {queda:.0f}%")
+            resumen.append(f"Salida {len(pcts)}: cierra {val:g}% → queda {queda:.0f}%")
         self.tabla_parciales.blockSignals(False)
         if resumen:
             self.lbl_resumen_parciales.setText(" · ".join(resumen))
             self.lbl_resumen_parciales.setVisible(True)
         else:
             self.lbl_resumen_parciales.setVisible(False)
-        if etapas_invalidas:
-            palabra = "Etapa" if len(etapas_invalidas) == 1 else "Etapas"
-            nums = ", ".join(str(n) for n in etapas_invalidas)
-            self.lbl_aviso_parciales.setText(
-                f"⚠ {palabra} {nums}: pide cerrar más de lo que queda de "
-                "la posición en ese momento.")
-            self.lbl_aviso_parciales.setVisible(True)
-        else:
-            self.lbl_aviso_parciales.setVisible(False)
+        avisos = validar_parciales(pcts)
+        self.lbl_aviso_parciales.setText(f"⚠ {avisos[0]}" if avisos else "")
+        self.lbl_aviso_parciales.setVisible(bool(avisos))
+        self._actualizar_boton_ejecutable()
 
-    def _leer_parciales_tabla(self):
+    def _validar_pct_tramos(self):
+        """Muestra cuánto riesgo acumulan los tramos configurados: cada
+        «Entrar %» es una porción del RIESGO TOTAL del setup (no del tamaño,
+        a diferencia de las salidas parciales), así que deberían sumar 100%
+        entre todos — si suman más, el sistema arriesga más del 1% (o el %
+        que sea) pretendido; si suman menos, el resto simplemente no se usa."""
+        self.tabla_tramos.blockSignals(True)
+        resumen = []
+        pcts = []
+        total = 0.0
+        for e in range(self.tabla_tramos.rowCount()):
+            item = self.tabla_tramos.item(e, 0)
+            if item is None:
+                continue
+            try:
+                val = float(item.text().replace('%', '').strip())
+            except ValueError:
+                val = 0.0
+            total += val
+            pcts.append({'pct': val})
+            item.setToolTip('' if total <= 100.0 + 1e-9 else
+                            "Los tramos ya suman más del 100% del riesgo total.")
+            resumen.append(f"Tramo {e + 1}: {val:g}% del riesgo")
+        self.tabla_tramos.blockSignals(False)
+        riesgo_total_pct = self.sp_riesgo.value() * total / 100.0
+        if resumen:
+            self.lbl_resumen_tramos.setText(
+                " · ".join(resumen) + f" · total {total:g}% del riesgo "
+                f"({riesgo_total_pct:g}% del equity)")
+            self.lbl_resumen_tramos.setVisible(True)
+        else:
+            self.lbl_resumen_tramos.setVisible(False)
+        avisos = validar_tramos(pcts)
+        self.lbl_aviso_tramos.setText(f"⚠ {avisos[0]}" if avisos else "")
+        self.lbl_aviso_tramos.setVisible(bool(avisos))
+        self._actualizar_boton_ejecutable()
+
+    def _leer_tabla_etapas(self, tabla, clave_lista, mapa_trigger, sufijos, valor_clave):
+        """Lee de vuelta una tabla de etapas/tramos al formato que consume el
+        motor — contraparte de _cargar_tabla_etapas."""
         s = self._setup_actual()
         if s is None:
             return []
-        parciales = []
-        for e in range(self.tabla_parciales.rowCount()):
+        stored = s.get(clave_lista, [])
+        etapas = []
+        for e in range(tabla.rowCount()):
+            item_pct = tabla.item(e, 0)
+            if item_pct is not None \
+                    and item_pct.data(Qt.ItemDataRole.UserRole) == _ROL_MECANISMO:
+                # fila de stop/TP/BE/trailing: su % vive en s['salida_*'], no
+                # en esta lista de etapas secuenciales
+                self._leer_pct_mecanismo(s, e, item_pct)
+                continue
             try:
-                pct_str = self.tabla_parciales.item(e, 0).text().replace('%', '').strip()
-                r_str = self.tabla_parciales.item(e, 1).text().replace('R', '').strip()
+                pct_str = item_pct.text().replace('%', '').strip()
                 pct = float(pct_str) if pct_str else 100.0
-                r = float(r_str) if r_str else 0.0
-                stored = s.get('parciales', [])
-                if e < len(stored):
-                    g = dict(stored[e].get('gestion', {'tipo': 0, 'val': 0.0}))
-                    conds = list(stored[e].get('condiciones', []))
+                disp = tabla.cellWidget(e, 1)
+                trigger = mapa_trigger[disp.cmb.currentText()]
+                idx = len(etapas)
+                if idx < len(stored):
+                    g = dict(stored[idx].get('gestion', {'tipo': 0, 'val': 0.0}))
+                    conds = list(stored[idx].get('condiciones', []))
                 else:
                     g = {'tipo': 0, 'val': 0.0}
                     conds = []
-                parciales.append({'pct': pct, 'r': r, 'condiciones': conds, 'gestion': g})
-            except (ValueError, AttributeError, IndexError):
+                if trigger == 'estancamiento':
+                    # único disparador con 2 números: no usa 'valor_clave'
+                    # (que para parciales es 'r' — dejarlo a 0 evita que se
+                    # cuele por la rama de R:R normal en el motor)
+                    etapas.append({'pct': pct, 'trigger': trigger,
+                                   'velas_max': int(disp.sp.value()),
+                                   'r_min': disp.sp2.value(),
+                                   'condiciones': conds, 'gestion': g})
+                else:
+                    valor = disp.sp.value() if sufijos.get(trigger) is not None else 0.0
+                    etapas.append({'pct': pct, valor_clave: valor, 'trigger': trigger,
+                                   'condiciones': conds, 'gestion': g})
+            except (ValueError, AttributeError, IndexError, KeyError):
                 pass
-        return parciales
+        return etapas
 
-    def _abrir_dialogo_gestion(self, fila):
+    def _leer_pct_mecanismo(self, s, fila, item_pct):
+        """Vuelca el «Cerrar %» editado en una fila de mecanismo al dict
+        correspondiente del setup, acotado a [0, 100]."""
+        clave = item_pct.data(_ROL_CLAVE_MECANISMO)
+        if clave not in _MECANISMOS_SALIDA_UI:
+            return
+        try:
+            pct = float(item_pct.text().replace('%', '').strip())
+        except ValueError:
+            return
+        self._mecanismo_setup(s, clave)['pct'] = min(max(pct, 0.0), 100.0)
+
+    def _leer_parciales_tabla(self):
+        return self._leer_tabla_etapas(
+            self.tabla_parciales, 'parciales', _MAPA_TRIGGER, _SUFIJOS_TRIGGER_ETAPA, 'r')
+
+    def _leer_tramos_tabla(self):
+        return self._leer_tabla_etapas(
+            self.tabla_tramos, 'tramos', _MAPA_TRIGGER_ENTRADA, _SUFIJOS_TRIGGER_ENTRADA, 'val')
+
+    def _abrir_dialogo_gestion_generico(self, fila, tabla, clave_lista, default_factory,
+                                        cargar_fn, label_ref_anterior):
+        """Diálogo de gestión (BE/trailing/mover al precio de referencia
+        anterior) de una etapa/tramo — idéntico para salidas parciales y
+        entrada escalonada, solo cambia a qué lista del setup escribe."""
         s = self._setup_actual()
         if s is None:
             return
-        parciales = s.setdefault('parciales', [])
-        while len(parciales) <= fila:
-            parciales.append({'pct': 50.0, 'r': 2.0, 'gestion': {'tipo': 0, 'val': 0.0}})
-        g_actual = parciales[fila].get('gestion', {'tipo': 0, 'val': 0.0})
+        lista = s.setdefault(clave_lista, [])
+        self._empujar_deshacer(s, clave_lista)
+        while len(lista) <= fila:
+            lista.append(default_factory())
+        self._editar_gestion_de(lista[fila], label_ref_anterior, tabla, fila,
+                                lambda: cargar_fn(lista))
+
+    def _editar_gestion_de(self, destino, label_ref_anterior, tabla, fila, tras_aceptar):
+        """Diálogo de gestión sobre un dict cualquiera con clave 'gestion' —
+        sirve tanto para una etapa de una lista (parciales/tramos) como para
+        uno de los cuatro mecanismos globales de salida."""
+        g_actual = destino.get('gestion', {'tipo': 0, 'val': 0.0})
 
         dlg = QDialog(self, Qt.WindowType.Popup)
         dlg.setStyleSheet(
@@ -2404,7 +3637,7 @@ class OptimizadorWidget(QWidget):
         rb_none = QRadioButton('Sin gestión')
         rb_be = QRadioButton('Break-even a')
         rb_trail = QRadioButton('Trailing stop a')
-        rb_prev = QRadioButton('Mover al precio de la parcial anterior')
+        rb_prev = QRadioButton(label_ref_anterior)
 
         sp_val = QDoubleSpinBox()
         sp_val.setRange(0.0, 10.0)
@@ -2456,7 +3689,7 @@ class OptimizadorWidget(QWidget):
         fila_btn.addWidget(btn_ok)
         lay.addLayout(fila_btn)
 
-        btn = self.tabla_parciales.cellWidget(fila, 3)
+        btn = tabla.cellWidget(fila, 3)
         if btn:
             pos = btn.mapToGlobal(btn.rect().bottomLeft())
             dlg.move(pos)
@@ -2465,16 +3698,26 @@ class OptimizadorWidget(QWidget):
             return
 
         if rb_be.isChecked():
-            parciales[fila]['gestion'] = {'tipo': 1, 'val': sp_val.value()}
+            destino['gestion'] = {'tipo': 1, 'val': sp_val.value()}
         elif rb_trail.isChecked():
-            parciales[fila]['gestion'] = {'tipo': 2, 'val': sp_val.value()}
+            destino['gestion'] = {'tipo': 2, 'val': sp_val.value()}
         elif rb_prev.isChecked():
-            parciales[fila]['gestion'] = {'tipo': 3, 'val': 0.0}
+            destino['gestion'] = {'tipo': 3, 'val': 0.0}
         else:
-            parciales[fila]['gestion'] = {'tipo': 0, 'val': 0.0}
+            destino['gestion'] = {'tipo': 0, 'val': 0.0}
 
-        self._cargar_parciales_tabla(parciales)
+        tras_aceptar()
         self._guardar_setup_actual()
+
+    def _abrir_dialogo_gestion(self, fila):
+        self._abrir_dialogo_gestion_generico(
+            fila, self.tabla_parciales, 'parciales', etapa_salida_por_defecto,
+            self._cargar_parciales_tabla, 'Mover al precio de la parcial anterior')
+
+    def _abrir_dialogo_gestion_tramo(self, fila):
+        self._abrir_dialogo_gestion_generico(
+            fila, self.tabla_tramos, 'tramos', tramo_entrada_por_defecto,
+            self._cargar_tramos_tabla, 'Mover al precio del tramo anterior')
 
     @_no_crash
     def _guardar_setup_actual(self, *_):
@@ -2483,6 +3726,14 @@ class OptimizadorWidget(QWidget):
         s = self._setup_actual()
         if s is None:
             return
+        # snapshot para deshacer: se compara contra el estado ya volcado al
+        # final de este método, y solo se apila si algo de esto cambió
+        antes_deshacer = {
+            'parciales': copy.deepcopy(s.get('parciales', [])),
+            'tramos': copy.deepcopy(s.get('tramos', [])),
+            'condiciones_entrada': copy.deepcopy(
+                (s.get('filtros') or {}).get('condiciones_entrada', [])),
+        }
         s['nombre'] = self.txt_nombre.text().strip() or s['nombre']
         s['plantilla'] = self._plantilla_actual
         s['params'] = self._leer_params_widgets(s['plantilla'])
@@ -2491,9 +3742,12 @@ class OptimizadorWidget(QWidget):
         s['tp_r'] = self.sp_tp.value()
         s['salida_n_velas'] = self.sp_tiempo.value()
         s['be_atr'] = self.sp_be.value()
+        s['be_unidad'] = _MAPA_BE_UNIDAD[self.cmb_be_unidad.currentText()]
         s['trailing_atr'] = self.sp_trailing.value()
         s['parciales'] = self._leer_parciales_tabla()
         self._validar_pct_parciales()
+        s['tramos'] = self._leer_tramos_tabla()
+        self._validar_pct_tramos()
         s['edge'] = self.btn_edge.isChecked()
         elegidos = [i for i, chk in enumerate(self._chk_dias) if chk.isChecked()]
         dias_disponibles = self._dias_disponibles or set(range(7))
@@ -2519,9 +3773,71 @@ class OptimizadorWidget(QWidget):
                 'cerrar_posiciones': self.chk_noticias_cerrar.isChecked(),
             },
         }
+        # deshacer: si alguna de las 3 listas cambió respecto al snapshot de
+        # arriba, apilar el valor ANTERIOR (no el nuevo) para poder volver
+        despues_deshacer = {
+            'parciales': s['parciales'], 'tramos': s['tramos'],
+            'condiciones_entrada': s['filtros']['condiciones_entrada'],
+        }
+        for clave, valor_antes in antes_deshacer.items():
+            if valor_antes != despues_deshacer[clave]:
+                pila = s.setdefault('_deshacer', [])
+                pila.append((clave, valor_antes))
+                del pila[:-20]   # tope: últimas 20 acciones
+        self._actualizar_boton_deshacer()
+        # la señal mostrada en la tabla de entrada sigue a los parámetros, y
+        # las filas de stop/TP/BE/trailing a sus spins
+        self._sincronizar_filas_plantilla(s)
+        self._sincronizar_filas_mecanismo()
         self._refresh_item_actual()
         self._refresh_definicion()
         self._refresh_codigo()
+        self._actualizar_boton_ejecutable()
+
+    # ── deshacer (Ctrl+Z): pila de snapshots por setup, compartida entre
+    # "Entrada del setup", "Entrada escalonada" y "Salida del setup" ──
+    def _crear_boton_deshacer(self):
+        btn = QPushButton("↺")
+        btn.setToolTip(
+            "Deshacer (Ctrl+Z): revierte el último cambio en cualquiera de "
+            "las tablas de Entrada/Salida — borrar una fila, editar su %, "
+            "su disparador, sus condiciones o su gestión.")
+        btn.setEnabled(False)
+        btn.clicked.connect(self._deshacer)
+        return btn
+
+    def _deshacer(self):
+        s = self._setup_actual()
+        if s is None or not s.get('_deshacer'):
+            return
+        clave, valor = s['_deshacer'].pop()
+        self._cargando = True
+        try:
+            if clave == 'parciales':
+                s['parciales'] = valor
+                self._cargar_parciales_tabla(valor)
+            elif clave == 'tramos':
+                s['tramos'] = valor
+                self._cargar_tramos_tabla(valor)
+            else:   # 'condiciones_entrada'
+                s.setdefault('filtros', {})['condiciones_entrada'] = valor
+                self.editor_cond_entrada.cargar_condiciones(valor)
+        finally:
+            self._cargando = False
+        self._actualizar_boton_deshacer()
+        self._refresh_item_actual()
+        self._refresh_definicion()
+        self._refresh_codigo()
+        self._actualizar_boton_ejecutable()
+
+    def _actualizar_boton_deshacer(self):
+        s = self._setup_actual()
+        habilitado = bool(s and s.get('_deshacer'))
+        for btn in (getattr(self, 'btn_deshacer_entrada', None),
+                    getattr(self, 'btn_deshacer_tramos', None),
+                    getattr(self, 'btn_deshacer_parciales', None)):
+            if btn is not None:
+                btn.setEnabled(habilitado)
 
     def _refresh_definicion(self):
         s = self._setup_actual()
@@ -3141,28 +4457,33 @@ class ResultadosWidget(QWidget):
         self._modo_grafico = 'velas'
         self._art_datos = []
         self._actualizando_xlim = False
-        self._sincronizando_slider = False
         self._y_manual = False
 
         # estado de trades (poblado en _dibujar_principal) para recortar
-        # compra/venta/trayecto/stop-loss al rango visible en cada frame
+        # compra/venta/trayecto/cajas de salida al rango visible en cada frame
         self._tr = None
         self._compra_idx_full = None
         self._venta_idx_full = None
         self._trayecto_segmentos_full = None
-        self._stop_mask_base = None
-        self._stop_segmentos_full = None
-        self._stop_cuadros_full = None
-        self._tp_mask_base = None
-        self._tp_segmentos_full = None
-        self._tp_cuadros_full = None
+        self._salida_segmentos_full = None
+        self._salida_cuadros_full = None
+        self._salida_colores_full = None
         self._scatter_compra = None
         self._scatter_venta = None
+        # tramos de entrada escalonada (aperturas NO son un cierre: viven en
+        # resultado['entradas'], no en 'trades' — ver core/backtest). Solo
+        # los tramos 2+ se marcan aquí (el 1º ya lo pinta compra/venta).
+        self._entr = None
+        self._tramo_compra_idx_full = None
+        self._tramo_venta_idx_full = None
+        self._scatter_tramo_compra = None
+        self._scatter_tramo_venta = None
         self._art_trayecto = None
-        self._art_stop_cuadros = None
-        self._art_stop_segmentos = None
-        self._art_tp_cuadros = None
-        self._art_tp_segmentos = None
+        self._art_salida_cuadros = None
+        self._art_salida_segmentos = None
+        self._art_stop_track = None
+        self._art_entrada_track = None
+        self._art_zona_riesgo = None
         self._art_fijos_dinamicos = []
         self._art_overlays_extra = []
         self._art_osciladores = []
@@ -3220,9 +4541,9 @@ class ResultadosWidget(QWidget):
         lay.addWidget(self.tabla_metricas)
 
         # gráfico principal: log-return + flechas + IS/OOS
-        self.fig = Figure(figsize=(9, 3.2), facecolor=FIG_BG)
+        self.fig = Figure(figsize=(9, 4.8), facecolor=FIG_BG)
         self.canvas = FigureCanvasQTAgg(self.fig)
-        self.canvas.setMinimumHeight(320)
+        self.canvas.setMinimumHeight(480)
         self.toolbar = NavigationToolbar2QT(self.canvas, self)
         self.toolbar.setStyleSheet("background-color: #141e30;")
         fila_zoom = QHBoxLayout()
@@ -3285,7 +4606,7 @@ class ResultadosWidget(QWidget):
         self.stack_grafico = QStackedWidget()
         self.stack_grafico.addWidget(self.canvas)   # índice 0 = clásica
         self.stack_grafico.addWidget(self.lwc)       # índice 1 = moderna
-        lay.addWidget(self.stack_grafico)
+        lay.addWidget(self.stack_grafico, 1)
 
         # arrastrar los márgenes de los ejes (estilo TradingView/MT4): eje Y
         # (precio) para estirar/comprimir la escala, eje X (fecha) para zoom
@@ -3305,6 +4626,11 @@ class ResultadosWidget(QWidget):
         lbl_eq = QLabel("Curva de Equity (IS vs OOS)")
         lbl_eq.setObjectName("titulo")
         header_eq.addWidget(lbl_eq)
+        header_eq.addWidget(_icono_ayuda(
+            "Evolución del capital a lo largo del backtest. La zona "
+            "sombreada distingue el tramo In-Sample del Out-of-Sample; "
+            "puedes superponer Buy & Hold para comparar contra simplemente "
+            "mantener el activo."))
         header_eq.addStretch()
         self.chk_bh = QCheckBox("Mostrar Buy && Hold")
         self.chk_bh.setToolTip(
@@ -3337,6 +4663,10 @@ class ResultadosWidget(QWidget):
         self.grp_codigo.setCheckable(True)
         self.grp_codigo.setChecked(False)
         lay_cod = QVBoxLayout(self.grp_codigo)
+        lay_cod.insertLayout(0, _fila_ayuda(
+            "El mismo pseudocódigo del constructor, pero congelado tal y "
+            "como se ejecutó en ESTE backtest — útil para confirmar después "
+            "qué configuración exacta produjo estos resultados."))
         self.txt_codigo = QPlainTextEdit()
         self.txt_codigo.setReadOnly(True)
         self.txt_codigo.setStyleSheet(
@@ -3353,6 +4683,10 @@ class ResultadosWidget(QWidget):
         # métricas por setup (¿aporta cada forma de entrada del sistema?)
         self.grp_setups = QGroupBox("Métricas por setup")
         lay_ms = QVBoxLayout(self.grp_setups)
+        lay_ms.insertLayout(0, _fila_ayuda(
+            "Cuando el sistema tiene más de un setup, esta tabla desglosa "
+            "las métricas (trades, win rate, expectancy...) por separado "
+            "para cada uno, además del resultado conjunto de arriba."))
         self.tabla_setups = QTableWidget(0, 6)
         self.tabla_setups.setHorizontalHeaderLabels(
             ['Setup', 'Riesgo %', 'Trades', 'Win rate', 'PnL', 'Expectancy %'])
@@ -3369,6 +4703,10 @@ class ResultadosWidget(QWidget):
         lbl_tr = QLabel("Trades (clic en una fila para centrar el gráfico)")
         lbl_tr.setObjectName("titulo")
         fila_tr.addWidget(lbl_tr)
+        fila_tr.addWidget(_icono_ayuda(
+            "Lista de todas las operaciones del backtest, con su motivo de "
+            "cierre (señal, stop, TP, tiempo, parcial...). Haz clic en una "
+            "fila para centrar el gráfico principal en esa operación."))
         fila_tr.addStretch()
         btn_lista_completa = QPushButton("Lista completa")
         btn_lista_completa.clicked.connect(self._abrir_lista_completa)
@@ -3399,6 +4737,11 @@ class ResultadosWidget(QWidget):
         lbl_wfa_titulo = QLabel("Walk-Forward Analysis")
         lbl_wfa_titulo.setObjectName("titulo")
         header_wfa.addWidget(lbl_wfa_titulo)
+        header_wfa.addWidget(_icono_ayuda(
+            "Divide la serie en ventanas sucesivas y mide el rendimiento de "
+            "cada una por separado, para comprobar si el sistema es "
+            "consistente a lo largo del tiempo o solo funcionó en un tramo "
+            "concreto."))
         header_wfa.addStretch()
         self.combo_wfa_modo = QComboBox()
         self.combo_wfa_modo.setMinimumWidth(160)
@@ -3428,6 +4771,11 @@ class ResultadosWidget(QWidget):
         # Montecarlo
         self.grp_mc = QGroupBox("Montecarlo (1000 remuestreos del orden de los trades)")
         lay_mc = QVBoxLayout(self.grp_mc)
+        lay_mc.insertLayout(0, _fila_ayuda(
+            "Reordena aleatoriamente la secuencia de trades miles de veces "
+            "para estimar el rango de resultados plausibles (drawdown, "
+            "capital final...) que no depende del orden exacto en que "
+            "ocurrieron — ayuda a distinguir suerte de ventaja real."))
         self.lbl_mc = QLabel("")
         self.lbl_mc.setObjectName("campo")
         lay_mc.addWidget(self.lbl_mc)
@@ -3445,6 +4793,11 @@ class ResultadosWidget(QWidget):
         lbl_mfe_titulo = QLabel("Análisis de Eficiencia (MFE/MAE)")
         lbl_mfe_titulo.setObjectName("titulo")
         header_mfe.addWidget(lbl_mfe_titulo)
+        header_mfe.addWidget(_icono_ayuda(
+            "MFE (excursión favorable máxima) y MAE (adversa máxima) miden, "
+            "en múltiplos de R, cuánto llegó a moverse el precio a favor y "
+            "en contra durante cada operación — revela si el stop/TP están "
+            "bien calibrados o si el sistema deja beneficio sobre la mesa."))
         header_mfe.addStretch()
         self.combo_mfe_modo = QComboBox()
         self.combo_mfe_modo.setMinimumWidth(160)
@@ -3649,7 +5002,8 @@ class ResultadosWidget(QWidget):
 
     def _mostrar_lwc(self, payload):
         """Repinta la vista LWC reflejando los mismos checkboxes (trayecto/
-        stop-loss/noticias) que la vista clásica, para que ambas se vean
+        stop-loss/noticias) y los mismos indicadores (medias/Bollinger/KAMA/
+        patrones/osciladores) que la vista clásica, para que ambas se vean
         coherentes al conmutar entre ellas."""
         self.lwc.mostrar(
             payload,
@@ -3659,7 +5013,8 @@ class ResultadosWidget(QWidget):
                         and self.chk_stop.isChecked(),
             mostrar_noticias=getattr(self, 'chk_noticias', None) is not None
                              and self.chk_noticias.isChecked(),
-            eventos_noticias=payload.get('eventos_noticias'))
+            eventos_noticias=payload.get('eventos_noticias'),
+            indicadores=self._recolectar_indicadores(payload))
 
     def _redibujar_principal_conservando_zoom(self):
         """Redibuja el gráfico principal preservando el rango temporal (zoom)
@@ -3690,6 +5045,15 @@ class ResultadosWidget(QWidget):
         xe = self._x_full[self._tr['idx_entrada']]
         xs = self._x_full[self._tr['idx_salida']]
         return (xe <= x1) & (xs >= x0)
+
+    def _tramo_extra_visible(self, idx_full, x0, x1):
+        """Máscara booleana de un array de índices de tramos 2+ (evento
+        puntual, no un rango como los trades) dentro de la ventana visible
+        [x0, x1]."""
+        if idx_full is None or len(idx_full) == 0:
+            return np.zeros(0, dtype=bool)
+        xt = self._x_full[idx_full]
+        return (xt >= x0) & (xt <= x1)
 
     def _redibujar_datos(self, ax):
         """Redibuja solo las velas/línea, decimadas al rango visible de
@@ -3836,18 +5200,14 @@ class ResultadosWidget(QWidget):
         """'pan' si el evento cae dentro del propio gráfico (arrastrar
         desplaza la vista), 'y' si cae en la franja de etiquetas del eje Y
         (a la derecha del gráfico), 'x' si cae en la franja de etiquetas del
-        eje X (debajo del último panel, por encima del RangeSlider),
-        'resize_panel:<i>' si cae en el borde entre el panel i y el i+1
-        (precio y osciladores apilados), o None."""
+        eje X (debajo del último panel), 'resize_panel:<i>' si cae en el
+        borde entre el panel i y el i+1 (precio y osciladores apilados), o
+        None."""
         ax = getattr(self, '_ax_principal', None)
         if ax is None or event.x is None or event.y is None:
             return None
         if self.toolbar.mode:
             return None  # no interferir con pan/zoom nativo del toolbar
-        slider_ax = getattr(self._range_slider, 'ax', None) \
-            if getattr(self, '_range_slider', None) is not None else None
-        if slider_ax is not None and event.inaxes is slider_ax:
-            return None
 
         paneles = self._paneles or [('precio', ax)]
         if len(paneles) > 1:
@@ -3867,8 +5227,7 @@ class ResultadosWidget(QWidget):
             return 'y'
         ultimo = paneles[-1][1]
         bbox_ult = ultimo.get_window_extent()
-        limite_inferior = slider_ax.get_window_extent().y1 if slider_ax is not None else 0
-        if bbox.x0 <= event.x <= bbox.x1 and limite_inferior < event.y < bbox_ult.y0:
+        if bbox.x0 <= event.x <= bbox.x1 and 0 < event.y < bbox_ult.y0:
             return 'x'
         return None
 
@@ -3902,6 +5261,59 @@ class ResultadosWidget(QWidget):
         else:
             self._drag_lim0 = ax.get_xlim()
 
+    def _actualizar_tooltip_trade(self, event, ax, zona):
+        """Muestra/oculta self._annot_trade con el lotaje (y el RR, si es la
+        flecha de SALIDA) del marcador de compra/venta más cercano al
+        cursor, dentro de un radio en píxeles de pantalla. Llamado desde
+        _on_motion_ejes solo cuando no hay arrastre activo (pan/zoom con
+        blit usa su propio camino y no necesita este tooltip)."""
+        annot = getattr(self, '_annot_trade', None)
+        if annot is None:
+            return
+        UMBRAL_PX2 = 10.0 ** 2
+        mejor = None   # (dist2, x_dato, y_dato, texto)
+        if zona == 'pan' and event.x is not None and event.y is not None \
+                and len(self._compra_idx_full):
+            mask = self._trades_visibles(*ax.get_xlim())
+            filas = np.where(mask)[0]
+            for idx_full, lado in ((self._compra_idx_full, 'compra'),
+                                    (self._venta_idx_full, 'venta')):
+                idx = idx_full[mask]
+                if not len(idx):
+                    continue
+                pts = ax.transData.transform(
+                    np.column_stack([self._x_full[idx], self._c_full[idx]]))
+                d2 = (pts[:, 0] - event.x) ** 2 + (pts[:, 1] - event.y) ** 2
+                j = int(np.argmin(d2))
+                if mejor is None or d2[j] < mejor[0]:
+                    r = filas[j]
+                    es_salida = (self._es_long_full[r] if lado == 'venta'
+                                 else not self._es_long_full[r])
+                    lineas = [f"Lotaje: {self._lotaje_full[r]:.2f}"]
+                    if es_salida:
+                        lineas.append(f"RR: {self._rr_full[r]:+.2f}R")
+                    mejor = (d2[j], self._x_full[idx[j]], self._c_full[idx[j]],
+                              '\n'.join(lineas))
+        if mejor is not None and mejor[0] <= UMBRAL_PX2:
+            _, x_dato, y_dato, texto = mejor
+            renderer = self.canvas.get_renderer()
+            bb = ax.get_window_extent(renderer=renderer)
+            x_disp, y_disp = ax.transData.transform((x_dato, y_dato))
+            dx, ha = ((15, 'left') if (bb.x1 - x_disp) >= (x_disp - bb.x0)
+                      else (-15, 'right'))
+            dy, va = ((15, 'bottom') if (bb.y1 - y_disp) >= (y_disp - bb.y0)
+                      else (-15, 'top'))
+            annot.xy = (x_dato, y_dato)
+            annot.set_position((dx, dy))
+            annot.set_ha(ha)
+            annot.set_va(va)
+            annot.set_text(texto)
+            annot.set_visible(True)
+            self.canvas.draw_idle()
+        elif annot.get_visible():
+            annot.set_visible(False)
+            self.canvas.draw_idle()
+
     @_no_crash
     def _on_motion_ejes(self, event):
         ax = getattr(self, '_ax_principal', None)
@@ -3916,6 +5328,7 @@ class ResultadosWidget(QWidget):
                         'x': Qt.CursorShape.SizeHorCursor,
                         'pan': Qt.CursorShape.OpenHandCursor}
             self.canvas.setCursor(cursores.get(zona, Qt.CursorShape.ArrowCursor))
+            self._actualizar_tooltip_trade(event, ax, zona)
             return
         if event.x is None or event.y is None:
             return
@@ -3933,7 +5346,6 @@ class ResultadosWidget(QWidget):
             self._y_manual = True
             ax.set_ylim(ylim0[0] - dyd, ylim0[1] - dyd)
             ax.set_xlim(xlim0[0] - dxd, xlim0[1] - dxd)  # dispara xlim_changed
-            self._sync_slider(ax.get_xlim())
             self._sync_dateedits(*ax.get_xlim())
             self._pintar_frame_blit(ax)
             return
@@ -3949,7 +5361,6 @@ class ResultadosWidget(QWidget):
             factor = np.exp(-(event.x - x0) * 0.005)
             medio = (hi - lo) / 2.0 * factor
             ax.set_xlim(centro - medio, centro + medio)  # dispara xlim_changed
-            self._sync_slider(ax.get_xlim())
             self._sync_dateedits(*ax.get_xlim())
             self._pintar_frame_blit(ax)
 
@@ -3977,7 +5388,6 @@ class ResultadosWidget(QWidget):
         subir = (event.step > 0) if getattr(event, 'step', 0) else (event.button == 'up')
         factor = 0.85 if subir else 1.0 / 0.85
         ax.set_xlim(ancla + (lo - ancla) * factor, ancla + (hi - ancla) * factor)
-        self._sync_slider(ax.get_xlim())
         self._sync_dateedits(*ax.get_xlim())
         self._pintar_frame_blit(ax)
         self._scroll_timer.start(180)
@@ -4000,9 +5410,11 @@ class ResultadosWidget(QWidget):
         return list(self._art_datos) + self._art_fijos_dinamicos \
             + self._art_overlays_extra + self._art_osciladores + [
             a for a in (self._scatter_compra, self._scatter_venta,
-                        self._art_trayecto, self._art_stop_cuadros,
-                        self._art_stop_segmentos, self._art_tp_cuadros,
-                        self._art_tp_segmentos) if a is not None]
+                        self._scatter_tramo_compra, self._scatter_tramo_venta,
+                        self._art_trayecto, self._art_salida_cuadros,
+                        self._art_salida_segmentos, self._art_stop_track,
+                        self._art_entrada_track, self._art_zona_riesgo)
+            if a is not None]
 
     def _iniciar_sesion_blit(self):
         """Al empezar un arrastre/scroll: cachea un bitmap de fondo SIN la
@@ -4071,16 +5483,31 @@ class ResultadosWidget(QWidget):
             idx = self._venta_idx_full[mask]
             self._scatter_venta.set_offsets(
                 np.column_stack([self._x_full[idx], self._c_full[idx]]))
+        if self._scatter_tramo_compra is not None:
+            idx = self._tramo_compra_idx_full[
+                self._tramo_extra_visible(self._tramo_compra_idx_full, x0, x1)]
+            self._scatter_tramo_compra.set_offsets(
+                np.column_stack([self._x_full[idx], self._c_full[idx]]))
+        if self._scatter_tramo_venta is not None:
+            idx = self._tramo_venta_idx_full[
+                self._tramo_extra_visible(self._tramo_venta_idx_full, x0, x1)]
+            self._scatter_tramo_venta.set_offsets(
+                np.column_stack([self._x_full[idx], self._c_full[idx]]))
         if self._art_trayecto is not None:
             self._art_trayecto.set_segments(self._trayecto_segmentos_full[mask])
-        if self._art_stop_cuadros is not None:
-            m = mask[self._stop_mask_base]
-            self._art_stop_cuadros.set_verts(self._stop_cuadros_full[m])
-            self._art_stop_segmentos.set_segments(self._stop_segmentos_full[m])
-        if self._art_tp_cuadros is not None:
-            m = mask[self._tp_mask_base]
-            self._art_tp_cuadros.set_verts(self._tp_cuadros_full[m])
-            self._art_tp_segmentos.set_segments(self._tp_segmentos_full[m])
+        if self._art_salida_cuadros is not None:
+            # a diferencia del trayecto/stop, aquí "mask" ya cubre TODOS los
+            # trades (la caja de Salida se dibuja en todas las operaciones,
+            # no en un subconjunto): sin máscara base intermedia.
+            self._art_salida_cuadros.set_verts(self._salida_cuadros_full[mask])
+            self._art_salida_cuadros.set_facecolor(self._salida_colores_full[mask])
+            self._art_salida_segmentos.set_segments(self._salida_segmentos_full[mask])
+            self._art_salida_segmentos.set_color(self._salida_colores_full[mask])
+        # _art_stop_track / _art_entrada_track / _art_zona_riesgo NO se
+        # recortan aquí: son series por VELA (longitud n, no una por trade),
+        # matplotlib ya las recorta a la ventana visible vía el xlim del eje,
+        # igual que hace con las velas — solo hace falta que estén en
+        # _artistas_dinamicos() para que se redibujen en cada frame.
 
     def _pintar_frame_blit(self, ax):
         """Un frame de arrastre/zoom: restaura el fondo cacheado y repinta
@@ -4117,6 +5544,7 @@ class ResultadosWidget(QWidget):
         corte = p['corte']
         tr = p['resultado']['trades']
         self._tr = tr
+        self._entr = p['resultado'].get('entradas')
 
         self._x_full = date2num(ts)
         self._o_full = p.get('open', p['close'])
@@ -4143,13 +5571,22 @@ class ResultadosWidget(QWidget):
         ax.yaxis.tick_right()
         ax.yaxis.set_label_position('right')
         self._paneles = [('precio', ax)]
+        # tooltip de hover (lotaje/RR) sobre las flechas de compra/venta —
+        # recreado en cada redibujo completo porque fig.clear() destruye el
+        # anterior; la lógica de mostrar/ocultar vive en _on_motion_ejes
+        # (mismo callback permanente que ya gestiona el cursor de pan/zoom).
+        self._annot_trade = ax.annotate(
+            "", xy=(0, 0), xytext=(15, 15), textcoords="offset points",
+            bbox=dict(boxstyle="round,pad=0.4", fc=FIG_BG, ec=GRID_C, alpha=0.95),
+            color=AX_FG, fontsize=7, zorder=99, annotation_clip=False)
+        self._annot_trade.set_visible(False)
         for i, (kind, datos) in enumerate(paneles_spec, start=1):
             ax_osc = self.fig.add_subplot(gs[i, 0], sharex=ax)
             self._paneles.append((kind, ax_osc))
             self._art_osciladores += self._dibujar_panel_oscilador(
                 ax_osc, kind, datos, ts, y, self._h_full, self._l_full)
         self._aplicar_pesos_paneles()
-        self.canvas.setMinimumHeight(int(320 + 90 * n_osc))
+        self.canvas.setMinimumHeight(int(480 + 90 * n_osc))
 
         # sombreado IS / OOS — artistas "dinámicos baratos": se repintan en
         # cada frame de blit junto con las velas (ver _pintar_frame_blit)
@@ -4181,6 +5618,12 @@ class ResultadosWidget(QWidget):
             es_long = tr['dir'] > 0
             self._compra_idx_full = np.where(es_long, tr['idx_entrada'], tr['idx_salida'])
             self._venta_idx_full = np.where(es_long, tr['idx_salida'], tr['idx_entrada'])
+            # para el hover de lotaje/RR (_on_motion_ejes): compra_idx_full[r]/
+            # venta_idx_full[r] siguen siendo la fila r de `tr` sin reordenar,
+            # así que unidades/r_multiple/es_long se leen con el mismo índice.
+            self._es_long_full = es_long
+            self._lotaje_full = tr['unidades']
+            self._rr_full = tr['r_multiple']
             idx_c = self._compra_idx_full[mask_vis]
             idx_v = self._venta_idx_full[mask_vis]
             self._scatter_compra = ax.scatter(
@@ -4192,6 +5635,35 @@ class ResultadosWidget(QWidget):
         else:
             self._compra_idx_full = np.array([], dtype=np.int64)
             self._venta_idx_full = np.array([], dtype=np.int64)
+            self._es_long_full = np.array([], dtype=bool)
+            self._lotaje_full = np.array([], dtype=float)
+            self._rr_full = np.array([], dtype=float)
+
+        # tramos 2+ de entrada escalonada (promediar/piramidar): círculo
+        # hueco para no confundirlos con la apertura/cierre del trade — el
+        # tramo 0 (la apertura) ya lo pinta compra/venta arriba. Viven en
+        # resultado['entradas'], no en 'trades' (no son un cierre).
+        self._scatter_tramo_compra = None
+        self._scatter_tramo_venta = None
+        self._tramo_compra_idx_full = np.array([], dtype=np.int64)
+        self._tramo_venta_idx_full = np.array([], dtype=np.int64)
+        entr = self._entr
+        if entr is not None and len(entr.get('idx', [])):
+            extra = entr['tramo'] > 0
+            if extra.any():
+                self._tramo_compra_idx_full = entr['idx'][extra & (entr['dir'] > 0)]
+                self._tramo_venta_idx_full = entr['idx'][extra & (entr['dir'] < 0)]
+                idx_tc = self._tramo_compra_idx_full[
+                    self._tramo_extra_visible(self._tramo_compra_idx_full, *ax.get_xlim())]
+                idx_tv = self._tramo_venta_idx_full[
+                    self._tramo_extra_visible(self._tramo_venta_idx_full, *ax.get_xlim())]
+                self._scatter_tramo_compra = ax.scatter(
+                    self._x_full[idx_tc], self._c_full[idx_tc], marker='o', s=24,
+                    facecolors='none', edgecolors=VERDE_FLECHA, linewidths=1.3,
+                    zorder=3, label='Tramo (promediar/piramidar)')
+                self._scatter_tramo_venta = ax.scatter(
+                    self._x_full[idx_tv], self._c_full[idx_tv], marker='o', s=24,
+                    facecolors='none', edgecolors=ROJO_FLECHA, linewidths=1.3, zorder=3)
 
         # trayecto de cada operación (entrada→salida, precio real de fill),
         # opcional vía checkbox: la pendiente ya muestra de un vistazo si el
@@ -4217,89 +5689,81 @@ class ResultadosWidget(QWidget):
             ax.add_collection(self._art_trayecto)
             ax.plot([], [], color=GRIS, linewidth=1.2, label='Trayecto')
 
-        # stop-loss por operación (nivel ×ATR fijado al entrar) + zona de
-        # riesgo entre precio de entrada y stop — opcional, vía checkbox.
-        # Vectorizado y recortado igual que el trayecto.
-        self._art_stop_cuadros = None
-        self._art_stop_segmentos = None
-        self._stop_mask_base = None
-        self._stop_segmentos_full = None
-        self._stop_cuadros_full = None
-        if n_tr and getattr(self, 'chk_stop', None) is not None \
-                and self.chk_stop.isChecked() and 'precio_stop' in tr:
-            tiene_stop_cfg = tr['precio_stop'] > 0
-            # setups sin stop configurado (p.ej. salida solo por señal
-            # contraria) no tienen nivel teórico que mostrar — si el trade
-            # perdió, se usa su precio de salida real, mismo criterio que
-            # ya usa el cuadro verde de operación ganadora
-            perdedora_sin_stop = (~tiene_stop_cfg) & (tr['pnl'] < 0)
-            tiene_stop = tiene_stop_cfg | perdedora_sin_stop
-            if tiene_stop.any():
-                idx_e = tr['idx_entrada'][tiene_stop]
-                idx_s = tr['idx_salida'][tiene_stop]
-                stop_v = np.where(tiene_stop_cfg, tr['precio_stop'],
-                                  tr['precio_salida'])[tiene_stop]
-                ent_v = tr['precio_entrada'][tiene_stop]
-                x_e, x_s = self._x_full[idx_e], self._x_full[idx_s]
-                self._stop_segmentos_full = np.stack([
-                    np.column_stack([x_e, stop_v]),
-                    np.column_stack([x_s, stop_v])], axis=1)
-                self._stop_cuadros_full = np.stack([
-                    np.column_stack([x_e, ent_v]), np.column_stack([x_s, ent_v]),
-                    np.column_stack([x_s, stop_v]), np.column_stack([x_e, stop_v])],
-                    axis=1)
-                self._stop_mask_base = tiene_stop
-                m0 = mask_vis[tiene_stop]
-                self._art_stop_cuadros = PolyCollection(
-                    self._stop_cuadros_full[m0], facecolors=ROJO, alpha=0.08,
-                    edgecolors='none', zorder=1.5)
-                self._art_stop_segmentos = LineCollection(
-                    self._stop_segmentos_full[m0], colors=ROJO, linewidths=0.8,
-                    linestyles='--', alpha=0.7, zorder=2.5)
-                ax.add_collection(self._art_stop_cuadros)
-                ax.add_collection(self._art_stop_segmentos)
-                ax.plot([], [], color=ROJO, linestyle='--', linewidth=1.0,
-                        label='Stop loss')
+        # «Mostrar operación»: trayectoria REAL del stop/precio medio (series
+        # por vela emitidas por el motor, no reconstruidas desde los cierres)
+        # + una caja de "Salida" por CADA operación, sin importar el motivo
+        # ni si ganó o perdió — opcional, vía checkbox.
+        self._art_stop_track = None
+        self._art_entrada_track = None
+        self._art_zona_riesgo = None
+        self._art_salida_cuadros = None
+        self._art_salida_segmentos = None
+        self._salida_segmentos_full = None
+        self._salida_cuadros_full = None
+        self._salida_colores_full = None
+        if getattr(self, 'chk_stop', None) is not None and self.chk_stop.isChecked():
+            resultado = p['resultado']
+            stop_track = resultado.get('stop_track')
+            entrada_track = resultado.get('entrada_track')
+            if stop_track is not None and entrada_track is not None:
+                # zona de riesgo: se abre entre el precio de entrada vigente y
+                # el stop vigente — se estrecha o desaparece sola cuando el
+                # break-even anula el riesgo o cuando el setup no tiene stop
+                # (ambas series NaN en ese tramo cortan el relleno)
+                self._art_zona_riesgo = ax.fill_between(
+                    self._x_full, entrada_track, stop_track, color=ROJO,
+                    alpha=0.08, edgecolor='none', zorder=1.5)
+                # línea del stop, escalonada: el salto vertical en la vela en
+                # que el break-even/trailing mueve el nivel es justo lo que
+                # se quería ver — 'steps-post' porque el valor de la vela i
+                # rige hasta la i+1, no una rampa entre ambas
+                (self._art_stop_track,) = ax.plot(
+                    self._x_full, stop_track, drawstyle='steps-post',
+                    color=ROJO, linestyle='--', linewidth=0.9, alpha=0.8,
+                    zorder=2.5)
+                # precio de entrada vigente (medio ponderado tras promediar):
+                # punteado para no confundirlo con el trayecto (sólido, mismo
+                # gris) si ambos checkboxes están activos a la vez
+                (self._art_entrada_track,) = ax.plot(
+                    self._x_full, entrada_track, drawstyle='steps-post',
+                    color=GRIS, linestyle=':', linewidth=1.0, alpha=0.6,
+                    zorder=2.4)
+                if np.isfinite(stop_track).any():
+                    ax.plot([], [], color=ROJO, linestyle='--', linewidth=1.0,
+                            label='Stop loss')
+                if np.isfinite(entrada_track).any():
+                    ax.plot([], [], color=GRIS, linestyle=':', linewidth=1.0,
+                            label='Precio de entrada (medio)')
 
-        # recorrido ganador por operación — mismo patrón visual que el
-        # stop-loss, en verde, pero con el precio de salida REAL (no una
-        # reconstrucción teórica de take-profit): cualquier trade que
-        # cerró en ganancia, sea por TP, señal contraria de salida, tiempo,
-        # o cualquier otro motivo — no depende de que el setup tenga TP
-        # configurado.
-        self._art_tp_cuadros = None
-        self._art_tp_segmentos = None
-        self._tp_mask_base = None
-        self._tp_segmentos_full = None
-        self._tp_cuadros_full = None
-        if n_tr and getattr(self, 'chk_stop', None) is not None \
-                and self.chk_stop.isChecked():
-            ganador = tr['pnl'] > 0
-            if ganador.any():
-                idx_e = tr['idx_entrada'][ganador]
-                idx_s = tr['idx_salida'][ganador]
-                ent_v = tr['precio_entrada'][ganador]
-                sal_v = tr['precio_salida'][ganador]
+            if n_tr:
+                idx_e = tr['idx_entrada']
+                idx_s = tr['idx_salida']
+                ent_v = tr['precio_entrada']
+                sal_v = tr['precio_salida']
                 x_e, x_s = self._x_full[idx_e], self._x_full[idx_s]
-                self._tp_segmentos_full = np.stack([
+                self._salida_segmentos_full = np.stack([
                     np.column_stack([x_e, sal_v]),
                     np.column_stack([x_s, sal_v])], axis=1)
-                self._tp_cuadros_full = np.stack([
+                self._salida_cuadros_full = np.stack([
                     np.column_stack([x_e, ent_v]), np.column_stack([x_s, ent_v]),
                     np.column_stack([x_s, sal_v]), np.column_stack([x_e, sal_v])],
                     axis=1)
-                self._tp_mask_base = ganador
-                m0 = mask_vis[ganador]
-                self._art_tp_cuadros = PolyCollection(
-                    self._tp_cuadros_full[m0], facecolors=VERDE, alpha=0.08,
+                self._salida_colores_full = np.where(tr['pnl'] > 0, VERDE, ROJO)
+                self._art_salida_cuadros = PolyCollection(
+                    self._salida_cuadros_full[mask_vis],
+                    facecolors=self._salida_colores_full[mask_vis], alpha=0.08,
                     edgecolors='none', zorder=1.5)
-                self._art_tp_segmentos = LineCollection(
-                    self._tp_segmentos_full[m0], colors=VERDE, linewidths=0.8,
+                self._art_salida_segmentos = LineCollection(
+                    self._salida_segmentos_full[mask_vis], linewidths=0.8,
+                    colors=self._salida_colores_full[mask_vis],
                     linestyles='--', alpha=0.7, zorder=2.5)
-                ax.add_collection(self._art_tp_cuadros)
-                ax.add_collection(self._art_tp_segmentos)
+                ax.add_collection(self._art_salida_cuadros)
+                ax.add_collection(self._art_salida_segmentos)
+                # una sola entrada de leyenda: la caja significa siempre lo
+                # mismo (dónde se salió), sea por TP, señal, tiempo o stop —
+                # el color ya distingue ganadora (verde) de perdedora (rojo)
                 ax.plot([], [], color=VERDE, linestyle='--', linewidth=1.0,
-                        label='Operación ganadora')
+                        label='Salida')
 
         # etiquetas IS / OOS sobre el eje
         ax.text(0.01, 0.97, 'IS', transform=ax.transAxes, color=AZUL,
@@ -4362,50 +5826,9 @@ class ResultadosWidget(QWidget):
         ax.legend(loc='lower right', fontsize=7, facecolor=FIG_BG,
                   edgecolor=GRID_C, labelcolor=AX_FG, framealpha=0.6)
 
-        # RangeSlider embebido bajo el stack de paneles (mismo patrón que
-        # rango_dialog.py: referencias fuertes o el GC lo desconecta). La
-        # franja reservada [0, BOTTOM_STACK] no depende del número de
-        # paneles apilados (ver _aplicar_pesos_paneles), así que su posición
-        # es siempre la misma.
-        ax_sl = self.fig.add_axes([LEFT_PANEL, 0.06, RIGHT_PANEL - LEFT_PANEL, 0.05])
-        ax_sl.set_facecolor('#1a2a45')
-        x0n, x1n = self._x_full[0], self._x_full[-1]
-        v0, v1 = ax.get_xlim()
-        v0, v1 = max(v0, x0n), min(v1, x1n)
-        self._range_slider = RangeSlider(ax_sl, '', x0n, x1n,
-                                         valinit=(v0, v1), valfmt='')
-
-        def on_slider(_val):
-            # si el cambio viene de nuestro propio set_val durante un drag,
-            # no hacer nada: la vista ya está fijada y un draw_idle() aquí
-            # rompería el blitting (parpadeo/recarga de indicadores)
-            if self._sincronizando_slider:
-                return
-            a, b = self._range_slider.val
-            ax.set_xlim(num2date(a), num2date(b))
-            self._sync_dateedits(a, b)
-            if self._blit_bg is None:
-                self.canvas.draw_idle()
-
-        self._range_slider.on_changed(on_slider)
         ax.callbacks.connect('xlim_changed', self._on_xlim_changed)
         self._ax_principal = ax
         self.canvas.draw_idle()
-
-    def _sync_slider(self, xlim):
-        """Mueve el thumb del RangeSlider para seguir la vista durante un
-        arrastre/zoom, SIN re-disparar el redibujado: la bandera hace que
-        `on_slider` (que set_val invoca síncronamente) sea un no-op. Así el
-        pan no mete un draw_idle() completo por frame que rompa el blitting."""
-        if getattr(self, '_range_slider', None) is None:
-            return
-        self._sincronizando_slider = True
-        try:
-            self._range_slider.set_val(xlim)
-        except Exception:
-            pass
-        finally:
-            self._sincronizando_slider = False
 
     def _sync_dateedits(self, num_ini, num_fin):
         d0 = num2date(num_ini)
@@ -6013,8 +7436,8 @@ class TabBacktest(QWidget):
             self._threads.remove(th)
         th.deleteLater()
         self.constructor.progreso.setVisible(False)
-        self.constructor.btn_run.setEnabled(True)
-        self.constructor.btn_optimizar.setEnabled(bool(self.constructor.csv_path))
+        # re-evalúa CSV + validez del sistema, en vez de reactivar a ciegas
+        self.constructor._actualizar_boton_ejecutable()
         QApplication.restoreOverrideCursor()
 
     @_no_crash

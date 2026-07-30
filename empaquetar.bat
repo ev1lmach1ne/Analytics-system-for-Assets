@@ -85,7 +85,11 @@ if errorlevel 1 (
     pause & exit /b 1
 )
 
-rem ── 8. Instalar dependencias en Python portable ──
+rem ── 8. Instalar setuptools (necesario para paquetes desde src) ──
+echo [*] Instalando setuptools y wheel...
+"%PYDIR%\python.exe" -m pip install setuptools wheel --no-warn-script-location >nul 2>&1
+
+rem ── 9. Instalar dependencias en Python portable ──
 echo [*] Instalando dependencias (esto tarda unos minutos)...
 "%PYDIR%\python.exe" -m pip install -r requirements.txt --no-warn-script-location --trusted-host pypi.org --trusted-host files.pythonhosted.org
 if errorlevel 1 (
@@ -93,7 +97,7 @@ if errorlevel 1 (
     pause & exit /b 1
 )
 
-rem ── 9. Copiar archivos de la app ──
+rem ── 10. Copiar archivos de la app ──
 echo [*] Copiando archivos de la aplicacion...
 
 rem Limpiar dist anterior (conservar python si ya esta)
@@ -122,7 +126,7 @@ mkdir "%APPDIR%\Sistemas" 2>nul
 mkdir "%APPDIR%\Sistemas\externos" 2>nul
 mkdir "%APPDIR%\Favoritos" 2>nul
 
-rem ── 10. Crear launcher ──
+rem ── 11. Crear launcher ──
 echo [*] Creando launcher...
 (
 echo @echo off
@@ -137,7 +141,7 @@ echo sh.CurrentDirectory = CreateObject^("Scripting.FileSystemObject"^).GetParen
 echo sh.Run "python\pythonw.exe app.py", 0, False
 ) > "%APPDIR%\Iniciar.vbs"
 
-rem ── 11. Crear ZIP ──
+rem ── 12. Crear ZIP ──
 echo [*] Creando archivo comprimido...
 set "ZIPFILE=%DIST%\AnalyticsSystem_Portable.zip"
 if exist "%ZIPFILE%" del "%ZIPFILE%" 2>nul
@@ -148,7 +152,7 @@ if errorlevel 1 (
     pause & exit /b 1
 )
 
-rem ── 12. Resumen ──
+rem ── 13. Resumen ──
 echo.
 echo ==============================================
 echo   Empaquetado completado

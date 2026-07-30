@@ -9,6 +9,10 @@ from core.backtest import (
 from core.strategies import (
     generar_senales, generar_senales_sistema, describir, ESTRATEGIAS,
     params_por_defecto, sma, codigo_setup, codigo_sistema, defaults_setup,
+    etapa_salida_por_defecto, filas_plantilla, trigger_etapa,
+    tramo_entrada_por_defecto, trigger_tramo,
+    salida_mecanismo_por_defecto, validar_parciales, validar_tramos,
+    validar_setup, AVISO_EXCESO_PARCIALES,
 )
 
 
@@ -454,6 +458,899 @@ def test_config_stop_y_tiempo_por_setup():
     assert t['motivo'][1] == 3            # setup 5: tiempo
     assert t['idx_salida'][1] == 12       # entro en 9, +3 velas
     assert t['setup'][1] == 5
+
+
+# ── salidas parciales ──────────────────────────────────────────────────────
+
+def _cfg_parciales(etapas, **extra):
+    return dict(CONFIG_BASE, config_por_setup={0: dict({'parciales': etapas}, **extra)})
+
+
+def test_etapa_senal_al_100_equivale_a_no_tener_etapas():
+    # La etapa por defecto del constructor (100% a la señal) debe dar
+    # exactamente el mismo resultado que un setup sin etapas: es la garantía
+    # de no-regresión para todos los sistemas ya guardados.
+    n = 10
+    o, h, l, c = _ohlc_plano(n)
+    o[6] = 110.0
+    s = _senales_vacias(n)
+    s['entradas_long'][2] = True
+    s['salidas_long'][5] = True
+
+    base = simular(o, h, l, c, s, CONFIG_BASE)
+    etapa = simular(o, h, l, c, s, _cfg_parciales(
+        [{'pct': 100.0, 'r': 0.0, 'trigger': 'senal', 'condiciones': []}]))
+
+    assert etapa['n_trades'] == base['n_trades'] == 1
+    for clave in ('idx_entrada', 'idx_salida', 'pnl', 'motivo', 'parcial',
+                  'unidades'):
+        assert etapa['trades'][clave].tolist() == base['trades'][clave].tolist()
+    assert etapa['capital_final'] == pytest.approx(base['capital_final'])
+    assert etapa['equity'].tolist() == base['equity'].tolist()
+    assert etapa['trades']['motivo'][0] == 0     # 'Señal', no 'Parcial'
+
+
+def test_etapa_senal_parcial_deja_viva_la_posicion():
+    # 50% a la señal + 50% al cierre por tiempo. unidades = 10000*0.01/4 = 25.
+    # Señal de salida en t=5 -> parcial al open de t=6 (110): cierra 12.5 uds
+    # -> pnl 12.5*10 = 125. El resto sigue abierto y sale por tiempo.
+    n = 12
+    o, h, l, c = _ohlc_plano(n)
+    o[6] = 110.0
+    o[9] = 120.0
+    c[9] = 120.0
+    s = _senales_vacias(n)
+    s['entradas_long'][2] = True
+    s['salidas_long'][5] = True
+    r = simular(o, h, l, c, s, _cfg_parciales(
+        [{'pct': 50.0, 'r': 0.0, 'trigger': 'senal', 'condiciones': []},
+         {'pct': 50.0, 'r': 0.0, 'trigger': 'senal', 'condiciones': []}],
+        salida_n_velas=6))
+    t = r['trades']
+    assert r['n_trades'] == 2
+    assert t['motivo'][0] == 5 and t['parcial'][0] == 1
+    assert t['idx_salida'][0] == 6
+    assert t['unidades'][0] == pytest.approx(12.5)
+    assert t['pnl'][0] == pytest.approx(125.0)
+    # el resto cierra por tiempo (entró en t=3, +6 velas -> t=9) al close 120
+    assert t['motivo'][1] == 3 and t['parcial'][1] == 0
+    assert t['unidades'][1] == pytest.approx(12.5)
+    assert t['pnl'][1] == pytest.approx(250.0)
+
+
+def test_etapa_senal_parcial_mas_etapa_por_rr():
+    # El caso del constructor: 50% por señal contraria, 50% a 2R.
+    # stop 1xATR (ATR=2) -> dist = 2, 2R = +4 sobre 100 = 104.
+    n = 14
+    o, h, l, c = _ohlc_plano(n)
+    o[6] = 101.0
+    h[8] = 105.0          # toca 2R en t=8
+    s = _senales_vacias(n)
+    s['entradas_long'][2] = True
+    s['salidas_long'][5] = True
+    r = simular(o, h, l, c, s, _cfg_parciales(
+        [{'pct': 50.0, 'r': 0.0, 'trigger': 'senal', 'condiciones': []},
+         {'pct': 50.0, 'r': 2.0, 'trigger': 'r', 'condiciones': []}],
+        stop_atr=1.0))
+    t = r['trades']
+    assert r['n_trades'] == 2
+    assert t['motivo'].tolist() == [5, 5]
+    assert t['parcial'].tolist() == [1, 2]
+    assert t['idx_salida'][0] == 6            # parcial por señal, al open
+    assert t['precio_salida'][0] == pytest.approx(101.0)
+    assert t['idx_salida'][1] == 8            # parcial por R:R, intra-vela
+    assert t['precio_salida'][1] == pytest.approx(104.0)
+
+
+def test_etapa_senal_sin_trigger_explicito_dispara_igual():
+    # Formato antiguo: r=0 y sin condiciones era una etapa muerta que nunca
+    # se ejecutaba, pese a que el pseudocódigo la rotulaba "a la señal".
+    n = 12
+    o, h, l, c = _ohlc_plano(n)
+    o[6] = 110.0
+    s = _senales_vacias(n)
+    s['entradas_long'][2] = True
+    s['salidas_long'][5] = True
+    r = simular(o, h, l, c, s, _cfg_parciales(
+        [{'pct': 40.0, 'r': 0.0}, {'pct': 60.0, 'r': 0.0}]))
+    assert r['trades']['motivo'][0] == 5
+    assert r['trades']['unidades'][0] == pytest.approx(10.0)   # 40% de 25
+
+
+def test_etapa_senal_no_impide_revertir_cuando_cierra_todo():
+    # Señal contraria del mismo setup: si la etapa cierra el 100%, la
+    # posición debe revertirse igual que sin etapas.
+    n = 14
+    o, h, l, c = _ohlc_plano(n)
+    s = _senales_vacias(n)
+    s['entradas_long'][2] = True
+    s['entradas_short'][5] = True
+    r = simular(o, h, l, c, s, _cfg_parciales(
+        [{'pct': 100.0, 'r': 0.0, 'trigger': 'senal', 'condiciones': []}]))
+    t = r['trades']
+    assert r['n_trades'] >= 2
+    assert t['dir'][0] == 1 and t['motivo'][0] == 0
+    assert t['dir'][1] == -1              # revirtió a corto
+
+
+def test_etapa_por_defecto_no_cambia_un_backtest_real():
+    # Un sistema guardado antes de esta versión (sin 'parciales') y el mismo
+    # sistema abierto ahora en el constructor (con la etapa 100% a la señal
+    # que se le inyecta) deben dar exactamente el mismo backtest.
+    rng = np.random.default_rng(7)
+    closes = 100 + np.cumsum(rng.normal(0, 1.0, 400))
+    df = _df_sintetico(closes)
+    setup = {'plantilla': 'Cruce de medias',
+             'params': {'tipo': 'SMA', 'rapida': 5, 'lenta': 20,
+                        'direccion': 'Ambas'}}
+    s = generar_senales_sistema(df, [setup])
+    o, h, l, c = (df['open'].values, df['high'].values,
+                  df['low'].values, df['close'].values)
+
+    antiguo = simular(o, h, l, c, s, dict(
+        CONFIG_BASE, config_por_setup={0: {'stop_atr': 1.0}}))
+    nuevo = simular(o, h, l, c, s, dict(CONFIG_BASE, config_por_setup={
+        0: {'stop_atr': 1.0, 'parciales': [etapa_salida_por_defecto()]}}))
+
+    assert antiguo['n_trades'] > 5            # el escenario ejercita el motor
+    assert nuevo['n_trades'] == antiguo['n_trades']
+    assert nuevo['capital_final'] == pytest.approx(antiguo['capital_final'])
+    for clave, arr in antiguo['trades'].items():
+        assert nuevo['trades'][clave].tolist() == arr.tolist(), clave
+
+
+def test_filas_plantilla_editables_solo_donde_la_tabla_puede():
+    filas = filas_plantilla('Cruce de medias',
+                            {'tipo': 'SMA', 'rapida': 20, 'lenta': 50,
+                             'direccion': 'Ambas'})
+    assert [f['direccion'] for f in filas] == ['long', 'short']
+    assert filas[0]['texto'] == 'SMA(20) cruza arriba SMA(50)'
+    assert filas[0]['mapeo']['izq.periodo'] == 'rapida'
+    assert filas[0]['mapeo']['der.periodo'] == 'lenta'
+    # la salida es el cruce contrario
+    sal = filas_plantilla('Cruce de medias',
+                          {'tipo': 'SMA', 'rapida': 20, 'lenta': 50,
+                           'direccion': 'Ambas'}, salida=True)
+    assert sal[0]['texto'] == 'SMA(20) cruza abajo SMA(50)'
+
+    # una sola dirección -> una sola fila
+    solo_long = filas_plantilla('Cruce de medias', {'direccion': 'Long'})
+    assert len(solo_long) == 1 and solo_long[0]['direccion'] == 'long'
+
+    # CCI no es representable como fila de indicador: solo texto
+    cci = filas_plantilla('CCI')
+    assert all(f['mapeo'] == {} and f['izq'] is None for f in cci)
+    assert 'CCI(20)' in cci[0]['texto']
+
+
+def test_filas_plantilla_cubren_todas_las_estrategias():
+    for plantilla in ESTRATEGIAS:
+        for salida in (False, True):
+            for f in filas_plantilla(plantilla, salida=salida):
+                assert f['texto']
+                assert (f['izq'] is None) == (not f['mapeo'])
+
+
+def test_trigger_etapa_deriva_el_formato_antiguo():
+    assert trigger_etapa({'pct': 100, 'r': 0.0}) == 'senal'
+    assert trigger_etapa({'pct': 50, 'r': 2.0}) == 'r'
+    assert trigger_etapa({'pct': 50, 'r': 0.0, 'condiciones': [{'x': 1}]}) == 'cond'
+    assert trigger_etapa({'pct': 50, 'r': 2.0, 'trigger': 'senal'}) == 'senal'
+
+
+def test_codigo_setup_describe_cada_disparador():
+    setup = {'nombre': 'x', 'plantilla': 'Cruce de medias',
+             'params': params_por_defecto('Cruce de medias'),
+             'riesgo_pct': 0.01, 'stop_atr': 1.0, 'tp_r': 0.0,
+             'salida_n_velas': 0,
+             'parciales': [dict(etapa_salida_por_defecto(), pct=50.0),
+                           {'pct': 50.0, 'r': 2.0, 'trigger': 'r'}]}
+    cod = codigo_setup(setup, 0)
+    assert 'a la señal de salida de la plantilla' in cod
+    assert 'cuando el precio ≥ +2 R' in cod
+
+
+# ── entrada escalonada (tramos) ─────────────────────────────────────────────
+
+def _cfg_tramos(tramos, parciales=None, **extra):
+    cfg_s = dict({'tramos': tramos}, **extra)
+    if parciales is not None:
+        cfg_s['parciales'] = parciales
+    return dict(CONFIG_BASE, config_por_setup={0: cfg_s})
+
+
+def test_tramo_por_defecto_100_senal_equivale_a_no_tener_tramos():
+    n = 10
+    o, h, l, c = _ohlc_plano(n)
+    o[6] = 110.0
+    s = _senales_vacias(n)
+    s['entradas_long'][2] = True
+    s['salidas_long'][5] = True
+
+    base = simular(o, h, l, c, s, CONFIG_BASE)
+    con_tramo = simular(o, h, l, c, s, _cfg_tramos(
+        [{'pct': 100.0, 'trigger': 'senal', 'val': 0.0, 'condiciones': [],
+          'gestion': {'tipo': 0, 'val': 0.0}}]))
+
+    assert con_tramo['n_trades'] == base['n_trades'] == 1
+    for clave, arr in base['trades'].items():
+        assert con_tramo['trades'][clave].tolist() == arr.tolist(), clave
+    assert con_tramo['capital_final'] == pytest.approx(base['capital_final'])
+    # una sola entrada registrada (tramo 0, la apertura)
+    assert con_tramo['entradas']['tramo'].tolist() == [0]
+
+
+def test_tramo_velas_promedia_precio_y_suma_unidades():
+    # 50% a la señal + 50% a +2 velas de la 1ª entrada: mismo total que una
+    # sola entrada al 100% (misma distancia de riesgo en ambos tramos), pero
+    # el precio de entrada queda como la media ponderada de los dos rellenos.
+    n = 12
+    o, h, l, c = _ohlc_plano(n)
+    o[6] = 110.0
+    s = _senales_vacias(n)
+    s['entradas_long'][2] = True
+    s['salidas_long'][8] = True
+    r = simular(o, h, l, c, s, _cfg_tramos(
+        [{'pct': 50.0, 'trigger': 'senal'},
+         {'pct': 50.0, 'trigger': 'velas', 'val': 2.0}]))
+    ent = r['entradas']
+    assert ent['tramo'].tolist() == [0, 1]
+    assert ent['unidades'].tolist() == pytest.approx([12.5, 12.5])
+    assert ent['precio'].tolist() == pytest.approx([100.0, 110.0])
+
+    t = r['trades']
+    assert r['n_trades'] == 1
+    assert t['unidades'][0] == pytest.approx(25.0)             # 12.5 + 12.5
+    assert t['precio_entrada'][0] == pytest.approx(105.0)      # media ponderada
+
+
+def test_tramo_retroceso_dimensiona_cada_tramo_por_su_propia_distancia():
+    # Promediar a la baja: el 2º tramo entra más cerca del stop que el 1º, así
+    # que necesita MÁS unidades para arriesgar el mismo % — pero el riesgo
+    # TOTAL (unidades × distancia al stop de cada tramo) debe sumar
+    # exactamente el riesgo pretendido del setup (1% de 10000 = 100).
+    n = 10
+    o = np.full(n, 100.0)
+    h = np.full(n, 101.0)
+    l = np.full(n, 99.5)     # nunca toca el stop (98) ni el umbral (99) salvo donde se fuerza
+    c = np.full(n, 100.0)
+    l[5] = 99.0               # retroceso de 0.5×ATR desde 100 -> dispara el tramo 2
+    o[6] = 99.0               # el tramo 2 entra a mejor precio (promedia a la baja)
+    s = _senales_vacias(n)
+    s['entradas_long'][2] = True
+    s['salidas_long'][8] = True
+    r = simular(o, h, l, c, s, _cfg_tramos(
+        [{'pct': 50.0, 'trigger': 'senal'},
+         {'pct': 50.0, 'trigger': 'retroceso', 'val': 0.5}],
+        stop_atr=1.0))
+    ent = r['entradas']
+    assert ent['unidades'].tolist() == pytest.approx([25.0, 50.0])
+    assert ent['precio'].tolist() == pytest.approx([100.0, 99.0])
+
+    dist_ref, dist_tramo2 = 2.0, 1.0     # |100-98| y |99-98|
+    riesgo_total = ent['unidades'][0] * dist_ref + ent['unidades'][1] * dist_tramo2
+    assert riesgo_total == pytest.approx(100.0)     # exactamente 1% de 10000
+
+    t = r['trades']
+    assert t['unidades'][0] == pytest.approx(75.0)
+    assert t['precio_entrada'][0] == pytest.approx((100.0 * 25.0 + 99.0 * 50.0) / 75.0)
+
+
+def test_tramo_avance_piramide_con_be_autoajusta_el_stop():
+    # Pirámide: el 2º tramo entra a favor (+2R) y su gestión mueve el stop al
+    # nuevo precio medio (break-even del conjunto). El riesgo total sigue
+    # siendo el 1% pretendido, y si el precio retrocede después, el stop-out
+    # ocurre en el precio medio NUEVO, no en el stop original de la 1ª entrada
+    # — la prueba de que el riesgo se autoajusta al piramidar.
+    n = 12
+    o = np.full(n, 100.0)
+    h = np.full(n, 101.0)
+    l = np.full(n, 100.6)    # por encima del stop original (98) Y del nuevo (100.5)
+    c = np.full(n, 100.0)
+    h[4] = 105.0             # +2R (100 + 2*2) -> dispara el tramo 2 (pirámide)
+    o[5] = 104.0             # precio de relleno del tramo 2
+    l[7] = 100.0             # rompe el stop YA MOVIDO a 100.5 (no el original 98)
+    s = _senales_vacias(n)
+    s['entradas_long'][1] = True
+    r = simular(o, h, l, c, s, _cfg_tramos(
+        [{'pct': 70.0, 'trigger': 'senal'},
+         {'pct': 30.0, 'trigger': 'avance', 'val': 2.0,
+          'gestion': {'tipo': 1, 'val': 0.01}}],
+        stop_atr=1.0))
+    ent = r['entradas']
+    assert ent['unidades'].tolist() == pytest.approx([35.0, 5.0])
+    assert ent['precio'].tolist() == pytest.approx([100.0, 104.0])
+
+    riesgo_total = ent['unidades'][0] * 2.0 + ent['unidades'][1] * 6.0   # |104-98|
+    assert riesgo_total == pytest.approx(100.0)     # 1% de 10000, ni un poco más
+
+    t = r['trades']
+    assert r['n_trades'] == 1
+    precio_medio = (100.0 * 35.0 + 104.0 * 5.0) / 40.0
+    assert t['precio_entrada'][0] == pytest.approx(precio_medio)
+    assert t['motivo'][0] == 1                       # stop, no señal ni tiempo
+    assert t['precio_stop'][0] == pytest.approx(precio_medio)   # BE al precio medio
+    assert t['pnl'][0] == pytest.approx(0.0)          # break-even exacto
+
+
+def test_tramo_clamp_evita_unidades_desbocadas_cerca_del_stop():
+    # Si el tramo dispara pegado al stop, la distancia real (~0.05×ATR) se
+    # acota a un mínimo del 25% de la distancia de la 1ª entrada — si no, las
+    # unidades del tramo se dispararían (20× más en este caso).
+    n = 10
+    o = np.full(n, 100.0)
+    h = np.full(n, 101.0)
+    l = np.full(n, 99.5)
+    c = np.full(n, 100.0)
+    l[5] = 99.0
+    o[6] = 98.05             # a solo 0.05 del stop (98)
+    s = _senales_vacias(n)
+    s['entradas_long'][2] = True
+    r = simular(o, h, l, c, s, _cfg_tramos(
+        [{'pct': 50.0, 'trigger': 'senal'},
+         {'pct': 50.0, 'trigger': 'retroceso', 'val': 0.5}],
+        stop_atr=1.0))
+    ent = r['entradas']
+    # sin clamp: (10000*0.01*0.5)/0.05 = 1000.0 — el clamp lo deja en 100.0
+    assert ent['unidades'][1] == pytest.approx(100.0)
+    assert ent['unidades'][1] < 500.0
+
+
+def test_tramo_pendiente_que_nunca_dispara_no_construye_mas_posicion():
+    n = 10
+    o, h, l, c = _ohlc_plano(n)
+    o[6] = 110.0
+    s = _senales_vacias(n)
+    s['entradas_long'][2] = True
+    s['salidas_long'][5] = True
+    r = simular(o, h, l, c, s, _cfg_tramos(
+        [{'pct': 50.0, 'trigger': 'senal'},
+         {'pct': 50.0, 'trigger': 'velas', 'val': 1000.0}]))
+    ent = r['entradas']
+    assert ent['tramo'].tolist() == [0]      # el 2º tramo nunca llegó a disparar
+    t = r['trades']
+    assert t['unidades'][0] == pytest.approx(12.5)     # solo lo que construyó el 1er tramo
+
+
+def test_tramos_y_salidas_parciales_el_cerrar_pct_es_del_total_construido():
+    # «Cerrar 50%» en una salida parcial debe cerrar la mitad de TODO lo
+    # construido (los dos tramos), no la mitad del primer tramo.
+    n = 10
+    o, h, l, c = _ohlc_plano(n)
+    h[7] = 105.0    # +1R (100 + 1*4) -> dispara la salida parcial
+    s = _senales_vacias(n)
+    s['entradas_long'][2] = True
+    r = simular(o, h, l, c, s, _cfg_tramos(
+        [{'pct': 50.0, 'trigger': 'senal'},
+         {'pct': 50.0, 'trigger': 'velas', 'val': 1.0}],
+        parciales=[{'pct': 50.0, 'r': 1.0, 'trigger': 'r', 'condiciones': [],
+                    'gestion': {'tipo': 0, 'val': 0.0}}]))
+    ent = r['entradas']
+    total_construido = ent['unidades'].sum()
+    assert total_construido == pytest.approx(25.0)   # 12.5 + 12.5
+
+    t = r['trades']
+    assert t['motivo'][0] == 5                       # parcial por R:R
+    assert t['unidades'][0] == pytest.approx(total_construido / 2)   # 12.5, no 6.25
+
+
+def test_tramo_por_defecto_no_cambia_un_backtest_real():
+    # Mismo criterio que test_etapa_por_defecto_no_cambia_un_backtest_real,
+    # pero para el lado de la entrada: un sistema real con un solo tramo
+    # (100% a la señal) debe dar exactamente el mismo backtest que sin
+    # 'tramos' en absoluto.
+    rng = np.random.default_rng(11)
+    closes = 100 + np.cumsum(rng.normal(0, 1.0, 400))
+    df = _df_sintetico(closes)
+    setup = {'plantilla': 'Cruce de medias',
+             'params': {'tipo': 'SMA', 'rapida': 5, 'lenta': 20,
+                        'direccion': 'Ambas'}}
+    s = generar_senales_sistema(df, [setup])
+    o, h, l, c = (df['open'].values, df['high'].values,
+                  df['low'].values, df['close'].values)
+
+    antiguo = simular(o, h, l, c, s, dict(
+        CONFIG_BASE, config_por_setup={0: {'stop_atr': 1.0}}))
+    nuevo = simular(o, h, l, c, s, dict(CONFIG_BASE, config_por_setup={
+        0: {'stop_atr': 1.0, 'tramos': [tramo_entrada_por_defecto()]}}))
+
+    assert antiguo['n_trades'] > 5
+    assert nuevo['n_trades'] == antiguo['n_trades']
+    assert nuevo['capital_final'] == pytest.approx(antiguo['capital_final'])
+    for clave, arr in antiguo['trades'].items():
+        assert nuevo['trades'][clave].tolist() == arr.tolist(), clave
+
+
+def test_trigger_tramo_sin_formato_antiguo_que_migrar():
+    assert trigger_tramo({'pct': 100, 'trigger': 'senal'}) == 'senal'
+    assert trigger_tramo({'pct': 50, 'trigger': 'retroceso', 'val': 1.0}) == 'retroceso'
+    assert trigger_tramo({'pct': 50, 'trigger': 'avance', 'val': 2.0}) == 'avance'
+    assert trigger_tramo({'pct': 50}) == 'senal'          # sin 'trigger' -> por defecto
+    assert trigger_tramo({'pct': 50, 'trigger': 'inventado'}) == 'senal'
+
+
+def test_codigo_setup_describe_la_entrada_escalonada():
+    setup = {'nombre': 'x', 'plantilla': 'Cruce de medias',
+             'params': params_por_defecto('Cruce de medias'),
+             'riesgo_pct': 0.01, 'stop_atr': 1.0, 'tp_r': 0.0,
+             'salida_n_velas': 0,
+             'tramos': [dict(tramo_entrada_por_defecto(), pct=70.0),
+                        {'pct': 30.0, 'trigger': 'avance', 'val': 2.0,
+                         'gestion': {'tipo': 1, 'val': 0.0}}]}
+    cod = codigo_setup(setup, 0)
+    assert 'ENTRADA ESCALONADA' in cod
+    assert 'con la señal de entrada de la plantilla' in cod
+    assert 'si avanza +2 R a favor (pirámide)' in cod
+    assert '0.3% del equity' in cod or '0.30%' in cod  # 30% de 1% de riesgo
+    # con un solo tramo (el caso normal) no se muestra el bloque
+    setup['tramos'] = [tramo_entrada_por_defecto()]
+    assert 'ENTRADA ESCALONADA' not in codigo_setup(setup, 0)
+
+
+# ── cierre parcial por mecanismo (stop / TP / break-even / trailing) ──────
+
+def _cfg_mec(**mecanismos):
+    """CONFIG_BASE con los mecanismos globales del setup 0 configurados."""
+    cfg_setup = {}
+    for clave, valor in mecanismos.items():
+        if clave in ('salida_stop', 'salida_tp', 'salida_be', 'salida_trailing'):
+            cfg_setup[clave] = valor
+        else:
+            cfg_setup[clave] = valor
+    return dict(CONFIG_BASE, config_por_setup={0: cfg_setup})
+
+
+def test_mecanismos_al_100_no_cambian_un_backtest_real():
+    # Los 4 mecanismos explícitos al 100% deben dar exactamente lo mismo que
+    # no configurarlos: es la garantía de no-regresión para lo ya guardado.
+    rng = np.random.default_rng(11)
+    closes = 100 + np.cumsum(rng.normal(0, 1.0, 400))
+    df = _df_sintetico(closes)
+    setup = {'plantilla': 'Cruce de medias',
+             'params': {'tipo': 'SMA', 'rapida': 5, 'lenta': 20,
+                        'direccion': 'Ambas'}}
+    s = generar_senales_sistema(df, [setup])
+    o, h, l, c = (df['open'].values, df['high'].values,
+                  df['low'].values, df['close'].values)
+    base_setup = {'stop_atr': 1.0, 'tp_r': 3.0, 'be_atr': 1.0, 'trailing_atr': 0.5}
+
+    antiguo = simular(o, h, l, c, s, dict(CONFIG_BASE,
+                                          config_por_setup={0: dict(base_setup)}))
+    nuevo = simular(o, h, l, c, s, dict(CONFIG_BASE, config_por_setup={0: dict(
+        base_setup,
+        **{k: salida_mecanismo_por_defecto()
+           for k in ('salida_stop', 'salida_tp', 'salida_be', 'salida_trailing')})}))
+
+    assert antiguo['n_trades'] > 5          # el escenario ejercita el motor
+    assert nuevo['n_trades'] == antiguo['n_trades']
+    assert nuevo['capital_final'] == pytest.approx(antiguo['capital_final'])
+    for clave, arr in antiguo['trades'].items():
+        assert nuevo['trades'][clave].tolist() == arr.tolist(), clave
+
+
+def test_stop_parcial_dispara_una_sola_vez_por_posicion():
+    # Stop al 50%: el primer toque cierra la mitad y la posición sigue viva.
+    # En el SEGUNDO toque el mecanismo ya gastó su turno, así que cierra todo
+    # el resto (parcial 0). Sin esta regla, condiciones que siguen siendo
+    # ciertas vela tras vela drenarían la posición poco a poco.
+    # unidades = 10000*0.01/(1*2) = 50 (ATR=2, stop 1xATR -> dist 2, stop=98).
+    n = 20
+    o, h, l, c = _ohlc_plano(n)
+    l[5] = 97.0      # toca el stop (98)
+    l[9] = 97.0      # vuelve a tocarlo
+    s = _senales_vacias(n)
+    s['entradas_long'][2] = True
+    r = simular(o, h, l, c, s, _cfg_mec(
+        stop_atr=1.0, salida_stop={'pct': 50.0, 'condiciones': [],
+                                   'gestion': {'tipo': 0, 'val': 0.0}}))
+    t = r['trades']
+    assert t['motivo'][0] == 1 and t['parcial'][0] == -1
+    assert t['unidades'][0] == pytest.approx(25.0)          # 50% de 50
+    assert t['precio_salida'][0] == pytest.approx(98.0)
+    # 2º toque: el stop ya no puede cerrar parcial -> se lleva todo el resto
+    assert t['motivo'][1] == 1 and t['parcial'][1] == 0
+    assert t['unidades'][1] == pytest.approx(25.0)
+    assert r['n_trades'] == 2
+
+
+def test_salida_por_tiempo_parcial_no_drena_la_posicion():
+    # La condición de tiempo es cierta en TODAS las velas a partir de la N,
+    # así que sin disparo único cerraría un 30% en cada una hasta agotarla.
+    # Debe cerrar el 30% una sola vez y dejar correr el resto.
+    n = 24
+    o, h, l, c = _ohlc_plano(n)
+    s = _senales_vacias(n)
+    s['entradas_long'][2] = True
+    r = simular(o, h, l, c, s, _cfg_mec(
+        salida_n_velas=5,
+        salida_tiempo={'pct': 30.0, 'condiciones': [],
+                       'gestion': {'tipo': 0, 'val': 0.0}}))
+    t = r['trades']
+    # sin stop: dist de referencia 2xATR = 4 -> unidades = 100/4 = 25
+    assert t['motivo'][0] == 3 and t['parcial'][0] == -5
+    assert t['idx_salida'][0] == 8                          # entró en 3, +5 velas
+    assert t['unidades'][0] == pytest.approx(7.5)           # 30% de 25
+    # el resto NO se desangra vela a vela ni lo cierra el tiempo una vela
+    # después: la salida por tiempo queda agotada y el remanente llega al final
+    assert r['n_trades'] == 2
+    assert t['motivo'][1] == 4 and t['parcial'][1] == 0
+    assert t['idx_salida'][1] == n - 1
+    assert t['unidades'][1] == pytest.approx(17.5)
+
+
+def test_cada_mecanismo_conserva_su_propio_turno():
+    # El stop original gasta su parcial; después el break-even mueve el nivel
+    # y, al tocarse, dispara SU parcial: son mecanismos distintos.
+    n = 24
+    o, h, l, c = _ohlc_explicito(n, {
+        3: (100.0, 100.2, 100.0, 100.1),   # entra (stop original en 98)
+        4: (100.1, 100.2, 97.5, 99.0),     # toca el stop -> parcial -1
+        5: (99.0, 103.0, 100.5, 102.5),    # +1xATR a favor -> BE mueve el stop a 100
+        6: (102.5, 102.5, 99.5, 99.8),     # toca el stop en BE -> parcial -3
+    })
+    s = _senales_vacias(n)
+    s['entradas_long'][2] = True
+    r = simular(o, h, l, c, s, _cfg_mec(
+        stop_atr=1.0, be_atr=0.5,
+        salida_stop={'pct': 50.0, 'condiciones': [], 'gestion': {'tipo': 0, 'val': 0.0}},
+        salida_be={'pct': 50.0, 'condiciones': [], 'gestion': {'tipo': 0, 'val': 0.0}}))
+    t = r['trades']
+    assert t['parcial'][0] == -1 and t['idx_salida'][0] == 4
+    assert t['parcial'][1] == -3 and t['idx_salida'][1] == 6
+    assert t['precio_salida'][1] == pytest.approx(100.0)
+
+
+def test_tp_parcial_deja_correr_el_resto():
+    # TP 2R al 30%: cierra el 30% al tocar el objetivo y el resto sigue.
+    n = 16
+    o, h, l, c = _ohlc_plano(n)
+    h[5] = 105.0     # 2R sobre 100 con dist 2 -> 104
+    s = _senales_vacias(n)
+    s['entradas_long'][2] = True
+    r = simular(o, h, l, c, s, _cfg_mec(
+        stop_atr=1.0, tp_r=2.0,
+        salida_tp={'pct': 30.0, 'condiciones': [], 'gestion': {'tipo': 0, 'val': 0.0}}))
+    t = r['trades']
+    assert t['motivo'][0] == 2 and t['parcial'][0] == -2
+    assert t['unidades'][0] == pytest.approx(15.0)           # 30% de 50
+    assert t['precio_salida'][0] == pytest.approx(104.0)
+    assert r['n_trades'] >= 2                                # el resto cierra aparte
+
+
+def _ohlc_explicito(n, velas):
+    """OHLC plano en 100 con velas concretas sobrescritas por índice:
+    {idx: (open, high, low, close)}. Necesario para los tests de break-even y
+    trailing: _ohlc_plano deja low=99 en TODAS las velas, así que en cuanto el
+    BE sube el stop a 100 el precio ya lo estaría tocando en esa misma vela."""
+    o, h, l, c = _ohlc_plano(n)
+    for idx, (vo, vh, vl, vc) in velas.items():
+        o[idx], h[idx], l[idx], c[idx] = vo, vh, vl, vc
+    return o, h, l, c
+
+
+def test_origen_stop_distingue_break_even_de_stop_original():
+    # BE a 0.5xATR mueve el stop a la entrada (100). Al tocarlo, debe
+    # aplicarse el pct del BE (25%), no el del stop original (100%).
+    # unidades = 10000*0.01/(1*2) = 50; stop original = 98.
+    n = 20
+    o, h, l, c = _ohlc_explicito(n, {
+        3: (100.0, 100.2, 100.0, 100.1),   # entra; sin avance -> BE no salta
+        4: (100.1, 102.0, 101.0, 101.5),   # +1xATR a favor -> BE mueve el stop a 100
+        5: (101.0, 101.0, 99.0, 99.5),     # vuelve y toca el stop ya en BE
+    })
+    s = _senales_vacias(n)
+    s['entradas_long'][2] = True
+    r = simular(o, h, l, c, s, _cfg_mec(
+        stop_atr=1.0, be_atr=0.5,
+        salida_stop={'pct': 100.0, 'condiciones': [], 'gestion': {'tipo': 0, 'val': 0.0}},
+        salida_be={'pct': 25.0, 'condiciones': [], 'gestion': {'tipo': 0, 'val': 0.0}}))
+    t = r['trades']
+    assert t['idx_salida'][0] == 5
+    assert t['motivo'][0] == 1
+    assert t['parcial'][0] == -3                             # break-even, no stop
+    assert t['unidades'][0] == pytest.approx(12.5)           # 25% de 50
+    assert t['precio_salida'][0] == pytest.approx(100.0)     # el stop movido a BE
+
+
+def test_trailing_gana_el_origen_cuando_mueve_el_stop_despues_del_be():
+    # El BE mueve el stop a 100 y acto seguido el trailing lo sube por encima:
+    # el toque posterior debe clasificarse como trailing (-4), no como BE.
+    n = 20
+    o, h, l, c = _ohlc_explicito(n, {
+        3: (100.0, 100.2, 100.0, 100.1),   # entra
+        4: (100.1, 102.0, 101.5, 101.8),   # BE -> 100, luego trailing -> 101
+        5: (101.8, 106.0, 105.5, 105.8),   # trailing -> 106 - 0.5*2 = 105
+        6: (105.8, 105.8, 104.0, 104.5),   # toca el stop del trailing
+    })
+    s = _senales_vacias(n)
+    s['entradas_long'][2] = True
+    r = simular(o, h, l, c, s, _cfg_mec(
+        stop_atr=1.0, be_atr=0.5, trailing_atr=0.5,
+        salida_be={'pct': 25.0, 'condiciones': [], 'gestion': {'tipo': 0, 'val': 0.0}},
+        salida_trailing={'pct': 40.0, 'condiciones': [], 'gestion': {'tipo': 0, 'val': 0.0}}))
+    t = r['trades']
+    assert t['idx_salida'][0] == 6
+    assert t['parcial'][0] == -4                             # trailing
+    assert t['unidades'][0] == pytest.approx(20.0)           # 40% de 50
+    assert t['precio_salida'][0] == pytest.approx(105.0)
+
+
+# ── stop_track / entrada_track: instrumentación para el gráfico ──────────
+
+def test_stop_track_sigue_al_break_even():
+    # Mismo escenario de OHLC que test_origen_stop_distingue_break_even_de_stop_original,
+    # pero SIN los % parciales de ese test (aquí ambos al 100%, el defecto):
+    # con un % parcial el stop se dispara dos veces (parcial en 5, total en 6)
+    # y este test quiere un único cierre limpio para verificar el escalón.
+    # Entra en 3 (stop 98), el BE salta en la vela 4 (stop -> 100), cierra en 5.
+    n = 20
+    o, h, l, c = _ohlc_explicito(n, {
+        3: (100.0, 100.2, 100.0, 100.1),
+        4: (100.1, 102.0, 101.0, 101.5),
+        5: (101.0, 101.0, 99.0, 99.5),
+    })
+    s = _senales_vacias(n)
+    s['entradas_long'][2] = True
+    r = simular(o, h, l, c, s, _cfg_mec(stop_atr=1.0, be_atr=0.5))
+    st = r['stop_track']
+    assert np.isnan(st[:3]).all()               # antes de entrar
+    assert st[3] == pytest.approx(98.0)          # stop original
+    assert st[4] == pytest.approx(100.0)         # el BE salta esta misma vela
+    assert st[5] == pytest.approx(100.0)         # la vela de cierre conserva el nivel
+    assert np.isnan(st[6:]).all()                # tras cerrar
+
+
+def test_stop_track_sigue_al_trailing():
+    # Mismo escenario de OHLC que
+    # test_trailing_gana_el_origen_cuando_mueve_el_stop_despues_del_be, pero
+    # con los mecanismos al 100% (el defecto) para un único cierre limpio.
+    n = 20
+    o, h, l, c = _ohlc_explicito(n, {
+        3: (100.0, 100.2, 100.0, 100.1),
+        4: (100.1, 102.0, 101.5, 101.8),   # BE -> 100, trailing -> 101
+        5: (101.8, 106.0, 105.5, 105.8),   # trailing -> 105
+        6: (105.8, 105.8, 104.0, 104.5),   # toca el stop del trailing
+    })
+    s = _senales_vacias(n)
+    s['entradas_long'][2] = True
+    r = simular(o, h, l, c, s, _cfg_mec(
+        stop_atr=1.0, be_atr=0.5, trailing_atr=0.5))
+    st = r['stop_track']
+    tramo_valido = st[3:7]
+    assert not np.isnan(tramo_valido).any()
+    # monótono creciente mientras el trailing arrastra (largo)
+    assert (np.diff(tramo_valido) >= -1e-9).all()
+    assert st[4] == pytest.approx(101.0)
+    assert st[5] == pytest.approx(105.0)
+    assert st[6] == pytest.approx(105.0)         # vela de cierre
+
+
+def test_entrada_track_refleja_el_precio_medio_ponderado():
+    # Dos tramos al 50%: la serie vale el precio del 1er fill hasta el 2º
+    # tramo, y el medio ponderado a partir de ahí. ATR=2 (por defecto en
+    # _senales_vacias), retroceso=1xATR -> dispara si low <= 100-2 = 98.
+    n = 20
+    o, h, l, c = _ohlc_plano(n)
+    l[5] = 97.0    # retroceso detectado en la vela 5
+    o[6] = 98.0    # 2º tramo ejecuta al open de la vela siguiente
+    s = _senales_vacias(n)
+    s['entradas_long'][2] = True
+    cfg = dict(CONFIG_BASE, config_por_setup={0: {
+        'tramos': [{'pct': 50.0, 'trigger': 'senal', 'val': 0.0, 'condiciones': [],
+                   'gestion': {'tipo': 0, 'val': 0.0}},
+                  {'pct': 50.0, 'trigger': 'retroceso', 'val': 1.0, 'condiciones': [],
+                   'gestion': {'tipo': 0, 'val': 0.0}}]}})
+    r = simular(o, h, l, c, s, cfg)
+    et = r['entrada_track']
+    assert et[3] == pytest.approx(100.0)          # solo el 1er tramo
+    assert et[5] == pytest.approx(100.0)          # todavía sin el 2º tramo
+    assert et[6] == pytest.approx(99.0)           # medio ponderado 50/50 (100+98)/2
+    assert np.isnan(et[:3]).all()
+
+
+def test_tracks_nan_fuera_de_posicion_y_longitud_n():
+    # señal de salida en la vela 5 -> cierra al OPEN de la vela 6 (convención
+    # del motor: señal en t, ejecución en t+1), así que la vela de cierre es
+    # la 6, no la 5 -- esa vela conserva el último valor (no es NaN).
+    n = 12
+    o, h, l, c = _ohlc_plano(n)
+    o[6] = 110.0
+    s = _senales_vacias(n)
+    s['entradas_long'][2] = True
+    s['salidas_long'][5] = True
+    r = simular(o, h, l, c, s, CONFIG_BASE)
+    st, et = r['stop_track'], r['entrada_track']
+    assert len(st) == n and len(et) == n
+    assert np.isnan(st).all()                     # CONFIG_BASE no tiene stop
+    assert np.isnan(et[:3]).all() and np.isnan(et[7:]).all()
+    assert not np.isnan(et[3:7]).any()
+
+
+def test_condiciones_del_mecanismo_no_desactivan_la_red_de_seguridad():
+    # Si las condiciones del mecanismo NO se cumplen, el cierre sigue siendo
+    # total: el stop nunca deja de proteger, solo deja de ser parcial.
+    n = 16
+    o, h, l, c = _ohlc_plano(n)
+    l[5] = 97.0
+    s = _senales_vacias(n)
+    s['entradas_long'][2] = True
+    nunca = np.zeros(n, dtype=bool)
+    cfg = _cfg_mec(stop_atr=1.0,
+                   salida_stop={'pct': 50.0, 'condiciones': [{'x': 1}],
+                                'gestion': {'tipo': 0, 'val': 0.0}})
+    cfg['mecanismos_masks_long'] = [[nunca, nunca, nunca, nunca]]
+    cfg['mecanismos_masks_short'] = [[nunca, nunca, nunca, nunca]]
+    r = simular(o, h, l, c, s, cfg)
+    t = r['trades']
+    assert r['n_trades'] == 1
+    assert t['motivo'][0] == 1 and t['parcial'][0] == 0      # cierre completo
+    assert t['unidades'][0] == pytest.approx(50.0)
+
+
+def test_be_unidad_r_usa_la_distancia_de_riesgo_real():
+    # Stop a 2xATR (ATR=2 -> dist de riesgo = 4, stop en 96). Con be=1.0:
+    #   · en ×ATR  -> activa al avanzar 1×2 = 2  (o sea 0.5R)
+    #   · en R     -> activa al avanzar 1×4 = 4  (1R de verdad)
+    # La vela 4 avanza +3: suficiente para ×ATR, insuficiente para R.
+    n = 20
+    velas = {
+        3: (100.0, 100.2, 100.0, 100.1),   # entra
+        4: (100.1, 103.0, 100.5, 102.0),   # +3 a favor
+        5: (102.0, 102.0, 99.5, 99.8),     # vuelve por debajo de la entrada
+    }
+    o, h, l, c = _ohlc_explicito(n, velas)
+    s = _senales_vacias(n)
+    s['entradas_long'][2] = True
+
+    # en ×ATR el BE ya saltó en la vela 4 -> la 5 cierra en la entrada (100)
+    r_atr = simular(o, h, l, c, s, _cfg_mec(stop_atr=2.0, be_atr=1.0,
+                                            be_unidad='atr'))
+    assert r_atr['trades']['motivo'][0] == 1
+    assert r_atr['trades']['precio_salida'][0] == pytest.approx(100.0)
+
+    # en R el BE NO llegó a activarse: el stop sigue en 96 y la vela 5 (low
+    # 99.5) no lo toca, así que la posición sigue abierta
+    r_r = simular(o, h, l, c, s, _cfg_mec(stop_atr=2.0, be_atr=1.0,
+                                          be_unidad='r'))
+    assert r_r['trades']['idx_salida'][0] > 5
+
+
+def test_be_unidad_por_defecto_es_atr():
+    # Sin 'be_unidad', el motor debe comportarse como siempre (×ATR).
+    n = 20
+    velas = {
+        3: (100.0, 100.2, 100.0, 100.1),
+        4: (100.1, 103.0, 100.5, 102.0),
+        5: (102.0, 102.0, 99.5, 99.8),
+    }
+    o, h, l, c = _ohlc_explicito(n, velas)
+    s = _senales_vacias(n)
+    s['entradas_long'][2] = True
+    sin_clave = simular(o, h, l, c, s, _cfg_mec(stop_atr=2.0, be_atr=1.0))
+    con_atr = simular(o, h, l, c, s, _cfg_mec(stop_atr=2.0, be_atr=1.0,
+                                              be_unidad='atr'))
+    for clave, arr in con_atr['trades'].items():
+        assert sin_clave['trades'][clave].tolist() == arr.tolist(), clave
+
+
+def test_validar_parciales_y_tramos():
+    assert validar_parciales([{'pct': 50}, {'pct': 50}]) == []
+    assert validar_parciales([{'pct': 100}]) == []
+    avisos = validar_parciales([{'pct': 100}, {'pct': 100}])
+    assert len(avisos) == 1
+    assert avisos[0] == f"Etapa 2: {AVISO_EXCESO_PARCIALES}"
+    assert AVISO_EXCESO_PARCIALES == "Se excede el 100% del tamaño de la posición."
+
+    assert validar_tramos([{'pct': 50}, {'pct': 50}]) == []
+    assert validar_tramos([{'pct': 100}, {'pct': 50}])    # suma 150% -> avisa
+    assert validar_setup({'parciales': [{'pct': 100}, {'pct': 100}],
+                          'tramos': [{'pct': 100}]})
+
+
+# ── disparador de estancamiento (N velas sin alcanzar un R mínimo) ─────────
+
+def test_estancamiento_no_afecta_setups_que_no_lo_usan():
+    # no-regresión: una etapa normal ('r') da el mismo resultado exacto que
+    # antes de existir el disparador de estancamiento (sus arrays quedan a
+    # su valor por defecto — False/0/0 — y la rama nueva nunca se activa).
+    n = 14
+    o, h, l, c = _ohlc_plano(n)
+    h[6] = 105.0   # toca 2R (stop 1xATR -> dist=2) en la vela 6
+    s = _senales_vacias(n)
+    s['entradas_long'][2] = True
+    r = simular(o, h, l, c, s, _cfg_parciales(
+        [{'pct': 100.0, 'r': 2.0, 'trigger': 'r', 'condiciones': []}],
+        stop_atr=1.0))
+    t = r['trades']
+    assert r['n_trades'] == 1
+    assert t['motivo'][0] == 5 and t['parcial'][0] == 1
+    assert t['idx_salida'][0] == 6
+    assert t['precio_salida'][0] == pytest.approx(104.0)   # entrada 100 + 2R(2)
+
+
+def test_estancamiento_dispara_por_falta_de_avance():
+    # stop 1xATR (ATR=2) -> dist_pos=2, unidades=10000*0.01/2=50. OHLC plano:
+    # high=101 siempre -> max_fav tope en 101 -> avance_r=(101-100)/2=0.5,
+    # por debajo de r_min=1.0: la operación nunca demuestra que llega a 1R.
+    # Entra en vela 2 -> abre en vela 3 (idx_in=3); velas_max=5 -> dispara en
+    # la vela 3+5=8, cerrando a mercado (close=100).
+    n = 15
+    o, h, l, c = _ohlc_plano(n)
+    s = _senales_vacias(n)
+    s['entradas_long'][2] = True
+    r = simular(o, h, l, c, s, _cfg_parciales(
+        [{'pct': 60.0, 'trigger': 'estancamiento', 'velas_max': 5, 'r_min': 1.0,
+          'condiciones': [], 'gestion': {'tipo': 0, 'val': 0.0}}],
+        stop_atr=1.0))
+    t = r['trades']
+    assert t['idx_entrada'][0] == 3
+    assert t['idx_salida'][0] == 8
+    assert t['motivo'][0] == 5                    # cierre parcial
+    assert t['parcial'][0] == 1                    # etapa secuencial nº1
+    assert t['precio_salida'][0] == pytest.approx(100.0)   # cierre a mercado
+    assert t['unidades'][0] == pytest.approx(30.0)         # 60% de 50
+    assert r['n_trades'] >= 2                       # el resto sigue y cierra aparte
+
+
+def test_estancamiento_no_dispara_si_ya_alcanzo_el_r():
+    # el precio toca 1R pronto (vela 4) y luego se aplana: avance_r, basado
+    # en max_fav (que no retrocede), se queda por encima de r_min para
+    # siempre -> la etapa NUNCA dispara, aunque pasen de sobra las velas_max.
+    n = 20
+    o, h, l, c = _ohlc_explicito(n, {
+        4: (100.0, 103.0, 100.0, 102.5),   # toca 1R (dist=2 -> 102) y se aplana
+    })
+    s = _senales_vacias(n)
+    s['entradas_long'][2] = True
+    r = simular(o, h, l, c, s, _cfg_parciales(
+        [{'pct': 50.0, 'trigger': 'estancamiento', 'velas_max': 5, 'r_min': 1.0,
+          'condiciones': [], 'gestion': {'tipo': 0, 'val': 0.0}}],
+        stop_atr=1.0))
+    t = r['trades']
+    # ninguna fila debería ser un cierre parcial de la etapa de estancamiento
+    assert not (t['motivo'] == 5).any()
+
+
+def test_estancamiento_aplica_gestion_tras_disparar():
+    # gestión tipo 1 (break-even, activación 0.5xATR) tras el parcial: activa
+    # el break-even DEL SETUP con esa distancia (mismo mecanismo que usa
+    # 'sp_be' — ver _aplicar_gestion_parcial). Con la vela plana ya a 1xATR
+    # de avance (max_fav=101, entrada=100, ATR=2), el 0.5xATR (=1.0) ya se
+    # cumple: el stop salta a la entrada (100) en la vela siguiente, y como
+    # el low plano es 99, lo toca de inmediato.
+    n = 15
+    o, h, l, c = _ohlc_plano(n)
+    s = _senales_vacias(n)
+    s['entradas_long'][2] = True
+    r = simular(o, h, l, c, s, _cfg_parciales(
+        [{'pct': 50.0, 'trigger': 'estancamiento', 'velas_max': 5, 'r_min': 1.0,
+          'condiciones': [], 'gestion': {'tipo': 1, 'val': 0.5}}],
+        stop_atr=1.0))
+    t = r['trades']
+    assert t['motivo'][0] == 5 and t['parcial'][0] == 1
+    # el resto cierra por el stop ya movido a break-even (100), no al
+    # original (98): la gestión de la etapa sí se aplicó
+    assert t['motivo'][1] == 1
+    assert t['precio_stop'][1] == pytest.approx(100.0)
+    assert t['precio_salida'][1] == pytest.approx(100.0)
+
+
+def test_estancamiento_respeta_condiciones_extra():
+    # condición adicional que nunca se cumple: aunque pasen las velas y el
+    # avance sea insuficiente, la etapa no dispara.
+    n = 15
+    o, h, l, c = _ohlc_plano(n)
+    s = _senales_vacias(n)
+    s['entradas_long'][2] = True
+    nunca = np.zeros(n, dtype=bool)
+    cfg = _cfg_parciales(
+        [{'pct': 100.0, 'trigger': 'estancamiento', 'velas_max': 5, 'r_min': 1.0,
+          'condiciones': [{'x': 1}], 'gestion': {'tipo': 0, 'val': 0.0}}],
+        stop_atr=1.0)
+    cfg['parciales_masks_long'] = [[nunca]]
+    cfg['parciales_masks_short'] = [[nunca]]
+    r = simular(o, h, l, c, s, cfg)
+    assert not (r['trades']['motivo'] == 5).any()
 
 
 def test_sistema_dos_setups_fusion_y_prioridad():

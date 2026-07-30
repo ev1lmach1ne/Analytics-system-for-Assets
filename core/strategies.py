@@ -31,6 +31,7 @@ from core.candle_patterns import (
     PATRONES_INFO, detectar_patrones, preparar_contexto, _mascara_sesion,
 )
 from core.metrics import calcular_er_series, calcular_kama_numba, calcular_hurst_array
+from core.backtest import TRIGGERS_TRAMO_ENTRADA
 
 PERIODO_ATR_DEFECTO = 14
 MAX_SETUPS = 64   # límite del bitmask int64 de salidas por setup
@@ -989,90 +990,406 @@ def generar_senales_sistema(df, setups, eventos_noticias=None):
     return out
 
 
+def etapa_salida_por_defecto():
+    """Etapa de salida implícita de cualquier plantilla: cerrar el 100% de la
+    posición con la propia señal de salida de la plantilla (el cruce contrario
+    en Cruce de medias/KAMA, la vuelta a la media en Bollinger/RSI/...).
+
+    Materializarla como etapa explícita es lo que permite editarla desde la
+    tabla «Salida del setup» (p. ej. bajarla al 50% y añadir una segunda etapa
+    a 2R). Con pct=100 el motor la trata exactamente igual que no tener
+    etapas — ver core/backtest.py."""
+    return {'pct': 100.0, 'r': 0.0, 'trigger': 'senal', 'condiciones': [],
+            'gestion': {'tipo': 0, 'val': 0.0}}
+
+
+def _fila(izq, op, der, direccion, mapeo, nota=''):
+    """Descriptor de una fila de condición derivada de una plantilla, en el
+    mismo formato que consume la tabla de condiciones de la GUI.
+
+    'mapeo' dice qué celda de la fila escribe en qué parámetro de la plantilla
+    ({'izq.periodo': 'rapida'}), para que editar la fila cambie la plantilla en
+    vez de añadir un filtro suelto. Una celda sin entrada en el mapeo va
+    bloqueada. 'nota' avisa de lo que la fila no puede representar con
+    fidelidad (ver KAMA)."""
+    texto = f"{_desc_spec(izq)} {op} {_desc_spec(der)}"
+    return {'izq': izq, 'op': op, 'der': der, 'direccion': direccion,
+            'mapeo': mapeo, 'texto': texto, 'nota': nota}
+
+
+def _fila_texto(texto, direccion='ambas'):
+    """Fila que la tabla no sabe representar como indicador (Stochastic,
+    Williams %R, CCI, patrones): solo texto, sin celdas editables."""
+    return {'izq': None, 'op': None, 'der': None, 'direccion': direccion,
+            'mapeo': {}, 'texto': texto, 'nota': ''}
+
+
+def _lados(p):
+    """(hace_long, hace_short) según el parámetro 'direccion' de la plantilla."""
+    d = p.get('direccion', 'Ambas')
+    return d in ('Long', 'Ambas'), d in ('Short', 'Ambas')
+
+
+# KAMA en la tabla de condiciones solo expone un «Periodo» (el del ER): sus
+# constantes de suavizado son fijas (_KAMA_RAPIDO_REGLA/_KAMA_LENTO_REGLA), así
+# que la fila solo es fiel si la plantilla usa esos mismos valores.
+_NOTA_KAMA = ("la fila usa el KAMA del editor de reglas (rápido="
+              f"{_KAMA_RAPIDO_REGLA}, lento={_KAMA_LENTO_REGLA}); si cambias "
+              "«SC rápido»/«SC lento» la plantilla seguirá usando los tuyos, "
+              "pero esta fila no puede reflejarlo")
+
+
+def filas_plantilla(plantilla, params=None, salida=False):
+    """Descriptores de fila de la señal de ENTRADA (o de SALIDA si
+    salida=True) de una plantilla, uno por lado activo.
+
+    Es la única fuente de verdad de "qué hace esta plantilla": la usan tanto
+    la tabla de Entrada de la GUI como el pseudocódigo de _codigo_reglas_plantilla.
+    Devuelve filas con 'mapeo' no vacío cuando la tabla puede representarlas,
+    y filas de solo texto cuando no (Stochastic/Williams %R/CCI/patrones)."""
+    p = params_por_defecto(plantilla)
+    p.update(params or {})
+    hace_long, hace_short = _lados(p)
+    filas = []
+
+    if plantilla == 'Cruce de medias':
+        t, r, l = p['tipo'], p['rapida'], p['lenta']
+        mapeo = {'izq.tipo': 'tipo', 'izq.periodo': 'rapida',
+                 'der.tipo': 'tipo', 'der.periodo': 'lenta'}
+        arriba, abajo = 'cruza arriba', 'cruza abajo'
+        if hace_long:
+            filas.append(_fila({'tipo': t, 'periodo': r},
+                               abajo if salida else arriba,
+                               {'tipo': t, 'periodo': l}, 'long', mapeo))
+        if hace_short:
+            filas.append(_fila({'tipo': t, 'periodo': r},
+                               arriba if salida else abajo,
+                               {'tipo': t, 'periodo': l}, 'short', mapeo))
+
+    elif plantilla == 'Bollinger + ATR':
+        per, d = p['periodo'], p['desv']
+        mapeo = {'der.periodo': 'periodo'}
+        media = {'tipo': 'BB_media', 'periodo': per, 'desv': d}
+        if hace_long:
+            filas.append(_fila({'tipo': 'close'}, '>' if salida else '<',
+                               media if salida else
+                               {'tipo': 'BB_inf', 'periodo': per, 'desv': d},
+                               'long', mapeo))
+        if hace_short:
+            filas.append(_fila({'tipo': 'close'}, '<' if salida else '>',
+                               media if salida else
+                               {'tipo': 'BB_sup', 'periodo': per, 'desv': d},
+                               'short', mapeo))
+
+    elif plantilla == 'RSI':
+        per = p['periodo']
+        izq = {'tipo': 'RSI', 'periodo': per}
+        if hace_long:
+            filas.append(_fila(
+                dict(izq), '>' if salida else '<',
+                {'tipo': 'valor', 'valor': 50.0 if salida else p['sobreventa']},
+                'long',
+                {'izq.periodo': 'periodo'} if salida else
+                {'izq.periodo': 'periodo', 'der.valor': 'sobreventa'}))
+        if hace_short:
+            filas.append(_fila(
+                dict(izq), '<' if salida else '>',
+                {'tipo': 'valor', 'valor': 50.0 if salida else p['sobrecompra']},
+                'short',
+                {'izq.periodo': 'periodo'} if salida else
+                {'izq.periodo': 'periodo', 'der.valor': 'sobrecompra'}))
+
+    elif plantilla == 'KAMA':
+        per_er, rap, len_ = p['periodo_er'], p['rapido'], p['lento']
+        mapeo = {'der.periodo': 'periodo_er'}
+        nota = _NOTA_KAMA if (rap, len_) != (_KAMA_RAPIDO_REGLA, _KAMA_LENTO_REGLA) else ''
+        kama = {'tipo': 'KAMA', 'periodo': per_er}
+        if hace_long:
+            filas.append(_fila({'tipo': 'close'},
+                               'cruza abajo' if salida else 'cruza arriba',
+                               dict(kama), 'long', mapeo, nota))
+        if hace_short:
+            filas.append(_fila({'tipo': 'close'},
+                               'cruza arriba' if salida else 'cruza abajo',
+                               dict(kama), 'short', mapeo, nota))
+
+    elif plantilla == 'Stochastic (%K/%D)':
+        est = f"Stoch(%K={p['periodo_k']},suav={p['suavizado_k']},%D={p['periodo_d']})"
+        if hace_long:
+            filas.append(_fila_texto(
+                f"%K > 50  [{est}]" if salida else
+                f"%K cruza arriba %D Y %K < {p['sobreventa']:g}  [{est}]", 'long'))
+        if hace_short:
+            filas.append(_fila_texto(
+                f"%K < 50  [{est}]" if salida else
+                f"%K cruza abajo %D Y %K > {p['sobrecompra']:g}  [{est}]", 'short'))
+
+    elif plantilla == 'Williams %R':
+        per = p['periodo']
+        if hace_long:
+            filas.append(_fila_texto(
+                f"%R({per}) > -50" if salida else
+                f"%R({per}) < {p['sobreventa']:g}", 'long'))
+        if hace_short:
+            filas.append(_fila_texto(
+                f"%R({per}) < -50" if salida else
+                f"%R({per}) > {p['sobrecompra']:g}", 'short'))
+
+    elif plantilla == 'CCI':
+        per = p['periodo']
+        if hace_long:
+            filas.append(_fila_texto(
+                f"CCI({per}) > 0" if salida else
+                f"CCI({per}) < {p['sobreventa']:g}", 'long'))
+        if hace_short:
+            filas.append(_fila_texto(
+                f"CCI({per}) < 0" if salida else
+                f"CCI({per}) > {p['sobrecompra']:g}", 'short'))
+
+    elif plantilla == 'Patrones de velas':
+        if salida:
+            filas.append(_fila_texto(f"a +{p['lag_salida']} velas de la entrada"))
+        else:
+            for nombre in (p['patrones'] or ['(ninguno)']):
+                filas.append(_fila_texto(
+                    f"se forma «{nombre}» (dirección = sesgo del patrón)"))
+
+    elif plantilla == 'Custom (reglas)':
+        etiquetas = {'salidas_long': 'long', 'salidas_short': 'short'} if salida \
+            else {'entradas_long': 'long', 'entradas_short': 'short'}
+        for clave, direccion in etiquetas.items():
+            for setup_r in (p.get('reglas') or {}).get(clave, []):
+                conds = " Y ".join(
+                    f"{_desc_spec(cond['izq'])} {cond['op']} {_desc_spec(cond['der'])}"
+                    for cond in setup_r.get('condiciones', []))
+                if conds:
+                    filas.append(_fila_texto(conds, direccion))
+
+    return filas
+
+
+# nombres históricos, más explícitos en el punto de uso
+def condiciones_senal_plantilla(plantilla, params=None):
+    return filas_plantilla(plantilla, params, salida=False)
+
+
+def condiciones_salida_plantilla(plantilla, params=None):
+    return filas_plantilla(plantilla, params, salida=True)
+
+
+_ACCION_ENTRADA = {'long': ('LONG: ', 'comprar'), 'short': ('SHORT:', 'vender')}
+_ACCION_SALIDA = {'long': ('LONG: ', 'vender'), 'short': ('SHORT:', 'recomprar')}
+
+
 def _codigo_reglas_plantilla(plantilla, p):
     """Líneas de ENTRADA y SALIDA (por señal) de una plantilla, con los
     parámetros interpolados. No incluye stop/TP/tiempo (van aparte, son del
-    setup, no de la plantilla)."""
-    ent, sal = [], []
-    if plantilla == 'Cruce de medias':
-        t, r, l = p['tipo'], p['rapida'], p['lenta']
-        if p['direccion'] in ('Long', 'Ambas'):
-            ent.append(f"LONG:  SI {t}({r}) cruza arriba {t}({l}) → comprar al open siguiente")
-            sal.append(f"LONG:  SI {t}({r}) cruza abajo {t}({l}) → vender al open siguiente")
-        if p['direccion'] in ('Short', 'Ambas'):
-            ent.append(f"SHORT: SI {t}({r}) cruza abajo {t}({l}) → vender al open siguiente")
-            sal.append(f"SHORT: SI {t}({r}) cruza arriba {t}({l}) → recomprar al open siguiente")
-    elif plantilla == 'Bollinger + ATR':
-        per, d = p['periodo'], p['desv']
-        if p['direccion'] in ('Long', 'Ambas'):
-            ent.append(f"LONG:  SI close < banda inferior BB({per},{d:g}) → comprar al open siguiente")
-            sal.append(f"LONG:  SI close > media BB({per}) → vender al open siguiente")
-        if p['direccion'] in ('Short', 'Ambas'):
-            ent.append(f"SHORT: SI close > banda superior BB({per},{d:g}) → vender al open siguiente")
-            sal.append(f"SHORT: SI close < media BB({per}) → recomprar al open siguiente")
-    elif plantilla == 'RSI':
-        per = p['periodo']
-        if p['direccion'] in ('Long', 'Ambas'):
-            ent.append(f"LONG:  SI RSI({per}) < {p['sobreventa']:g} → comprar al open siguiente")
-            sal.append(f"LONG:  SI RSI({per}) > 50 → vender al open siguiente")
-        if p['direccion'] in ('Short', 'Ambas'):
-            ent.append(f"SHORT: SI RSI({per}) > {p['sobrecompra']:g} → vender al open siguiente")
-            sal.append(f"SHORT: SI RSI({per}) < 50 → recomprar al open siguiente")
-    elif plantilla == 'Stochastic (%K/%D)':
-        pk, sk, pd_ = p['periodo_k'], p['suavizado_k'], p['periodo_d']
-        est = f"Stoch(%K={pk},suav={sk},%D={pd_})"
-        if p['direccion'] in ('Long', 'Ambas'):
-            ent.append(f"LONG:  SI %K cruza arriba %D Y %K < {p['sobreventa']:g}  [{est}] → comprar al open siguiente")
-            sal.append(f"LONG:  SI %K > 50  [{est}] → vender al open siguiente")
-        if p['direccion'] in ('Short', 'Ambas'):
-            ent.append(f"SHORT: SI %K cruza abajo %D Y %K > {p['sobrecompra']:g}  [{est}] → vender al open siguiente")
-            sal.append(f"SHORT: SI %K < 50  [{est}] → recomprar al open siguiente")
-    elif plantilla == 'Williams %R':
-        per = p['periodo']
-        if p['direccion'] in ('Long', 'Ambas'):
-            ent.append(f"LONG:  SI %R({per}) < {p['sobreventa']:g} → comprar al open siguiente")
-            sal.append(f"LONG:  SI %R({per}) > -50 → vender al open siguiente")
-        if p['direccion'] in ('Short', 'Ambas'):
-            ent.append(f"SHORT: SI %R({per}) > {p['sobrecompra']:g} → vender al open siguiente")
-            sal.append(f"SHORT: SI %R({per}) < -50 → recomprar al open siguiente")
-    elif plantilla == 'CCI':
-        per = p['periodo']
-        if p['direccion'] in ('Long', 'Ambas'):
-            ent.append(f"LONG:  SI CCI({per}) < {p['sobreventa']:g} → comprar al open siguiente")
-            sal.append(f"LONG:  SI CCI({per}) > 0 → vender al open siguiente")
-        if p['direccion'] in ('Short', 'Ambas'):
-            ent.append(f"SHORT: SI CCI({per}) > {p['sobrecompra']:g} → vender al open siguiente")
-            sal.append(f"SHORT: SI CCI({per}) < 0 → recomprar al open siguiente")
-    elif plantilla == 'KAMA':
-        per_er, r, l = p['periodo_er'], p['rapido'], p['lento']
-        if p['direccion'] in ('Long', 'Ambas'):
-            ent.append(f"LONG:  SI close cruza arriba KAMA(ER={per_er},rápido={r},lento={l}) → comprar al open siguiente")
-            sal.append(f"LONG:  SI close cruza abajo KAMA(ER={per_er},rápido={r},lento={l}) → vender al open siguiente")
-        if p['direccion'] in ('Short', 'Ambas'):
-            ent.append(f"SHORT: SI close cruza abajo KAMA(ER={per_er},rápido={r},lento={l}) → vender al open siguiente")
-            sal.append(f"SHORT: SI close cruza arriba KAMA(ER={per_er},rápido={r},lento={l}) → recomprar al open siguiente")
-    elif plantilla == 'Patrones de velas':
-        pats = p['patrones'] or ['(ninguno)']
-        for nombre in pats:
-            ent.append(f"SI se forma «{nombre}» → entrar en la dirección del "
-                       f"sesgo del patrón al open siguiente")
-        sal.append(f"Cierre a +{p['lag_salida']} velas de la entrada")
-    elif plantilla == 'Custom (reglas)':
-        etiquetas = {'entradas_long': ('ent', 'LONG'), 'entradas_short': ('ent', 'SHORT'),
-                     'salidas_long': ('sal', 'LONG'), 'salidas_short': ('sal', 'SHORT')}
-        reglas = p.get('reglas') or {}
-        for clave, (destino, direccion) in etiquetas.items():
-            for setup_r in reglas.get(clave, []):
-                conds = " Y ".join(
-                    f"{_desc_spec(c['izq'])} {c['op']} {_desc_spec(c['der'])}"
-                    for c in setup_r.get('condiciones', []))
-                if not conds:
-                    continue
-                linea = f"{direccion}: SI {conds}"
-                (ent if destino == 'ent' else sal).append(linea)
-        if not ent:
-            ent.append("(sin reglas de entrada definidas)")
+    setup, no de la plantilla). Se construye sobre filas_plantilla para que el
+    pseudocódigo y las tablas de la GUI no puedan divergir."""
+    if plantilla == 'Patrones de velas':
+        ent = [f"SI {f['texto'].split(' (dirección')[0]} → entrar en la dirección "
+               f"del sesgo del patrón al open siguiente"
+               for f in filas_plantilla(plantilla, p)]
+        sal = [f"Cierre {f['texto']}" for f in filas_plantilla(plantilla, p, salida=True)]
+        return ent, sal
+
+    def _lineas(filas, acciones):
+        out = []
+        for f in filas:
+            etiqueta, verbo = acciones.get(f['direccion'], ('', 'operar'))
+            out.append(f"{etiqueta} SI {f['texto']} → {verbo} al open siguiente")
+        return out
+
+    ent = _lineas(filas_plantilla(plantilla, p), _ACCION_ENTRADA)
+    sal = _lineas(filas_plantilla(plantilla, p, salida=True), _ACCION_SALIDA)
+    if plantilla == 'Custom (reglas)' and not ent:
+        ent.append("(sin reglas de entrada definidas)")
     return ent, sal
+
+
+def etapa_estancamiento_por_defecto():
+    """Etapa de salida por estancamiento: cierra si tras 'velas_max' velas
+    desde la entrada el avance a favor no llega a 'r_min' — ver
+    core/backtest.py (disparador 'estancamiento'). Sin retrocompatibilidad
+    que derivar: es un disparador nuevo, siempre se escribe explícito."""
+    return {'pct': 100.0, 'trigger': 'estancamiento', 'velas_max': 10,
+            'r_min': 1.0, 'condiciones': [], 'gestion': {'tipo': 0, 'val': 0.0}}
+
+
+def trigger_etapa(etapa):
+    """Disparador de una etapa de salida parcial: 'senal' (la propia señal de
+    salida de la plantilla), 'r' (al alcanzar +N R), 'cond' (cuando se
+    cumplen sus condiciones) o 'estancamiento' (N velas sin alcanzar un R
+    mínimo). Deriva el valor para etapas del formato antiguo sin 'trigger',
+    con el mismo criterio que core/backtest.simular."""
+    trigger = etapa.get('trigger')
+    if trigger in ('senal', 'r', 'cond', 'estancamiento'):
+        return trigger
+    if float(etapa.get('r', 0.0)) > 0.0:
+        return 'r'
+    return 'cond' if etapa.get('condiciones') else 'senal'
+
+
+def _desc_disparador_etapa(etapa):
+    trigger = trigger_etapa(etapa)
+    if trigger == 'r':
+        return f"cuando el precio ≥ +{float(etapa.get('r', 0.0)):g} R"
+    if trigger == 'cond':
+        conds = " Y ".join(_desc_condicion_dir(c) for c in etapa.get('condiciones', []))
+        return f"cuando se cumpla: {conds}" if conds else "cuando se cumplan sus condiciones"
+    if trigger == 'estancamiento':
+        velas = int(etapa.get('velas_max', 0))
+        r_min = float(etapa.get('r_min', 0.0))
+        return (f"por estancamiento: si a +{velas} velas de la entrada no ha "
+                f"alcanzado {r_min:g}R de avance")
+    return "a la señal de salida de la plantilla"
+
+
+def tramo_entrada_por_defecto():
+    """Tramo de entrada implícito de cualquier plantilla: construir el 100%
+    de la posición con la propia señal de entrada de la plantilla (el cruce,
+    la ruptura de banda, el nivel de RSI...). Es el equivalente en la
+    ENTRADA de etapa_salida_por_defecto(): un solo tramo al 100% a la señal
+    es exactamente lo que hace el sistema sin entrada escalonada — ver
+    core/backtest.simular, que trata la ausencia de 'tramos' igual que un
+    único tramo con estos mismos valores."""
+    return {'pct': 100.0, 'trigger': 'senal', 'val': 0.0, 'condiciones': [],
+            'gestion': {'tipo': 0, 'val': 0.0}}
+
+
+def trigger_tramo(tramo):
+    """Disparador de un tramo de entrada escalonada: 'senal' (se repite la
+    señal de entrada de la plantilla) · 'velas' (a +N velas de la 1ª
+    entrada) · 'retroceso' (N×ATR en contra, promediar) · 'avance' (+N R a
+    favor, pirámide) · 'cond' (solo sus condiciones) — ver
+    core/backtest.TRIGGERS_TRAMO_ENTRADA. A diferencia de trigger_etapa, no
+    hay formato antiguo que migrar: 'tramos' es un campo nuevo y el
+    constructor siempre escribe 'trigger' explícito; 'senal' es solo el
+    valor por defecto si faltara."""
+    trigger = tramo.get('trigger')
+    return trigger if trigger in TRIGGERS_TRAMO_ENTRADA else 'senal'
+
+
+def _desc_disparador_tramo(tramo):
+    trigger = trigger_tramo(tramo)
+    val = float(tramo.get('val', 0.0))
+    if trigger == 'velas':
+        return f"a +{val:g} velas de la 1ª entrada"
+    if trigger == 'retroceso':
+        return f"si retrocede {val:g}×ATR en contra (promediar)"
+    if trigger == 'avance':
+        return f"si avanza +{val:g} R a favor (pirámide)"
+    if trigger == 'cond':
+        conds = " Y ".join(_desc_condicion_dir(c) for c in tramo.get('condiciones', []))
+        return f"cuando se cumpla: {conds}" if conds else "cuando se cumplan sus condiciones"
+    return "con la señal de entrada de la plantilla"
+
+
+def salida_mecanismo_por_defecto():
+    """Configuración por defecto de uno de los cuatro mecanismos globales de
+    salida (stop-loss, take-profit, break-even, trailing): cerrar el 100% de
+    lo que quede abierto, sin condiciones ni gestión extra. Es exactamente lo
+    que hacían siempre, así que un setup sin estos campos se comporta igual —
+    ver core/backtest.simular, que asume estos mismos valores si faltan."""
+    return {'pct': 100.0, 'condiciones': [], 'gestion': {'tipo': 0, 'val': 0.0}}
+
+
+# etiqueta legible de cada mecanismo, en el mismo orden que
+# core.backtest.MECANISMOS_SALIDA (el orden fija el código de 'parcial')
+# con artículo incluido: se interpolan en frases del pseudocódigo
+NOMBRES_MECANISMO_SALIDA = {
+    'salida_stop': 'el stop-loss original',
+    'salida_tp': 'el take-profit',
+    'salida_be': 'el stop movido a break-even',
+    'salida_trailing': 'el trailing stop',
+    'salida_tiempo': 'la salida por tiempo',
+}
+
+
+def _desc_mecanismos_salida(setup):
+    """Líneas para el pseudocódigo describiendo los mecanismos globales que
+    NO cierran el 100% de la posición (los que sí lo hacen ya se describen en
+    las líneas de stop/TP/BE/trailing de codigo_setup)."""
+    gestion_nombres = {1: 'break-even', 2: 'trailing',
+                       3: 'stop al precio del cierre anterior'}
+    lineas = []
+    for clave, etiqueta in NOMBRES_MECANISMO_SALIDA.items():
+        mec = setup.get(clave)
+        if not mec:
+            continue
+        pct = float(mec.get('pct', 100.0))
+        if pct >= 100.0:
+            continue
+        # la salida por tiempo queda AGOTADA tras su parcial; el resto son
+        # redes de seguridad y siguen cortando (ver core/backtest)
+        if clave == 'salida_tiempo':
+            cola = ("una sola vez: el resto queda a cargo del stop/TP/señal, "
+                    "el tiempo ya no vuelve a cerrarlo")
+        else:
+            cola = "una sola vez por operación (si vuelve a dispararse, cierra el resto)"
+        texto = (f"ADEMÁS: al dispararse {etiqueta} cierra solo el {pct:g}% de "
+                 f"lo que quede abierto, {cola}")
+        conds = " Y ".join(_desc_condicion_dir(c) for c in mec.get('condiciones', []))
+        if conds:
+            texto += f", y solo si {conds}"
+        g_tipo = (mec.get('gestion') or {}).get('tipo', 0)
+        if g_tipo in gestion_nombres:
+            texto += f" → sobre el resto activa {gestion_nombres[g_tipo]}"
+        lineas.append(texto)
+    return lineas
+
+
+AVISO_EXCESO_PARCIALES = "Se excede el 100% del tamaño de la posición."
+
+
+def validar_parciales(parciales):
+    """Avisos de una lista de etapas de salida parcial (vacío = válida).
+
+    Cada «Cerrar %» es sobre el tamaño ORIGINAL de la posición y las etapas
+    son secuenciales, así que la suma acumulada no puede pasar del 100%: el
+    motor recorta al máximo disponible, pero una configuración así siempre
+    indica un error de captura (la etapa sobrante nunca llegaría a ejecutarse).
+    Función pura para poder testearla y para que la GUI decida si deja correr
+    el backtest — ver OptimizadorWidget._validar_sistema."""
+    invalidas = []
+    queda = 100.0
+    for i, etapa in enumerate(parciales or []):
+        try:
+            pct = float((etapa or {}).get('pct', 0.0))
+        except (TypeError, ValueError):
+            pct = 0.0
+        if pct > queda + 1e-9:
+            invalidas.append(i + 1)
+        queda -= min(max(pct, 0.0), queda)
+    if not invalidas:
+        return []
+    palabra = "Etapa" if len(invalidas) == 1 else "Etapas"
+    nums = ", ".join(str(x) for x in invalidas)
+    return [f"{palabra} {nums}: {AVISO_EXCESO_PARCIALES}"]
+
+
+def validar_tramos(tramos):
+    """Avisos de una lista de tramos de entrada escalonada (vacío = válida).
+
+    Cada «Entrar %» es una porción del RIESGO total del setup, así que la suma
+    no debería pasar del 100%: por encima, el sistema arriesgaría más de lo
+    pretendido (el motor no lo recorta, ver core/backtest)."""
+    total = 0.0
+    for tramo in (tramos or []):
+        try:
+            total += float((tramo or {}).get('pct', 0.0))
+        except (TypeError, ValueError):
+            pass
+    if total > 100.0 + 1e-9:
+        return [f"Los tramos suman {total:g}% del riesgo: el sistema "
+                "arriesgaría más de lo pretendido."]
+    return []
+
+
+def validar_setup(setup):
+    """Todos los avisos de configuración de un setup (vacío = válido)."""
+    return (validar_parciales(setup.get('parciales'))
+            + validar_tramos(setup.get('tramos')))
 
 
 _NOMBRES_DIA_ES = ['Lun', 'Mar', 'Mié', 'Jue', 'Vie', 'Sáb', 'Dom']
@@ -1153,17 +1470,34 @@ def codigo_setup(setup, indice=0):
     tp = setup.get('tp_r', 0.0)
     tiempo = setup.get('salida_n_velas', 0)
     be = setup.get('be_atr', 0.0)
+    be_uni = 'R' if setup.get('be_unidad') == 'r' else '×ATR'
     trail = setup.get('trailing_atr', 0.0)
     lineas.append(
         f"    riesgo = {riesgo:g}% del equity"
         f" · stop = {f'{stop:g}×ATR' if stop else 'ninguno'}"
         f" · take-profit = {f'{tp:g}R' if tp else 'ninguno'}"
         f" · salida por tiempo = {f'+{tiempo} velas' if tiempo else 'sin límite'}"
-        f" · {'BE a ' + f'{be:g}×ATR' if be else 'sin BE'}"
+        f" · {'BE a ' + f'{be:g}{be_uni}' if be else 'sin BE'}"
         f" · {'trailing a ' + f'{trail:g}×ATR' if trail else 'sin trailing'}")
+    gestion_nombres = {0: 'sin cambios', 1: 'BE', 2: 'trailing', 3: '→ precio de referencia anterior'}
+
+    tramos = setup.get('tramos') or []
+    if len(tramos) > 1:
+        lineas.append("")
+        lineas.append("  ENTRADA ESCALONADA:")
+        for e, tr in enumerate(tramos, 1):
+            pct = tr.get('pct', 100)
+            g = tr.get('gestion', {})
+            g_label = gestion_nombres.get(g.get('tipo', 0), '—')
+            if g.get('tipo') in (1, 2) and g.get('val', 0) > 0:
+                g_label += f' {g["val"]:g}×ATR'
+            riesgo_tramo = riesgo * pct / 100.0
+            lineas.append(
+                f"    Tramo {e} ({pct:g}% del riesgo total → {riesgo_tramo:g}% del "
+                f"equity): {_desc_disparador_tramo(tr)} → gestión: {g_label}")
+
     parciales = setup.get('parciales') or []
     if parciales:
-        gestion_nombres = {0: 'sin cambios', 1: 'BE', 2: 'trailing', 3: '→ precio parcial anterior'}
         lineas.append("")
         lineas.append("  SALIDAS PARCIALES:")
         for e, ep in enumerate(parciales, 1):
@@ -1173,9 +1507,8 @@ def codigo_setup(setup, indice=0):
             g_label = gestion_nombres.get(g.get('tipo', 0), '—')
             if g.get('tipo') in (1, 2) and g.get('val', 0) > 0:
                 g_label += f' {g["val"]:g}×ATR'
-            trigger = f'cuando el precio ≥ +{r:g} R' if r > 0 else 'a la señal del indicador'
             lineas.append(
-                f"    Salida {e} ({pct:g}% del total): {trigger}"
+                f"    Salida {e} ({pct:g}% del total): {_desc_disparador_etapa(ep)}"
                 f" → gestión: {g_label}")
 
     filtros_lineas = _desc_filtros(setup.get('filtros'))
@@ -1200,12 +1533,22 @@ def codigo_setup(setup, indice=0):
         lineas.append(f"    ADEMÁS: take-profit a {tp:g}R del riesgo")
     if be:
         lineas.append(f"    ADEMÁS: break-even: mueve el stop al precio de entrada "
-                      f"cuando el precio avanza {be:g}×ATR a favor")
+                      f"cuando el precio avanza {be:g}{be_uni} a favor")
     if trail:
         lineas.append(f"    ADEMÁS: trailing stop: el stop sigue al precio a "
                       f"{trail:g}×ATR del máximo alcanzado")
     if tiempo and plantilla != 'Patrones de velas':
-        lineas.append(f"    ADEMÁS: cierre forzoso a +{tiempo} velas de la entrada")
+        # si la salida por tiempo cierra solo una parte, la línea de abajo
+        # (_desc_mecanismos_salida) es la que lo describe: no anunciar aquí un
+        # cierre forzoso total que no va a ocurrir
+        pct_tiempo = float((setup.get('salida_tiempo') or {}).get('pct', 100.0))
+        if pct_tiempo >= 100.0:
+            lineas.append(f"    ADEMÁS: cierre forzoso a +{tiempo} velas de la entrada")
+        else:
+            lineas.append(f"    ADEMÁS: a +{tiempo} velas de la entrada se cierra "
+                          f"parte de la posición:")
+    for linea_mec in _desc_mecanismos_salida(setup):
+        lineas.append(f"    {linea_mec}")
     return "\n".join(lineas)
 
 
