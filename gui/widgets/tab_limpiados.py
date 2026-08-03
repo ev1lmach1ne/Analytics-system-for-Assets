@@ -564,6 +564,9 @@ class TabLimpiados(QWidget):
 
         metrics_path = os.path.join(self._base_data, "_gui_metrics.json")
         pdf_path_file = os.path.join(self._base_data, "_gui_pdf_path.json")
+        # Datos crudos de cada gráfico, para que el Analizador los dibuje
+        # nativamente en vez de mostrar la imagen del PDF.
+        plotdata_path = os.path.join(self._base_data, "_gui_plotdata.pkl")
 
         env = {
             'CONFIG_PATH': config_path,
@@ -571,6 +574,7 @@ class TabLimpiados(QWidget):
             'PYTHONIOENCODING': 'utf-8',
             'GUI_METRICS_OUTPUT': metrics_path,
             'GUI_PDF_OUTPUT': pdf_path_file,
+            'GUI_PLOTDATA_OUTPUT': plotdata_path,
             'USERPROFILE': os.environ.get('USERPROFILE', ''),
         }
         if rango_inicio is not None:
@@ -579,6 +583,7 @@ class TabLimpiados(QWidget):
 
         self._metrics_path = metrics_path
         self._pdf_path_file = pdf_path_file
+        self._plotdata_path = plotdata_path
 
         # Liberar el PDF actualmente cargado en el visor ANTES de lanzar el análisis:
         # si el nuevo informe reutiliza el mismo nombre de archivo (mismo activo/tf/
@@ -619,8 +624,24 @@ class TabLimpiados(QWidget):
                 traceback.print_exc()
 
         metrics_path = self._metrics_path if os.path.exists(self._metrics_path) else None
+        plotdata_path = getattr(self, '_plotdata_path', None)
+        plotdata_path = plotdata_path if (plotdata_path and os.path.exists(plotdata_path)) else None
+
+        # Rutas que se emiten a TabAnalisis. Por defecto las temporales del
+        # propio proceso (GUI_PDF_OUTPUT/GUI_METRICS_OUTPUT), pero se
+        # sustituyen por el sidecar en cuanto exista: TabAnalisis._ruta_bundle()
+        # deriva la ruta del .plotdata.pkl a partir del PDF que recibe (mismo
+        # prefijo + '.plotdata.pkl'), y ese emparejamiento solo existe junto al
+        # sidecar (`<csv>.analysis.<rango>.pdf` / `.plotdata.pkl`) — nunca junto
+        # a la ruta temporal, que vive en una carpeta distinta con otro nombre.
+        # Sin este cambio la pestaña Gráficos caía siempre al visor de PDF
+        # antiguo con el aviso de "versión anterior", aunque el bundle se
+        # acabara de generar en el mismo análisis.
+        pdf_emitir = pdf_path
+        metrics_emitir = metrics_path
 
         # Cache to sidecar files
+        rango_suffix = None
         if pdf_path and self._selected_path:
             import shutil
 
@@ -632,16 +653,22 @@ class TabLimpiados(QWidget):
                 if rango_suffix:
                     pdf_cache_h = self._selected_path + f'.analysis.{rango_suffix}.pdf'
                     metrics_cache_h = self._selected_path + f'.analysis.{rango_suffix}.metrics.json'
+                    plot_cache_h = self._selected_path + f'.analysis.{rango_suffix}.plotdata.pkl'
                     shutil.copy2(pdf_path, pdf_cache_h)
                     if metrics_path:
                         shutil.copy2(metrics_path, metrics_cache_h)
+                    if plotdata_path:
+                        shutil.copy2(plotdata_path, plot_cache_h)
 
                 if self._rango_inicio is None:
                     pdf_cache = self._selected_path + '.analysis.pdf'
                     metrics_cache = self._selected_path + '.analysis.metrics.json'
+                    plot_cache = self._selected_path + '.analysis.plotdata.pkl'
                     shutil.copy2(pdf_path, pdf_cache)
                     if metrics_path:
                         shutil.copy2(metrics_path, metrics_cache)
+                    if plotdata_path:
+                        shutil.copy2(plotdata_path, plot_cache)
                     self._cached_pdf = pdf_cache
                     self._cached_metrics = metrics_cache
                     self.btn_reanalyze.setVisible(True)
@@ -650,9 +677,22 @@ class TabLimpiados(QWidget):
                 import traceback
                 traceback.print_exc()
 
+        # El sidecar por rango es el mismo que lista periodo_combo en
+        # TabAnalisis (_poblar_periodo_combo busca '.analysis.*_to_*.pdf'):
+        # emitirlo aquí también hace que la selección inicial del combo
+        # coincida con el análisis recién hecho. Se comprueba con
+        # os.path.exists (no si el copy "declaró éxito") para no emitir un
+        # sidecar que haya fallado a mitad de copiar.
+        if rango_suffix and self._selected_path:
+            pdf_cache_h = self._selected_path + f'.analysis.{rango_suffix}.pdf'
+            metrics_cache_h = self._selected_path + f'.analysis.{rango_suffix}.metrics.json'
+            if os.path.exists(pdf_cache_h):
+                pdf_emitir = pdf_cache_h
+                metrics_emitir = metrics_cache_h if os.path.exists(metrics_cache_h) else None
+
         self.analysis_completed.emit(
-            pdf_path or '',
-            metrics_path or '',
+            pdf_emitir or '',
+            metrics_emitir or '',
             self._selected_nombre or '',
             self._selected_tf or '',
             self._selected_path or ''

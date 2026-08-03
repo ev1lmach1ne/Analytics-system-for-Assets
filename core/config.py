@@ -1,11 +1,42 @@
 import json
 import os
 import re
+import sys
 from dotenv import load_dotenv
 
 load_dotenv()
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+def _raiz_codigo():
+    """Carpeta del repositorio (dos niveles por encima de este archivo)."""
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _raiz_recursos():
+    """Solo lectura: el código y los scripts que viajan dentro del paquete.
+
+    Empaquetado, es la carpeta temporal donde PyInstaller se descomprime."""
+    if getattr(sys, 'frozen', False):
+        return getattr(sys, '_MEIPASS',
+                       os.path.dirname(os.path.abspath(sys.executable)))
+    return _raiz_codigo()
+
+
+def _raiz_datos_usuario():
+    """Escribible y permanente: ajustes, sistemas, favoritos y descargas.
+
+    Empaquetado NO puede ser la raíz de recursos: esa es la carpeta temporal
+    que PyInstaller borra al cerrar, así que todo lo que deba sobrevivir a un
+    reinicio se guarda junto al .exe."""
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return _raiz_codigo()
+
+
+# En modo fuente ambas raíces son la misma carpeta; solo divergen al
+# ejecutarse empaquetado.
+RESOURCE_ROOT = _raiz_recursos()
+PROJECT_ROOT = _raiz_datos_usuario()
 APP_CONFIG_PATH = os.path.join(PROJECT_ROOT, 'config.json')
 
 # === QuestDB Config ===
@@ -29,7 +60,8 @@ BASE_DATA     = os.getenv('BASE_DATA', os.path.join(PROJECT_ROOT, "data"))
 LIMPIADOS_DIR = os.path.join(BASE_DATA, "Limpiados")
 INFORMES_DIR  = os.path.join(LIMPIADOS_DIR, "Informes")
 CONFIG_PATH   = os.path.join(BASE_DATA, "sesion_config.json")
-SCRIPTS_DIR   = os.path.join(PROJECT_ROOT, "library", "scripts_utiles")
+# recurso de solo lectura: viaja dentro del paquete, no junto al .exe
+SCRIPTS_DIR   = os.path.join(RESOURCE_ROOT, "library", "scripts_utiles")
 SISTEMAS_DIR  = os.path.join(PROJECT_ROOT, "Sistemas")
 FAVORITOS_DIR = os.path.join(PROJECT_ROOT, "Favoritos")
 

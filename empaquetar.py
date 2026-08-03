@@ -24,6 +24,17 @@ APP_NAME = "AnalyticsSystem"
 os.makedirs(DIST, exist_ok=True)
 os.makedirs(CACHE, exist_ok=True)
 
+# Los scripts de library/scripts_utiles/ viajan como DATOS (--add-data), no como
+# módulos, así que PyInstaller no analiza sus imports: todo lo que usen y no use
+# también la GUI hay que declararlo a mano o el subproceso muere con
+# "ModuleNotFoundError". Se usa --collect-all (y no --hidden-import) porque estas
+# librerías cargan submódulos y ficheros de datos de forma dinámica.
+#   · seaborn / statsmodels -> analisis_descriptivo.py
+# tkinter y customtkinter NO están aquí a propósito: preparar_datos.py solo los
+# importa en sus ramas interactivas, que la GUI nunca ejecuta (siempre pasa
+# CSV_INPUT y CONFIG_SKIP), así que no hace falta cargar con ellos.
+DEPS_SCRIPTS = "--collect-all seaborn --collect-all statsmodels"
+
 
 def shell(cmd, cwd=None, check=True):
     print(f"  $ {cmd}")
@@ -52,15 +63,27 @@ def build_windows():
     app_py = os.path.join(PROJECT, "app.py")
     icon = os.path.join(PROJECT, "icon.ico")
     icon_arg = f' --icon="{icon}"' if os.path.exists(icon) else ""
-    config_json = os.path.join(PROJECT, "config.json")
-    config_arg = f' --add-data "{config_json};."' if os.path.exists(config_json) else ""
+    # --icon solo fija el icono del .exe en el Explorador de Windows: no lo
+    # deja disponible en tiempo de ejecución. app.py carga "icon.ico" con una
+    # ruta normal (relativa a su __file__, que en el .exe congelado cae en la
+    # carpeta temporal de extracción) para el splash y el icono de ventana —
+    # sin este --add-data ese archivo no existe ahí dentro y QIcon devuelve
+    # un icono vacío, dejando el splash en blanco.
+    icon_data_arg = f' --add-data "{icon};."' if os.path.exists(icon) else ""
+    # config.json NO se empaqueta a propósito: es la configuración personal de
+    # quien compila (su carpeta de datos, su tutorial ya visto...). Incrustarlo
+    # hacía que en cualquier otro equipo la app apuntara a una ruta inexistente
+    # y que nunca saliera el diálogo de primera apertura. Sin él, la app crea
+    # su config.json junto al .exe la primera vez que se abre.
+    config_arg = ""
 
     workdir = os.path.join(DIST, "build_win")
 
     cmd = (
         f'"{sys.executable}" -m PyInstaller '
         f'--onefile --windowed --name="{APP_NAME}"'
-        f'{icon_arg} '
+        f'{icon_arg}'
+        f'{icon_data_arg} '
         f'--add-data "{os.path.join(PROJECT, "core")};core" '
         f'--add-data "{os.path.join(PROJECT, "gui")};gui" '
         f'--add-data "{os.path.join(PROJECT, "library")};library"'
@@ -69,6 +92,7 @@ def build_windows():
         f'--hidden-import=PyQt6.QtWebEngineWidgets '
         f'--hidden-import=PyQt6.QtWebEngineCore '
         f'--hidden-import=numba '
+        f'{DEPS_SCRIPTS} '
         f'--distpath="{DIST}" '
         f'--workpath="{workdir}" '
         f'--specpath="{workdir}" '
@@ -98,13 +122,17 @@ def build_macos():
     app_py = os.path.join(PROJECT, "app.py")
     icon = os.path.join(PROJECT, "icon.ico")
     icon_arg = f' --icon="{icon}"' if os.path.exists(icon) else ""
-    config_json = os.path.join(PROJECT, "config.json")
-    config_arg = f' --add-data "{config_json}:."' if os.path.exists(config_json) else ""
+    # ver el comentario equivalente en build_windows(): sin bundlear
+    # icon.ico como dato, app.py no lo encuentra en tiempo de ejecución.
+    icon_data_arg = f' --add-data "{icon}:."' if os.path.exists(icon) else ""
+    # ver build_windows(): config.json es del que compila, no se empaqueta
+    config_arg = ""
 
     cmd = (
         f'"{sys.executable}" -m PyInstaller '
         f'--windowed --name="{APP_NAME}"'
-        f'{icon_arg} '
+        f'{icon_arg}'
+        f'{icon_data_arg} '
         f'--add-data "{os.path.join(PROJECT, "core")}:core" '
         f'--add-data "{os.path.join(PROJECT, "gui")}:gui" '
         f'--add-data "{os.path.join(PROJECT, "library")}:library"'
@@ -113,6 +141,7 @@ def build_macos():
         f'--hidden-import=PyQt6.QtWebEngineWidgets '
         f'--hidden-import=PyQt6.QtWebEngineCore '
         f'--hidden-import=numba '
+        f'{DEPS_SCRIPTS} '
         f'--distpath="{DIST}" '
         f'--workpath="{os.path.join(DIST, "build_mac")}" '
         f'--specpath="{os.path.join(DIST, "build_mac")}" '
@@ -155,12 +184,17 @@ def build_linux():
         shell(f'"{sys.executable}" -m pip install pyinstaller')
 
     app_py = os.path.join(PROJECT, "app.py")
-    config_json = os.path.join(PROJECT, "config.json")
-    config_arg = f' --add-data "{config_json}:."' if os.path.exists(config_json) else ""
+    icon = os.path.join(PROJECT, "icon.ico")
+    # ver el comentario equivalente en build_windows(): sin bundlear
+    # icon.ico como dato, app.py no lo encuentra en tiempo de ejecución.
+    icon_data_arg = f' --add-data "{icon}:."' if os.path.exists(icon) else ""
+    # ver build_windows(): config.json es del que compila, no se empaqueta
+    config_arg = ""
 
     cmd = (
         f'"{sys.executable}" -m PyInstaller '
-        f'--windowed --name="{APP_NAME}" '
+        f'--windowed --name="{APP_NAME}"'
+        f'{icon_data_arg} '
         f'--add-data "{os.path.join(PROJECT, "core")}:core" '
         f'--add-data "{os.path.join(PROJECT, "gui")}:gui" '
         f'--add-data "{os.path.join(PROJECT, "library")}:library"'
@@ -169,6 +203,7 @@ def build_linux():
         f'--hidden-import=PyQt6.QtWebEngineWidgets '
         f'--hidden-import=PyQt6.QtWebEngineCore '
         f'--hidden-import=numba '
+        f'{DEPS_SCRIPTS} '
         f'--distpath="{DIST}" '
         f'--workpath="{os.path.join(DIST, "build_linux")}" '
         f'--specpath="{os.path.join(DIST, "build_linux")}" '

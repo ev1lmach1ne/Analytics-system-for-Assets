@@ -9,6 +9,24 @@ from gui.questdb_bootstrap import mostrar_bootstrap_questdb
 from core.config import (get_base_data, LIMPIADOS_DIR, TF_LABELS, TIPO_LABELS,
                           TIPO_MAP, SCRIPTS_DIR, CATEGORIAS_DESCARGA_CONOCIDAS)
 
+# Categoría de descarga -> etiqueta que se preselecciona en «Tipo». El
+# desplegable es más grueso que las categorías, así que varias caen en la
+# misma opción: 'Stock' agrupa acciones, ETFs e índices (mismo criterio que
+# usa reorganizar_limpiados.py), y metales/materias primas van a
+# 'Futuro/Cfd', que es como se operan. 'OTROS' no está: si la ruta no dice
+# nada, no se toca lo que el usuario tuviera puesto.
+_TIPO_SUGERIDO = {
+    'CRYPTO': 'Crypto',
+    'FOREX': 'Forex',
+    'ACCION': 'Stock',
+    'ETF': 'Stock',
+    'INDICE': 'Stock',
+    'METAL-ETF': 'Stock',
+    'FUTURO': 'Futuro/Cfd',
+    'COMMODITIES': 'Futuro/Cfd',
+    'METAL': 'Futuro/Cfd',
+}
+
 STYLE_IMPORT = """
 QWidget { background-color: #141e30; }
 QPushButton {
@@ -159,10 +177,7 @@ class TabImportar(QWidget):
         self.explorer = new
 
     def _on_file_explorer_click(self, path):
-        self._selected_file = path
-        self.path_label.setText(os.path.basename(path))
-        self.btn_config.setEnabled(True)
-        self.btn_delete.setEnabled(True)
+        self._marcar_seleccion(path)
 
     def _filter_files(self, text: str):
         self.explorer.set_search_text(text)
@@ -173,10 +188,24 @@ class TabImportar(QWidget):
             self._base_data, "CSV (*.csv);;TXT (*.txt);;Todos (*)"
         )
         if path:
-            self._selected_file = path
-            self.path_label.setText(os.path.basename(path))
-            self.btn_config.setEnabled(True)
-            self.btn_delete.setEnabled(True)
+            self._marcar_seleccion(path)
+
+    def _marcar_seleccion(self, path):
+        """Registra el archivo elegido y preselecciona «Tipo» según la
+        categoría que se deduzca de su ruta.
+
+        El desplegable arranca en «Futuro/Cfd» y es fácil olvidarse de
+        cambiarlo, lo que acababa clasificando mal el activo (un crypto
+        descargado en ccxt/CRYPTO/... terminaba fuera de Crypto). Es solo
+        una propuesta: si la ruta no dice nada se deja como estaba, y el
+        usuario siempre puede cambiarlo antes de importar."""
+        self._selected_file = path
+        self.path_label.setText(os.path.basename(path))
+        self.btn_config.setEnabled(True)
+        self.btn_delete.setEnabled(True)
+        etiqueta = _TIPO_SUGERIDO.get(self._detectar_categoria(path))
+        if etiqueta:
+            self.tipo_input.setCurrentText(etiqueta)
 
     def _detectar_categoria(self, src_path):
         """Intenta extraer la categoria de descarga (FOREX/METAL/CRYPTO/...)
@@ -326,6 +355,11 @@ class TabImportar(QWidget):
             'nombre': cfg['nombre'],
             'tf': cfg['tf'],
             'activo': cfg['activo'],
+            # La categoría deducida de la ruta de origen es MÁS fiable que
+            # 'activo' (que sale de un desplegable que empieza en Futuro/Cfd
+            # y el usuario puede no tocar), así que se guarda para que
+            # reorganizar_limpiados.py la prefiera al clasificar la carpeta.
+            'categoria': cfg.get('categoria', 'OTROS'),
             'rf_rate': cfg.get('rf_rate', 0.0),
         }
         meta_path = cleaned_path + '.meta.json'

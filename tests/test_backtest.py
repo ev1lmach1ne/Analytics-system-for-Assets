@@ -4,7 +4,7 @@ import pytest
 
 from core.backtest import (
     simular, dividir_is_oos, calcular_metricas, walk_forward, montecarlo,
-    _analizar_drawdowns,
+    resultado_filtrado, _analizar_drawdowns,
 )
 from core.strategies import (
     generar_senales, generar_senales_sistema, describir, ESTRATEGIAS,
@@ -90,15 +90,17 @@ def test_trade_short_pnl_exacto():
 
 
 def test_mfe_mae_long():
-    # mismo trade que test_trade_long_pnl_exacto (entra t=3 a 100, sale
-    # t=6 a 110, unidades=25, riesgo_absoluto=100) pero con una excursión
-    # intermedia: en t=4 el precio sube hasta 108 (favorable) y baja hasta
-    # 95 (adverso) antes de que la señal de salida se ejecute en t=6.
+    # entra t=3 a 100, sale t=6 al open (104), unidades=25, riesgo_absoluto=100,
+    # con una excursión intermedia en t=4: sube hasta 108 (favorable) y baja
+    # hasta 95 (adverso) antes de que la señal de salida se ejecute en t=6.
     # mfe = 108-100 = 8 -> mfe_r = 8*25/100 = 2.0
     # mae = 100-95 = 5  -> mae_r = 5*25/100 = 1.25
+    # La vela 6 se define coherente (open dentro de su [low, high]): el trade
+    # sale en su open, así que su rango ya no cuenta para el MFE y solo entra
+    # el propio precio de salida (104), por debajo del máximo intermedio.
     n = 10
     o, h, l, c = _ohlc_plano(n)
-    o[6] = 110.0
+    o[6], h[6], l[6], c[6] = 104.0, 104.5, 103.5, 104.0
     h[4] = 108.0
     l[4] = 95.0
     s = _senales_vacias(n)
@@ -111,14 +113,15 @@ def test_mfe_mae_long():
 
 
 def test_mfe_mae_short():
-    # mismo trade que test_trade_short_pnl_exacto (entra corto t=3 a 100,
-    # sale t=6 a 90) con excursión intermedia en t=4: sube hasta 106
-    # (adverso para un corto) y baja hasta 93 (favorable).
+    # entra corto t=3 a 100, sale t=6 al open (96), con excursión intermedia
+    # en t=4: sube hasta 106 (adverso para un corto) y baja hasta 93 (favorable).
     # mfe = 100-93 = 7 -> mfe_r = 7*25/100 = 1.75
     # mae = 106-100 = 6 -> mae_r = 6*25/100 = 1.5
+    # Vela 6 coherente y con el open (96) por encima del mínimo intermedio (93),
+    # para que el MFE lo siga marcando la excursión de t=4 y no la salida.
     n = 10
     o, h, l, c = _ohlc_plano(n)
-    o[6] = 90.0
+    o[6], h[6], l[6], c[6] = 96.0, 96.5, 95.5, 96.0
     h[4] = 106.0
     l[4] = 93.0
     s = _senales_vacias(n)
@@ -128,6 +131,155 @@ def test_mfe_mae_short():
     t = r['trades']
     assert t['mfe_r'][0] == pytest.approx(1.75)
     assert t['mae_r'][0] == pytest.approx(1.5)
+
+
+def test_mfe_ignora_el_rango_posterior_a_una_salida_al_open():
+    # El trade sale al open de t=6 (100): en ese instante deja de existir, así
+    # que el rally posterior de esa misma vela hasta 130 NO es beneficio que
+    # "dejara en la mesa". Contar la vela de salida entera inflaba el ETD con
+    # una ganancia que nunca estuvo disponible.
+    n = 10
+    o, h, l, c = _ohlc_plano(n)
+    o[6], h[6], l[6], c[6] = 100.0, 130.0, 99.0, 129.0
+    s = _senales_vacias(n)
+    s['entradas_long'][2] = True
+    s['salidas_long'][5] = True
+    t = simular(o, h, l, c, s, CONFIG_BASE)['trades']
+    assert t['idx_salida'][0] == 6
+    assert t['motivo'][0] == 0
+    # solo las velas 3-5 (planas: máximo 101) más el precio de salida (100)
+    assert t['mfe_r'][0] == pytest.approx(0.25)     # (101-100)*25/100
+    assert t['etd_r'][0] == pytest.approx(0.25)     # r_multiple = 0
+
+
+def test_eficiencia_salida_100_cuando_el_tp_se_clava():
+    # Salir en el TP exacto es la ejecución perfecta: el trade capturó todo lo
+    # que su propia salida permitía. Que la vela desborde el objetivo (hasta
+    # 120) es irrelevante — la posición ya estaba cerrada a 108.
+    n = 12
+    o, h, l, c = _ohlc_plano(n)
+    h[5], c[5] = 120.0, 119.0
+    s = _senales_vacias(n)
+    s['entradas_long'][2] = True
+    r = simular(o, h, l, c, s, dict(CONFIG_BASE, stop_atr=2.0, tp_r=2.0))
+    t = r['trades']
+    assert t['motivo'][0] == 2                      # TP
+    assert t['precio_salida'][0] == pytest.approx(108.0)
+    assert t['mfe_r'][0] == pytest.approx(2.0)
+    assert t['etd_r'][0] == pytest.approx(0.0)
+    assert t['eficiencia_salida'][0] == pytest.approx(100.0)
+
+
+def test_etd_nunca_negativo_en_un_backtest_real():
+    # Invariante: el MFE es por definición >= el resultado final, así que el
+    # "beneficio dejado en la mesa" no puede ser negativo. Se rompía cuando la
+    # ventana del MFE no cubría el precio al que el trade salió de verdad.
+    rng = np.random.default_rng(11)
+    closes = 100 + np.cumsum(rng.normal(0, 1.0, 400))
+    df = _df_sintetico(closes)
+    s = generar_senales_sistema(df, [{'plantilla': 'Cruce de medias',
+                                      'params': {'tipo': 'SMA', 'rapida': 5,
+                                                 'lenta': 20, 'direccion': 'Ambas'}}])
+    o, h, l, c = (df['open'].values, df['high'].values,
+                  df['low'].values, df['close'].values)
+    t = simular(o, h, l, c, s, dict(CONFIG_BASE, config_por_setup={
+        0: {'stop_atr': 1.0, 'tp_r': 3.0}}))['trades']
+    assert len(t['etd_r']) > 5
+    assert (t['etd_r'] >= -1e-9).all()
+    assert (t['mfe_r'] >= -1e-9).all() and (t['mae_r'] >= -1e-9).all()
+    for clave in ('eficiencia_entrada', 'eficiencia_salida'):
+        v = t[clave][~np.isnan(t[clave])]
+        assert len(v) > 5
+        assert ((v >= 0.0) & (v <= 100.0)).all(), clave
+
+
+def test_eficiencia_salida_acotada_en_un_perdedor_con_mfe_minusculo():
+    # El caso que rompía la métrica: el precio avanza 0.2 a favor (0.1 R) y
+    # luego se para en el stop. Normalizar por el MFE daba r/mfe = -1/0.1 =
+    # -1000%, y ese denominador diminuto arrastraba la media de la tarjeta a
+    # cientos de puntos negativos. Normalizando por el rango completo el trade
+    # queda en 0%: se cerró en el peor precio de su recorrido, que es la
+    # lectura correcta y comparable con el resto.
+    n = 10
+    o = np.full(n, 100.0)
+    h = np.full(n, 100.1)
+    l = np.full(n, 99.9)
+    c = np.full(n, 100.0)
+    h[4] = 100.2          # excursión favorable mínima
+    l[5] = 97.0           # toca el stop (98)
+    s = _senales_vacias(n)
+    s['entradas_long'][2] = True
+    t = simular(o, h, l, c, s, dict(CONFIG_BASE, stop_atr=1.0))['trades']
+    assert t['motivo'][0] == 1                          # stop
+    assert t['precio_salida'][0] == pytest.approx(98.0)
+    assert t['mfe_r'][0] == pytest.approx(0.1)          # el MFE minúsculo
+    assert t['r_multiple'][0] == pytest.approx(-1.0)    # r/mfe habría dado -1000%
+    assert t['eficiencia_salida'][0] == pytest.approx(0.0)
+    assert t['eficiencia_entrada'][0] == pytest.approx(0.2 / 2.2 * 100.0)
+
+
+def test_eficiencias_cumplen_la_identidad_de_sweeney():
+    # entrada% + salida% - 100 = eficiencia total (el % del rango que el trade
+    # se llevó). Que la identidad se cumpla confirma que ambas comparten el
+    # mismo denominador —el rango recorrido— y por eso son comparables entre sí.
+    rng = np.random.default_rng(3)
+    closes = 100 + np.cumsum(rng.normal(0, 1.0, 400))
+    df = _df_sintetico(closes)
+    s = generar_senales_sistema(df, [{'plantilla': 'Cruce de medias',
+                                      'params': {'tipo': 'SMA', 'rapida': 5,
+                                                 'lenta': 20, 'direccion': 'Ambas'}}])
+    o, h, l, c = (df['open'].values, df['high'].values,
+                  df['low'].values, df['close'].values)
+    t = simular(o, h, l, c, s, dict(CONFIG_BASE, config_por_setup={
+        0: {'stop_atr': 1.0, 'tp_r': 3.0}}))['trades']
+    bruto = (t['precio_salida'] - t['precio_entrada']) * t['dir']
+    rango = (t['mfe_r'] + t['mae_r'])
+    escala = np.where(rango > 0, (t['mfe_r'] + t['mae_r']), np.nan)
+    total = bruto * t['unidades'] / (t['pnl'] / t['r_multiple']) / escala * 100.0
+    assert np.nanmax(np.abs(
+        t['eficiencia_entrada'] + t['eficiencia_salida'] - 100.0 - total)) < 1e-9
+
+
+def test_calcular_metricas_admite_trades_sin_columnas_derivadas():
+    # calcular_metricas se usa también con dicts de trades armados a mano; las
+    # columnas derivadas (etd_r, eficiencias) son opcionales y su ausencia no
+    # debe tumbar el resto de métricas.
+    equity = np.full(20, 10000.0)
+    trades = {
+        'idx_entrada': np.array([2, 5]), 'idx_salida': np.array([3, 6]),
+        'pnl': np.array([100.0, -50.0]), 'ret_pct': np.array([0.01, -0.005]),
+        'r_multiple': np.array([1.0, -1.0]),
+        'notional_redondo': np.array([20000.0] * 2),
+        'costo_comision': np.array([10.0] * 2),
+    }
+    m = calcular_metricas({'equity': equity, 'trades': trades,
+                           'drawdown': np.zeros(20), 'capital_final': 10000.0,
+                           'n_trades': 2})
+    assert m['win_rate'] == pytest.approx(0.5)
+    assert m['etd_r_medio'] is None
+    assert m['eficiencia_entrada_media'] is None
+    assert m['eficiencia_salida_media'] is None
+
+
+def test_ulcer_index_castiga_la_duracion_del_drawdown():
+    # Peter Martin: RMS del drawdown punto a punto. A igual profundidad (-10%),
+    # el drawdown que tarda más en recuperarse puntúa más alto — eso es lo que
+    # lo distingue del max drawdown, que daría lo mismo en ambos casos.
+    def _ui(eq):
+        return calcular_metricas({'equity': np.array(eq, dtype=float),
+                                  'trades': {k: np.array([]) for k in
+                                             ('idx_entrada', 'idx_salida', 'pnl',
+                                              'ret_pct', 'r_multiple')},
+                                  'drawdown': np.zeros(len(eq)),
+                                  'capital_final': float(eq[-1]), 'n_trades': 0})
+
+    breve = _ui([100.0, 90.0, 100.0, 100.0])
+    largo = _ui([100.0, 90.0, 90.0, 100.0])
+    # dd = [0, -0.1, 0, 0] -> sqrt(0.01/4) = 0.05 -> 5%
+    assert breve['ulcer_index'] == pytest.approx(5.0)
+    # dd = [0, -0.1, -0.1, 0] -> sqrt(0.02/4) = 0.0707 -> 7.07%
+    assert largo['ulcer_index'] == pytest.approx(7.0710678, abs=1e-5)
+    assert breve['max_dd_pct'] == pytest.approx(largo['max_dd_pct'])   # mismo -10%
 
 
 def test_comision_en_corto_cobrada_una_vez_por_ambos_lados():
@@ -313,6 +465,145 @@ def test_metricas_por_tramo():
     assert m_oos['n_trades'] == 1 and m_oos['win_rate'] == 0.0
     assert m_tot['n_trades'] == 2
     assert m_tot['pnl_total'] == pytest.approx(m_is['pnl_total'] + m_oos['pnl_total'])
+
+
+def test_exposicion_cuenta_las_velas_con_posicion_abierta():
+    # entra al open de t=3, sale al open de t=6 -> velas 3,4,5,6 con posición
+    # abierta en algún momento = 4 de 20 = 20%. Inclusive en ambos extremos:
+    # la vela de salida tuvo posición hasta que se ejecutó el cierre.
+    n = 20
+    o, h, l, c = _ohlc_plano(n)
+    o[6] = 110.0
+    s = _senales_vacias(n)
+    s['entradas_long'][2] = True
+    s['salidas_long'][5] = True
+    r = simular(o, h, l, c, s, CONFIG_BASE)
+    assert r['trades']['idx_entrada'][0] == 3 and r['trades']['idx_salida'][0] == 6
+    assert calcular_metricas(r)['exposicion_pct'] == pytest.approx(4 / 20 * 100)
+
+
+def test_exposicion_no_cuenta_dos_veces_las_salidas_parciales():
+    # Una sola entrada cerrada en dos parciales genera DOS filas en trades que
+    # comparten idx_entrada (3) y salen en t=6 y t=9. Sumar duraciones daría
+    # (6-3) + (9-3) = 9 velas sobre 12; lo correcto es la unión 3..9 = 7.
+    n = 12
+    o, h, l, c = _ohlc_plano(n)
+    o[6] = 110.0
+    o[9] = 120.0
+    c[9] = 120.0
+    s = _senales_vacias(n)
+    s['entradas_long'][2] = True
+    s['salidas_long'][5] = True
+    r = simular(o, h, l, c, s, _cfg_parciales(
+        [{'pct': 50.0, 'r': 0.0, 'trigger': 'senal', 'condiciones': []},
+         {'pct': 50.0, 'r': 0.0, 'trigger': 'senal', 'condiciones': []}],
+        salida_n_velas=6))
+    t = r['trades']
+    assert r['n_trades'] == 2
+    assert t['idx_entrada'].tolist() == [3, 3]
+    assert t['idx_salida'].tolist() == [6, 9]
+    assert calcular_metricas(r)['exposicion_pct'] == pytest.approx(7 / 12 * 100)
+
+
+def test_exposicion_coincide_con_la_instrumentacion_del_motor():
+    # Comprobación cruzada: la unión de intervalos de trades tiene que
+    # reproducir exactamente las velas que el motor marca como "en posición"
+    # para dibujar la trayectoria del stop.
+    rng = np.random.default_rng(11)
+    closes = 100 + np.cumsum(rng.normal(0, 1.0, 400))
+    df = _df_sintetico(closes)
+    s = generar_senales_sistema(df, [{'plantilla': 'Cruce de medias',
+                                      'params': {'tipo': 'SMA', 'rapida': 5,
+                                                 'lenta': 20, 'direccion': 'Ambas'}}])
+    o, h, l, c = (df['open'].values, df['high'].values,
+                  df['low'].values, df['close'].values)
+    r = simular(o, h, l, c, s, dict(CONFIG_BASE, config_por_setup={
+        0: {'stop_atr': 1.0, 'tp_r': 3.0}}))
+    m = calcular_metricas(r)
+    esperado = float(np.isfinite(r['entrada_track']).mean()) * 100.0
+    assert m['exposicion_pct'] == pytest.approx(esperado)
+    assert 0.0 < m['exposicion_pct'] <= 100.0
+
+
+def test_exposicion_por_tramo_recorta_el_trade_a_caballo():
+    # Un trade que entra en IS y sale en OOS ocupa tiempo real en los dos
+    # tramos, así que su intervalo se recorta a la ventana en vez de asignarse
+    # entero al tramo de su vela de entrada (que es como se cuentan los trades).
+    n = 20
+    o, h, l, c = _ohlc_plano(n)
+    o[14] = 110.0
+    s = _senales_vacias(n)
+    s['entradas_long'][7] = True     # entra en t=8 (IS)
+    s['salidas_long'][13] = True     # sale en t=14 (OOS)
+    r = simular(o, h, l, c, s, CONFIG_BASE)
+    corte = 10
+    assert r['trades']['idx_entrada'][0] == 8 and r['trades']['idx_salida'][0] == 14
+    m_is = calcular_metricas(r, 0, corte)
+    m_oos = calcular_metricas(r, corte, n)
+    assert m_is['n_trades'] == 1 and m_oos['n_trades'] == 0   # se cuenta en IS
+    assert m_is['exposicion_pct'] == pytest.approx(2 / 10 * 100)    # velas 8,9
+    assert m_oos['exposicion_pct'] == pytest.approx(5 / 10 * 100)   # velas 10..14
+
+
+def test_retorno_ajustado_por_exposicion():
+    n = 20
+    o, h, l, c = _ohlc_plano(n)
+    o[6] = 110.0
+    s = _senales_vacias(n)
+    s['entradas_long'][2] = True
+    s['salidas_long'][5] = True
+    r = simular(o, h, l, c, s, CONFIG_BASE)
+    m = calcular_metricas(r, velas_por_anio=252)
+    assert m['retorno_ajustado_exposicion_pct'] == pytest.approx(
+        m['retorno_anual_pct'] / m['exposicion_pct'] * 100.0)
+    # sin anualizar no hay retorno anual que ajustar
+    assert calcular_metricas(r)['retorno_ajustado_exposicion_pct'] is None
+    # sin trades no hay exposición: ni ratio ni división por cero
+    vacio = simular(o, h, l, c, _senales_vacias(n), CONFIG_BASE)
+    m_vacio = calcular_metricas(vacio, velas_por_anio=252)
+    assert m_vacio['exposicion_pct'] == 0.0
+    assert m_vacio['retorno_ajustado_exposicion_pct'] is None
+
+
+def test_capital_comprometido_cae_a_la_mitad_tras_una_parcial():
+    # Lo que la exposición en tiempo no puede distinguir: tras cerrar el 50%
+    # sigues "dentro" las mismas velas, pero con la mitad del capital en juego.
+    n = 12
+    o, h, l, c = _ohlc_plano(n)
+    s = _senales_vacias(n)
+    s['entradas_long'][2] = True
+    s['salidas_long'][5] = True
+    r = simular(o, h, l, c, s, _cfg_parciales(
+        [{'pct': 50.0, 'r': 0.0, 'trigger': 'senal', 'condiciones': []},
+         {'pct': 50.0, 'r': 0.0, 'trigger': 'senal', 'condiciones': []}],
+        salida_n_velas=6))
+    et = r['exposicion_track']
+    assert et[1] == 0.0                                  # antes de entrar
+    assert et[5] > 0.0
+    assert et[6] == pytest.approx(et[5] / 2, rel=1e-3)   # parcial del 50% en t=6
+    assert et[10] == 0.0                                 # ya cerrada del todo
+    m = calcular_metricas(r)
+    assert 0.0 < m['exposicion_capital_pct'] < m['exposicion_pct']
+
+
+def test_metricas_de_exposicion_con_trades_armados_a_mano():
+    # Sin 'exposicion_track' (dicts construidos fuera de simular) la métrica de
+    # capital queda en None, pero la de tiempo se calcula igual: solo necesita
+    # los índices de entrada y salida.
+    equity = np.full(20, 10000.0)
+    trades = {
+        'idx_entrada': np.array([2, 10]), 'idx_salida': np.array([5, 12]),
+        'pnl': np.array([100.0, -50.0]), 'ret_pct': np.array([0.01, -0.005]),
+        'r_multiple': np.array([1.0, -1.0]),
+        'notional_redondo': np.array([20000.0] * 2),
+        'costo_comision': np.array([10.0] * 2),
+    }
+    m = calcular_metricas({'equity': equity, 'trades': trades,
+                           'drawdown': np.zeros(20), 'capital_final': 10000.0,
+                           'n_trades': 2})
+    assert m['exposicion_capital_pct'] is None
+    # velas 2..5 (4) + 10..12 (3) = 7 de 20
+    assert m['exposicion_pct'] == pytest.approx(7 / 20 * 100)
 
 
 def test_walk_forward_ventanas():
@@ -1532,3 +1823,100 @@ def test_backtest_completo_con_estrategia():
     assert m['pnl_total'] > 0   # tendencia alcista clara: el cruce long gana
     assert np.isfinite(r['equity']).all()
     assert (r['drawdown'] <= 0).all()
+
+
+# ── resultado_filtrado: segmentación por dirección ──
+
+def _resultado_dos_lados():
+    """Simulación con largos y cortos alternados, para los tests de filtrado."""
+    n = 60
+    c = 100.0 + (np.arange(n) % 10).astype(float)
+    o = c.copy()
+    h = c + 1.0
+    l = c - 1.0
+    s = _senales_vacias(n)
+    for k in range(5):
+        s['entradas_long'][2 + k * 10] = True
+        s['salidas_long'][6 + k * 10] = True
+        s['entradas_short'][7 + k * 10] = True
+        s['salidas_short'][9 + k * 10] = True
+    r = simular(o, h, l, c, s, CONFIG_BASE)
+    tr = r['trades']
+    assert (tr['dir'] > 0).any() and (tr['dir'] < 0).any()   # el fixture sirve
+    return r
+
+
+def test_resultado_filtrado_sin_direccion_conserva_los_trades():
+    r = _resultado_dos_lados()
+    f = resultado_filtrado(r, 0)
+    assert f['n_trades'] == r['n_trades']
+    assert f['trades']['pnl'].sum() == pytest.approx(r['trades']['pnl'].sum())
+    assert (f['trades']['idx_original'] == np.arange(r['n_trades'])).all()
+
+
+def test_resultado_filtrado_parte_los_dos_lados_sin_perder_trades():
+    r = _resultado_dos_lados()
+    largos = resultado_filtrado(r, 1)
+    cortos = resultado_filtrado(r, -1)
+    assert largos['n_trades'] + cortos['n_trades'] == r['n_trades']
+    assert (largos['trades']['dir'] > 0).all()
+    assert (cortos['trades']['dir'] < 0).all()
+    # idx_original apunta de verdad al trade del resultado sin filtrar
+    for f in (largos, cortos):
+        assert (r['trades']['pnl'][f['trades']['idx_original']]
+                == pytest.approx(f['trades']['pnl']))
+
+
+def test_resultado_filtrado_reconstruye_la_equity_componiendo_retornos():
+    r = _resultado_dos_lados()
+    cap0 = CONFIG_BASE['capital_inicial']
+    f = resultado_filtrado(r, 1, cap0)
+    tr = f['trades']
+    orden = np.argsort(tr['idx_salida'], kind='stable')
+    esperado = cap0 * np.prod(1.0 + tr['ret_pct'][orden])
+    assert f['equity'][0] == pytest.approx(cap0)          # arranca en el capital
+    assert f['capital_final'] == pytest.approx(esperado)
+    assert f['equity'][-1] == pytest.approx(esperado)
+    # escalonada: solo cambia de valor en velas de salida de un trade filtrado
+    saltos = np.nonzero(np.diff(f['equity']))[0] + 1
+    assert set(saltos.tolist()) <= set(tr['idx_salida'].tolist())
+    assert (f['drawdown'] <= 0).all()
+
+
+def test_resultado_filtrado_no_solapa_la_exposicion_de_cada_lado():
+    # el motor mantiene una sola posición a la vez, así que las velas en
+    # mercado de un lado y las del otro son conjuntos disjuntos
+    r = _resultado_dos_lados()
+    n = len(r['equity'])
+    expo = lambda d: calcular_metricas(resultado_filtrado(r, d), 0, n)['exposicion_pct']
+    assert expo(1) + expo(-1) == pytest.approx(expo(0))
+
+
+def test_resultado_filtrado_lado_sin_trades_no_rompe_las_metricas():
+    n = 20
+    o, h, l, c = _ohlc_plano(n)
+    s = _senales_vacias(n)
+    s['entradas_long'][2] = True
+    s['salidas_long'][5] = True
+    r = simular(o, h, l, c, s, CONFIG_BASE)
+    f = resultado_filtrado(r, -1, CONFIG_BASE['capital_inicial'])
+    assert f['n_trades'] == 0
+    assert (f['equity'] == CONFIG_BASE['capital_inicial']).all()   # curva plana
+    m = calcular_metricas(f, 0, n)
+    assert m['n_trades'] == 0
+    assert m['retorno_pct'] == pytest.approx(0.0)
+    assert m['win_rate'] is None
+    assert m['exposicion_pct'] == pytest.approx(0.0)
+
+
+def test_resultado_filtrado_respeta_la_ventana_is_oos():
+    r = _resultado_dos_lados()
+    n = len(r['equity'])
+    corte = dividir_is_oos(n)
+    f = resultado_filtrado(r, 1)
+    tr = f['trades']
+    is_ = calcular_metricas(f, 0, corte)
+    oos = calcular_metricas(f, corte, n)
+    assert is_['n_trades'] == int((tr['idx_entrada'] < corte).sum())
+    assert oos['n_trades'] == int((tr['idx_entrada'] >= corte).sum())
+    assert is_['n_trades'] + oos['n_trades'] == f['n_trades']

@@ -1,11 +1,14 @@
-import os, json, re, glob
+import os, json, re, glob, pickle
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                              QLabel, QComboBox, QFrame, QFileDialog, QTextBrowser,
-                             QTabWidget, QProgressBar, QScrollArea, QSizePolicy, QMessageBox)
+                             QTabWidget, QProgressBar, QScrollArea, QSizePolicy,
+                             QMessageBox, QStackedWidget)
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont, QColor
 from gui.widgets.pdf_viewer import PdfViewer
 from gui.widgets.tab_patrones import TabPatrones
+from gui.widgets.analisis_graficos import GraficosAnalisis
+from gui.widgets.analisis_tarjetas import TarjetasKPI
 from core.config import tf_to_minutes
 
 STYLE_ANALISIS = """
@@ -63,6 +66,29 @@ QTabBar::tab:selected { background-color: #0d1424; color: #4fc3f7; font-weight: 
 QFrame#sep { background-color: #253a60; max-height: 1px; }
 QScrollArea { border: none; background: transparent; }
 QScrollArea > QWidget > QWidget { background: transparent; }
+QGroupBox {
+    background-color: #141e30; border: 1px solid #253a60;
+    border-radius: 6px; margin-top: 0px; padding: 10px;
+}
+QLabel#titulo { color: #4fc3f7; font-size: 12px; font-weight: bold; }
+QLabel#avisoLegacy {
+    background-color: #2a2416; color: #d4a03a;
+    border: 1px solid #4a3a1a; border-radius: 4px;
+    padding: 6px 10px; font-size: 11px;
+}
+QTableWidget {
+    background-color: #0d1424; color: #c8d6e5; gridline-color: #253a60;
+    border: 1px solid #253a60; font-size: 11px;
+}
+QToolTip {
+    background-color: #101a2e; color: #c8d6e5;
+    border: 1px solid #253a60; border-radius: 4px;
+    padding: 6px; font-size: 11px;
+}
+QHeaderView::section {
+    background-color: #1a2a45; color: #8fb3d9; border: none;
+    border-right: 1px solid #253a60; padding: 4px; font-size: 10px; font-weight: bold;
+}
 """
 
 _ANSI_RE = re.compile(r'\033\[([\d;]+)m')
@@ -263,6 +289,7 @@ class TabAnalisis(QWidget):
         self._page_map = None
         self._metrics_path = None
         self._all_metrics = None
+        self._bundle = None
         self._ticker = ''
         self._tf = ''
         self._csv_path = None
@@ -329,14 +356,47 @@ class TabAnalisis(QWidget):
         self.inner_tabs = QTabWidget()
         self.inner_tabs.setDocumentMode(True)
 
+        # ── Metricas: tarjetas KPI arriba, categorias completas debajo ──
+        pagina_metricas = QWidget()
+        lay_metricas = QVBoxLayout(pagina_metricas)
+        lay_metricas.setContentsMargins(20, 14, 20, 0)
+        lay_metricas.setSpacing(8)
+        self.kpi_cards = TarjetasKPI()
+        self.kpi_cards.setVisible(False)
+        lay_metricas.addWidget(self.kpi_cards)
         self.metrics_scroll = MetricsScroll()
-        self.inner_tabs.addTab(self.metrics_scroll, "  Metricas  ")
+        lay_metricas.addWidget(self.metrics_scroll, 1)
+        self.inner_tabs.addTab(pagina_metricas, "  Metricas  ")
 
+        # ── Graficos: nativos si el analisis trae datos, visor PDF si no ──
+        # Los informes generados antes de esta version solo tienen el PDF; en
+        # ese caso se sigue mostrando el visor de siempre con un aviso, en vez
+        # de dejar la pestana vacia.
+        self.graphs_stack = QStackedWidget()
+
+        self.graphs_native = GraficosAnalisis()
+        self.graphs_stack.addWidget(self.graphs_native)          # indice 0
+
+        pagina_pdf = QWidget()
+        lay_pdf = QVBoxLayout(pagina_pdf)
+        lay_pdf.setContentsMargins(0, 0, 0, 0)
+        lay_pdf.setSpacing(6)
+        self.lbl_legacy = QLabel(
+            "Este analisis se genero con una version anterior: se muestran las "
+            "paginas del PDF. Vuelve a analizar el activo para ver los graficos "
+            "interactivos.")
+        self.lbl_legacy.setObjectName("avisoLegacy")
+        self.lbl_legacy.setWordWrap(True)
+        lay_pdf.addWidget(self.lbl_legacy)
         self.graphs_viewer = PdfViewer()
-        self.inner_tabs.addTab(self.graphs_viewer, "  Graficos  ")
+        lay_pdf.addWidget(self.graphs_viewer, 1)
+        self.graphs_stack.addWidget(pagina_pdf)                   # indice 1
+
+        self.graphs_stack.setCurrentIndex(1)
+        self.inner_tabs.addTab(self.graphs_stack, "  Graficos  ")
 
         self.patterns_tab = TabPatrones()
-        self.inner_tabs.addTab(self.patterns_tab, "  Patrones  ")
+        self.inner_tabs.addTab(self.patterns_tab, "  Patrones de velas  ")
 
         layout.addWidget(self.inner_tabs, 1)
 
@@ -400,6 +460,9 @@ class TabAnalisis(QWidget):
         # El visor es adaptativo: al cambiar la Ventana solo se muestran las
         # páginas generales + las etiquetadas con el horizonte seleccionado.
         self._aplicar_filtro_paginas()
+        horizon = self.horizon.currentText() if self.horizon else 'General'
+        self.graphs_native.set_horizonte(horizon)
+        self.kpi_cards.set_horizonte(horizon)
 
     def _aplicar_filtro_paginas(self):
         if not self._pdf_path:
@@ -499,7 +562,7 @@ class TabAnalisis(QWidget):
         # archivo queda bloqueado mientras el visor lo tiene abierto.
         self.graphs_viewer.load(None)
 
-        for f in (pdf_cand, metrics_cand):
+        for f in (pdf_cand, metrics_cand, self._ruta_bundle(pdf_cand)):
             if f and os.path.exists(f):
                 try:
                     os.remove(f)
@@ -534,11 +597,57 @@ class TabAnalisis(QWidget):
         if isinstance(self._all_metrics, dict):
             self._page_map = self._all_metrics.pop('_paginas', None)
 
+        self._bundle = self._cargar_bundle(self._pdf_path)
+        horizon = self.horizon.currentText() if self.horizon else 'General'
+        self.kpi_cards.cargar(self._bundle, horizon)
+
         self._render_metrics()
+
+        if self._bundle is not None:
+            self.graphs_stack.setCurrentIndex(0)
+            # graphs_native.cargar() dibuja TODAS sus secciones de golpe y se
+            # asegura de que toda la cadena de pestañas antecesoras (esta
+            # misma, la de MainWindow...) esté realmente visible mientras
+            # dibuja, para que Qt le dé a cada canvas su ancho final — ver
+            # GraficosAnalisis._pintar_todo / _asegurar_cadena_visible.
+            self.graphs_native.cargar(self._bundle, horizon)
+            # Liberar el PDF del visor: mientras QPdfDocument lo tenga abierto,
+            # Windows no deja borrarlo ni sobrescribirlo en el próximo análisis.
+            self.graphs_viewer.load(None)
+        else:
+            self.graphs_stack.setCurrentIndex(1)
+            if self._pdf_path:
+                self.graphs_viewer.load(self._pdf_path)
+                self._aplicar_filtro_paginas()
+
         if self._pdf_path:
-            self.graphs_viewer.load(self._pdf_path)
-            self._aplicar_filtro_paginas()
             self.inner_tabs.setCurrentIndex(0)
+
+    def _ruta_bundle(self, pdf_path):
+        """Sidecar de datos de gráficos que acompaña a un PDF de análisis."""
+        if not pdf_path:
+            return None
+        if pdf_path.endswith('.pdf'):
+            return pdf_path[:-4] + '.plotdata.pkl'
+        return None
+
+    def _cargar_bundle(self, pdf_path):
+        ruta = self._ruta_bundle(pdf_path)
+        if not ruta or not os.path.exists(ruta):
+            return None
+        try:
+            with open(ruta, 'rb') as f:
+                bundle = pickle.load(f)
+        except Exception:
+            import traceback
+            print(f"[ERROR tab_analisis] no se pudo leer {ruta}:", flush=True)
+            traceback.print_exc()
+            return None
+        if not isinstance(bundle, dict) or bundle.get('_version') != 1:
+            print(f"[DEBUG tab_analisis] bundle ignorado (version incompatible): {ruta}",
+                  flush=True)
+            return None
+        return bundle
 
     def _render_metrics(self):
         if not self._all_metrics:

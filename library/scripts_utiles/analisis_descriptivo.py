@@ -25,6 +25,7 @@ import subprocess
 import re
 import math
 import io
+import pickle
 import time
 import traceback
 import warnings
@@ -669,7 +670,16 @@ if __name__ == "__main__":
     bloques_dd       = (en_drawdown != en_drawdown.shift()).cumsum()
     duraciones_velas = en_drawdown.groupby(bloques_dd).sum()
     duraciones_velas = duraciones_velas[duraciones_velas > 0]
-    
+
+    # Piezas sueltas de la recuperación, que la tarjeta de Max Drawdown de la
+    # GUI muestra por separado (no puede reaprovechar `recovery_str`, que ya
+    # viene formateado en una línea para la tabla del PDF). Se inicializan aquí
+    # porque las ramas de abajo no siempre llegan a definirlas: sin drawdown, o
+    # con archivos de TICKS que no tienen temporalidad.
+    duracion_str = None
+    rango_fechas_str = None
+    dd_recuperado = None   # True recuperado · False sigue en DD · None sin DD
+
     if len(duraciones_velas) > 0:
         # El bloque a reportar es el del DRAWDOWN MAS PROFUNDO (el mismo que
         # produce `mdd` en el PASO 2), no el de mayor DURACION — si no, el
@@ -689,7 +699,8 @@ if __name__ == "__main__":
     
             # Fecha de RECUPERACIÓN COMPLETA: la primera vela donde el precio vuelve a superar (o igualar) el pico anterior.
             pos_ultima_en_dd = df.index.get_loc(indices_bloque[-1])
-            if pos_ultima_en_dd + 1 < len(df.index):
+            dd_recuperado = pos_ultima_en_dd + 1 < len(df.index)
+            if dd_recuperado:
                 ts_recuperado = df.index[pos_ultima_en_dd + 1]
             else:
                 ts_recuperado = indices_bloque[-1]  # aún no recuperado al final de los datos
@@ -2106,6 +2117,41 @@ if __name__ == "__main__":
             print(f"Generado página {n_visible}/{TOTAL_PAGINAS_VISIBLES} — {titulo}")
             sys.stdout.flush()
 
+    # ── Bundle de datos para los gráficos nativos de la GUI ──
+    # La GUI dibuja las mismas figuras que este PDF, pero con matplotlib
+    # embebido en Qt. Los datos de cada gráfico se calculan DENTRO de su
+    # bloque de dibujo (decimados, agregados, con outliers recortados...), así
+    # que en vez de recalcularlos aparte cada región va guardando en _PLOT el
+    # array que acaba de plotear: la GUI dibuja exactamente lo mismo que el PDF
+    # sin volver a pasar por el motor de análisis.
+    #
+    # Regla del formato: SOLO numpy / list / dict / str / float / int / bool,
+    # nunca objetos pandas. El pickle lo lee otro proceso (la GUI) y no
+    # queremos acoplar el formato del archivo a la versión de pandas instalada.
+    # Las claves tupla (pares de TF) se serializan como "tf_a/tf_b".
+    _EXPORTAR_PLOT = 'GUI_PLOTDATA_OUTPUT' in os.environ
+    _PLOT = {
+        '_version': 1,
+        '_meta': {
+            'nombre': CONFIG['nombre'],
+            'tf': CONFIG['tf'],
+            'activo': CONFIG['activo'],
+            'archivo': os.path.basename(CONFIG['input_path']),
+            'es_datetime_valido': bool(es_datetime_valido),
+            'horizontes': list(HORIZON_NAMES),
+        },
+    }
+
+    def _arr(x):
+        """Serie/Index/array de pandas → np.ndarray desligado de pandas."""
+        return np.asarray(getattr(x, 'values', x))
+
+    def _eje(idx):
+        """Eje X: DatetimeIndex → datetime64[ns]; cualquier otra cosa → array."""
+        if es_datetime_valido and isinstance(idx, pd.DatetimeIndex):
+            return np.asarray(idx, dtype='datetime64[ns]')
+        return np.asarray(getattr(idx, 'values', idx))
+
     _pdf_buffer = io.BytesIO()
     with PdfPages(_pdf_buffer) as pdf:
     
@@ -2339,7 +2385,17 @@ if __name__ == "__main__":
                 ax1.axvline(y, color='#444', linewidth=0.4, alpha=0.4)
                 ax2.axvline(y, color='#444', linewidth=0.4, alpha=0.4)
                 ax3.axvline(y, color='#444', linewidth=0.4, alpha=0.4)
-    
+
+        if _EXPORTAR_PLOT:
+            _PLOT['precio_equity'] = {
+                'x': _eje(eje_x_plot),
+                'close': _arr(df_plot['close']),
+                'sma': (_arr(df_plot['SMA_Regimen'])
+                        if 'SMA_Regimen' in df_plot.columns else None),
+                'equity': _arr(equity_plot),
+                'dd_pct': _arr(dd_plot) * 100,
+            }
+
         pdf.savefig(fig, facecolor=fig.get_facecolor(), dpi=150)
         plt.close()
         _registrar_pagina('Precio, Equity y Underwater')
@@ -2391,6 +2447,15 @@ if __name__ == "__main__":
                              f'{h:.1f}%', ha='center',
                              va='bottom' if h > 0 else 'top',
                              color='white', fontsize=8)
+
+            if _EXPORTAR_PLOT:
+                _PLOT['estacionalidad'] = {
+                    'disponible': True,
+                    'meses_labels': [str(i) for i in mes_plot.index],
+                    'meses': _arr(mes_plot).astype(float),
+                    'dias_labels': [str(i) for i in dia_plot.index],
+                    'dias': _arr(dia_plot).astype(float),
+                }
         else:
             ax = fig.add_subplot(111)
             ax.axis('off')
@@ -2401,6 +2466,8 @@ if __name__ == "__main__":
                     "por lo que no es posible agrupar los retornos por mes o día de la semana.",
                     ha='center', va='center', fontsize=12, color='#888780',
                     transform=ax.transAxes)
+            if _EXPORTAR_PLOT:
+                _PLOT['estacionalidad'] = {'disponible': False}
     
         pdf.savefig(fig, facecolor=fig.get_facecolor())
         plt.close()
@@ -2522,6 +2589,28 @@ if __name__ == "__main__":
                 for spine in ax_e.spines.values():
                     spine.set_edgecolor('#21262d')
 
+                if _EXPORTAR_PLOT:
+                    _PLOT.setdefault('regimen_er', {})[_h] = {
+                        # panel superior: precio coloreado por régimen ER
+                        'x': (_eje(df_sub_h.index) if es_datetime_valido
+                              else np.arange(len(df_sub_h))),
+                        'close': _arr(df_sub_h['close']).astype(float),
+                        'er': _arr(er_sub_h).astype(float),
+                        'kama': (_arr(kama_h['serie'].iloc[::step_h]).astype(float)
+                                 if kama_h is not None else None),
+                        'kama_fast': (kama_h['fast'] if kama_h is not None else None),
+                        'kama_slow': (kama_h['slow'] if kama_h is not None else None),
+                        # panel inferior: histórico ER + SMA 200
+                        'x_er': (_eje(df.index[::step_h]) if es_datetime_valido
+                                 else np.arange(len(df))[::step_h]),
+                        'er_hist': np.asarray(er_plot_h, dtype=float),
+                        'er_sma': _arr(er_suav_h.iloc[::step_h]).astype(float),
+                        'periodo': eh['periodo'],
+                        'umbrales': {k: float(v) for k, v in u_h.items()},
+                        'hurst_ventana': (hh['ventana'] if hh else None),
+                        'hurst_medio': (float(hh['serie'].mean()) if hh else None),
+                    }
+
                 pdf.savefig(fig, facecolor=fig.get_facecolor(), dpi=150)
                 plt.close()
                 _registrar_pagina(f'Precio por régimen ER — {_h}', horizonte=_h)
@@ -2596,7 +2685,37 @@ if __name__ == "__main__":
             for spine in ax3.spines.values(): spine.set_edgecolor('#333')
             ax3.text(0.98, 0.05, f"R² ajuste: {r_sq:.4f}", transform=ax3.transAxes, ha='right', va='bottom',
                      fontsize=7, color='#888780', fontweight='bold')
-    
+
+            if _EXPORTAR_PLOT:
+                # Las etiquetas "1 c/Xd" de cada sigma salen de la frecuencia
+                # empírica en r_diario_real. Se precalculan aquí (son 6 puntos)
+                # en vez de exportar la serie entera y repetir la lógica de
+                # es_anual en la GUI.
+                _factor_anual = 365 if CONFIG['activo'] == 'CRYPTO' else 252
+
+                def _probs_campana(media, std, es_anual):
+                    out = {}
+                    for s in sigmas:
+                        for lado in (-1, 1):
+                            val = media + (lado * s * std)
+                            ref = val / np.sqrt(_factor_anual) if es_anual else val
+                            prob = (np.mean(r_diario_real <= ref) if lado == -1
+                                    else np.mean(r_diario_real >= ref))
+                            out[str(lado * s)] = {'val': float(val), 'prob': float(prob)}
+                    return out
+
+                _PLOT['riesgo_dia_anual'] = {
+                    'diario': {'media': float(ret_diario), 'std': float(vol_diaria),
+                               'sigmas': _probs_campana(ret_diario, vol_diaria, False)},
+                    'anual': {'media': float(ret_anual), 'std': float(vol_anual),
+                              'sigmas': _probs_campana(ret_anual, vol_anual, True),
+                              'factor_anual': int(_factor_anual)},
+                    'qq': {'osm': np.asarray(osm, dtype=float),
+                           'osr': np.asarray(osr, dtype=float),
+                           'slope': float(slope), 'intercept': float(intercept),
+                           'r_sq': float(r_sq)},
+                }
+
             pdf.savefig(fig, facecolor=fig.get_facecolor(), dpi=150)
             plt.close()
             _registrar_pagina('Riesgo Diario/Anual + QQ-Plot')
@@ -2704,7 +2823,42 @@ if __name__ == "__main__":
             ax3.grid(True, alpha=0.15, color='#444')
             ax3.legend(facecolor='#222', labelcolor='white', fontsize=6, loc='lower left')
             for spine in ax3.spines.values(): spine.set_edgecolor('#333')
-    
+
+            if _EXPORTAR_PLOT:
+                _sigmas_vela = {}
+                for _s in sigmas:
+                    for _lado in (-1, 1):
+                        _val = r_media + (_lado * _s * r_std)
+                        _prob = (np.mean(r <= _val) if _lado == -1 else np.mean(r >= _val))
+                        _sigmas_vela[str(_lado * _s)] = {'val': float(_val), 'prob': float(_prob)}
+
+                _vars = {}
+                for _conf, _z in ((0.95, 1.645), (0.99, 2.326)):
+                    _val_var = (r_media - _z * r_std if es_normal_p6
+                                else np.percentile(r, (1 - _conf) * 100))
+                    _vars[str(_conf)] = {'val': float(_val_var),
+                                         'prob': float(np.mean(r <= _val_var))}
+
+                _rolling = None
+                if 'r_var95' in locals() and len(r) > rolling_window * 2:
+                    _rolling = {
+                        'x': (_eje(r_var95.index[::paso_rolling]) if es_datetime_valido
+                              else np.arange(len(r_var95))[::paso_rolling]),
+                        'var95_pct': _arr(r_var95.iloc[::paso_rolling]).astype(float) * 100,
+                        'var99_pct': _arr(r_var99.iloc[::paso_rolling]).astype(float) * 100,
+                        'etiqueta_ventana': etiqueta_ventana,
+                    }
+
+                _PLOT['riesgo_intradia'] = {
+                    'media': float(r_media), 'std': float(r_std),
+                    'sigmas': _sigmas_vela,
+                    'var': _vars,
+                    'es_normal': bool(es_normal_p6),
+                    'p05_pct': float(p05_r) * 100,
+                    'p01_pct': float(p01_r) * 100,
+                    'rolling': _rolling,
+                }
+
             pdf.savefig(fig, facecolor=fig.get_facecolor(), dpi=150)
             plt.close()
             _registrar_pagina('Riesgo Intradiario + Rolling VaR')
@@ -2872,7 +3026,24 @@ if __name__ == "__main__":
                            labelcolor='#888780', framealpha=0.3)
                 for spine in ax2.spines.values(): spine.set_edgecolor('#333')
 
+                if _EXPORTAR_PLOT:
+                    _PLOT['perfil_horario'] = {
+                        'disponible': True,
+                        # bxp_stats se pasa tal cual a ax.bxp() en la GUI
+                        'bxp': [{'med': float(s['med']), 'q1': float(s['q1']),
+                                 'q3': float(s['q3']), 'whislo': float(s['whislo']),
+                                 'whishi': float(s['whishi']), 'mean': float(s['mean']),
+                                 'fliers': np.asarray(s['fliers'], dtype=float),
+                                 'n': int(s['n'])} for s in bxp_stats],
+                        'medias': np.asarray(hourly_means, dtype=float),
+                        'n_por_hora': np.asarray(hourly_n, dtype=int),
+                        'vol_media_total': float(total_avg_vol),
+                        'ret_por_hora': np.asarray(vals, dtype=float),
+                    }
+
             else:
+                if _EXPORTAR_PLOT:
+                    _PLOT['perfil_horario'] = {'disponible': False}
                 ax = fig.add_subplot(111)
                 ax.axis('off')
                 ax.set_facecolor('#111111')
@@ -2928,6 +3099,11 @@ if __name__ == "__main__":
                 vmin, vmax = cbar.mappable.get_clim()
                 cbar.set_ticks([vmin, (vmin+vmax)/2, vmax])
                 cbar.ax.yaxis.set_major_formatter(mticker.FormatStrFormatter('%.2f'))
+                if _EXPORTAR_PLOT:
+                    _PLOT['corr_24'] = {
+                        'm': corr_24.values.astype(float),
+                        'labels': [str(c) for c in corr_24.columns],
+                    }
             else:
                 ax = fig.add_subplot(111)
                 ax.axis('off')
@@ -2989,6 +3165,13 @@ if __name__ == "__main__":
                     vmin1, vmax1 = cbar1.mappable.get_clim()
                     cbar1.set_ticks([vmin1, (vmin1+vmax1)/2, vmax1])
                     cbar1.ax.yaxis.set_major_formatter(mticker.FormatStrFormatter('%.2f'))
+                    if _EXPORTAR_PLOT:
+                        _PLOT.setdefault('heatmaps', {})['week'] = {
+                            'm': pw.values.astype(float),
+                            'filas': [str(i) for i in pw.index],
+                            'cols': [str(c) for c in pw.columns],
+                            'vmax': float(vmax_pw),
+                        }
                 else:
                     ax1.text(0.5, 0.5, "No disponible", ha='center', va='center', fontsize=11, color='#888780', transform=ax1.transAxes)
                 for spine in ax1.spines.values(): spine.set_edgecolor('#333')
@@ -3024,6 +3207,13 @@ if __name__ == "__main__":
                     vmin2, vmax2 = cbar2.mappable.get_clim()
                     cbar2.set_ticks([vmin2, (vmin2+vmax2)/2, vmax2])
                     cbar2.ax.yaxis.set_major_formatter(mticker.FormatStrFormatter('%.2f'))
+                    if _EXPORTAR_PLOT:
+                        _PLOT.setdefault('heatmaps', {})['month'] = {
+                            'm': pm.values.astype(float),
+                            'filas': [str(i) for i in pm.index],
+                            'cols': [str(c) for c in pm.columns],
+                            'vmax': float(vmax_pm),
+                        }
                 else:
                     ax2.text(0.5, 0.5, "No disponible", ha='center', va='center', fontsize=11, color='#888780', transform=ax2.transAxes)
                 for spine in ax2.spines.values(): spine.set_edgecolor('#333')
@@ -3122,6 +3312,24 @@ if __name__ == "__main__":
                 ax_bot.text(0.5, 0.5, "No hay pares disponibles para el TF base actual.",
                             ha='center', va='center', fontsize=10, color='#888780', transform=ax_bot.transAxes)
 
+            if _EXPORTAR_PLOT:
+                _tiene_corr_natr = (_NATR_CORR is not None and not _NATR_CORR.empty
+                                    and _NATR_CORR.shape[0] >= 2)
+                _PLOT['natr_multitf'] = {
+                    'corr': (_NATR_CORR.values.astype(float) if _tiene_corr_natr else None),
+                    'labels': ([str(c) for c in _NATR_CORR.columns] if _tiene_corr_natr else []),
+                    'pares': [{
+                        'horizonte': h_name,
+                        'pair': str(pd_pair['pair']),
+                        'natr_base': float(pd_pair['natr_base']),
+                        'natr_target': float(pd_pair['natr_target']),
+                        'ratio': float(pd_pair['ratio']),
+                        'lag': int(pd_pair['lag']),
+                        'lag_unit': str(pd_pair['lag_unit']),
+                        'max_lag': int(pd_pair['max_lag']),
+                    } for h_name, pd_pair in all_pairs],
+                }
+
             plt.subplots_adjust(left=0.08, right=0.95, top=0.94, bottom=0.06)
             pdf.savefig(fig, facecolor=fig.get_facecolor(), dpi=150)
             plt.close()
@@ -3160,12 +3368,18 @@ if __name__ == "__main__":
 
             colores_ruido = ['#e67e22', '#9b59b6', '#3498db', '#2ecc71', '#f1c40f']
             n_simulaciones = 5
+            _walks_export = []
             for i in range(n_simulaciones):
                 rw = np.random.normal(loc=serie.mean(), scale=serie.std(), size=len(serie))
                 precio_ruido_sim = precio_inicial * np.exp(np.cumsum(rw))
                 ax4.plot(precio_ruido_sim, color=colores_ruido[i % len(colores_ruido)],
                          linewidth=1.0, alpha=0.65, linestyle='--',
                          label='Random Walk (Ruido)' if i == 0 else None, zorder=2)
+                # Las trayectorias son aleatorias: hay que exportar LAS MISMAS
+                # que se dibujaron, no volver a simularlas en la GUI (saldrían
+                # distintas y el gráfico no coincidiría con el PDF).
+                if _EXPORTAR_PLOT:
+                    _walks_export.append(np.asarray(precio_ruido_sim, dtype=float))
 
             # Línea del activo real más gruesa y por encima (zorder) del
             # resto, para que se note que es la protagonista de la comparativa.
@@ -3199,6 +3413,23 @@ if __name__ == "__main__":
                 ax5.text(0.5, 0.5, "No hay suficientes datos para ACF de retornos²",
                          ha='center', va='center', fontsize=11, color='#888780', transform=ax5.transAxes)
 
+            if _EXPORTAR_PLOT:
+                _tiene_acf_sq = (not np.isnan(clustering_lag1) and len(r_sq_clean) > 30
+                                 and min(20, len(r_sq_clean) // 4 - 1) >= 2)
+                _PLOT['dependencia'] = {
+                    'escalas': {'labels': [str(i) for i in df_heat.index],
+                                'valores': df_heat.values.ravel().astype(float)},
+                    # plot_acf/plot_pacf aceptan un array: la GUI los llama
+                    # sobre esta misma serie diaria (pequeña, ya agregada).
+                    'serie_dia': _arr(series_temporales['dia']).astype(float),
+                    'precio_real': np.asarray(precio_real_sim, dtype=float),
+                    'random_walks': _walks_export,
+                    'acf_sq': (np.asarray(acf_sq_full, dtype=float) if _tiene_acf_sq else None),
+                    'ci': (float(1.96 / np.sqrt(len(r_sq_clean))) if _tiene_acf_sq else None),
+                    'lb_p': (float(clustering_lb_p) if not np.isnan(clustering_lb_p) else None),
+                    'clustering': bool(clustering_presente),
+                }
+
             plt.tight_layout(pad=3.0)
             pdf.savefig(fig)
             plt.close(fig)
@@ -3221,6 +3452,11 @@ if __name__ == "__main__":
                 gs = gridspec.GridSpec(2, 2, hspace=0.40, wspace=0.25,
                                        height_ratios=[1.0, 1.0], left=0.07, right=0.96,
                                        top=0.91, bottom=0.06)
+                # Cada panel va en su propio try (uno puede fallar sin tumbar
+                # la página), así que el bundle se rellena panel a panel y se
+                # asigna al final con lo que haya salido bien.
+                _dash = {'window_z_days': int(window_z_days), 'term': None,
+                         'z': None, 'serie_z': None, 'ratio': None}
 
                 ax_a = fig.add_subplot(gs[0, 0])
                 ax_a.set_facecolor('#111111')
@@ -3248,9 +3484,19 @@ if __name__ == "__main__":
                         if len(natrs_actual) >= 2 and natrs_actual[-1] < natrs_actual[0] * 0.9:
                             ax_a.text(0.98, 0.05, 'BACKWARDACI\u00d3N', transform=ax_a.transAxes,
                                       ha='right', va='bottom', color='#e24b4a', fontsize=8, fontweight='bold')
+                            _estructura = 'BACKWARDACI\u00d3N'
                         else:
                             ax_a.text(0.98, 0.05, 'CONTANGO', transform=ax_a.transAxes,
                                       ha='right', va='bottom', color='#1d9e75', fontsize=8, fontweight='bold')
+                            _estructura = 'CONTANGO'
+                        if _EXPORTAR_PLOT:
+                            _dash['term'] = {
+                                'tfs': [str(t) for t in tfs_disp],
+                                'mins': [float(m) for m in mins],
+                                'actual': [float(v) for v in natrs_actual],
+                                'teorico': [float(v) for v in natrs_teo],
+                                'estructura': _estructura,
+                            }
                     else:
                         ax_a.text(0.5, 0.5, "Sin datos para term structure.", ha='center', va='center',
                                   color='#888780', transform=ax_a.transAxes)
@@ -3284,6 +3530,9 @@ if __name__ == "__main__":
                             ax_b.text(max(z + 0.1, 0.15) if z >= 0 else min(z - 0.1, -0.15),
                                       i, f'{z:+.2f}', va='center', fontsize=6.5, color='white',
                                       ha='left' if z >= 0 else 'right')
+                        if _EXPORTAR_PLOT:
+                            _dash['z'] = {'tfs': [str(t) for t in tfs_z],
+                                          'vals': [float(z) for z in z_vals]}
                     else:
                         ax_b.text(0.5, 0.5, "Sin Z-scores.", ha='center', va='center',
                                   color='#888780', transform=ax_b.transAxes)
@@ -3315,6 +3564,7 @@ if __name__ == "__main__":
                         tfs_plot = [tf for tf in (tf_a_key, tf_b_key) if tf and tf in z_series_h]
                     if tfs_plot:
                         line_colors = ['#4fc3f7', '#ff9900']
+                        _series_z_export = []
                         for i, tf in enumerate(tfs_plot):
                             zs = z_series_h[tf]
                             if len(zs) > 0:
@@ -3322,6 +3572,18 @@ if __name__ == "__main__":
                                 ax_c.plot(zs.index[::step], zs.values[::step],
                                           color=line_colors[i % len(line_colors)],
                                           linewidth=0.9, alpha=0.85, label=tf)
+                                if _EXPORTAR_PLOT:
+                                    _series_z_export.append({
+                                        'tf': str(tf),
+                                        'x': _eje(zs.index[::step]),
+                                        'y': np.asarray(zs.values[::step], dtype=float),
+                                    })
+                        if _EXPORTAR_PLOT and _series_z_export:
+                            _dash['serie_z'] = {
+                                'par': (f'{par_principal[0]}/{par_principal[1]}'
+                                        if par_principal else None),
+                                'series': _series_z_export,
+                            }
                         ax_c.axhline(2, color='#e24b4a', linestyle='--', alpha=0.5, linewidth=0.8)
                         ax_c.axhline(-2, color='#1d9e75', linestyle='--', alpha=0.5, linewidth=0.8)
                         ax_c.legend(loc='upper right', fontsize=7, framealpha=0.3, labelcolor='#888780')
@@ -3347,6 +3609,7 @@ if __name__ == "__main__":
                     ratio_bb_h = _NATR_RATIO_BB.get(horizon_name, {})
                     if ratio_series_h:
                         ratio_colors = ['#4fc3f7', '#ff9900']
+                        _ratio_export = []
                         for i, ((tf_a, tf_b), ratio_s) in enumerate(ratio_series_h.items()):
                             bb = ratio_bb_h.get((tf_a, tf_b), {})
                             step = max(1, len(ratio_s) // 500)
@@ -3355,6 +3618,11 @@ if __name__ == "__main__":
                             color_r = ratio_colors[i % len(ratio_colors)]
                             ax_d.plot(x, y, color=color_r, linewidth=0.9, alpha=0.85,
                                       label=f'{tf_a}/{tf_b}')
+                            # clave tupla → "tf_a/tf_b" (el bundle no admite tuplas)
+                            _r_item = {'label': f'{tf_a}/{tf_b}',
+                                       'x': _eje(x) if _EXPORTAR_PLOT else None,
+                                       'y': np.asarray(y, dtype=float) if _EXPORTAR_PLOT else None,
+                                       'bb': None}
                             if bb.get('upper') is not None and len(bb['upper']) > 0:
                                 mu_b = bb['mean'].dropna()
                                 up = bb['upper'].dropna()
@@ -3365,8 +3633,21 @@ if __name__ == "__main__":
                                                   color=color_r, alpha=0.10)
                                 ax_d.plot(mu_b.index[::step_bb], mu_b.values[::step_bb],
                                           color=color_r, linestyle=':', linewidth=0.6, alpha=0.5)
+                                if _EXPORTAR_PLOT:
+                                    _r_item['bb'] = {
+                                        'x': _eje(mu_b.index[::step_bb]),
+                                        'mu': np.asarray(mu_b.values[::step_bb], dtype=float),
+                                        'lo': np.asarray(lo.values[::step_bb], dtype=float),
+                                        'up': np.asarray(up.values[::step_bb], dtype=float),
+                                    }
                             curr_val = bb.get('current', 0)
                             ax_d.scatter([ratio_s.index[-1]], [curr_val], color=color_r, s=25, zorder=5)
+                            if _EXPORTAR_PLOT:
+                                _r_item['x_actual'] = _eje(pd.Index([ratio_s.index[-1]]))
+                                _r_item['current'] = float(curr_val)
+                                _ratio_export.append(_r_item)
+                        if _EXPORTAR_PLOT and _ratio_export:
+                            _dash['ratio'] = _ratio_export
                         ax_d.legend(loc='upper right', fontsize=6, framealpha=0.3, labelcolor='#888780')
                     else:
                         ax_d.text(0.5, 0.5, "Sin ratios Short/Long disponibles.",
@@ -3380,6 +3661,9 @@ if __name__ == "__main__":
                 for spine in ax_d.spines.values():
                     spine.set_edgecolor('#333')
                 ax_d.grid(True, alpha=0.15, color='#333')
+
+                if _EXPORTAR_PLOT:
+                    _PLOT.setdefault('dashboard_natr', {})[horizon_name] = _dash
 
                 pdf.savefig(fig, facecolor=fig.get_facecolor(), dpi=150)
                 plt.close()
@@ -3433,6 +3717,110 @@ if __name__ == "__main__":
     if 'GUI_PDF_OUTPUT' in os.environ:
         with open(os.environ['GUI_PDF_OUTPUT'], 'w', encoding='utf-8') as f:
             json.dump({'pdf_path': OUTPUT_PDF}, f)
+
+    if _EXPORTAR_PLOT:
+        # ── KPIs numéricos para las tarjetas de la GUI ──
+        # Van aquí y no en el metrics.json porque ese archivo es el contrato de
+        # strings ya formateados (con ANSI y barras) que consume MetricsScroll;
+        # las tarjetas necesitan el número crudo para colorear por umbral.
+        def _f(v):
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                return None
+            return v if math.isfinite(v) else None
+
+        _kpi_por_horizonte = {}
+        for _hz in HORIZON_NAMES:
+            _eh = _ER_H.get(_hz)
+            # HORIZON_HURST_RANGO no define 'General': ahí el Hurst es la serie
+            # base df['hurst'], que es la que muestra la categoría 7. Sin este
+            # respaldo la tarjeta quedaría vacía justo en la Ventana por defecto.
+            _hs = _HURST_H[_hz]['serie'] if _hz in _HURST_H else df['hurst']
+            _kpi_por_horizonte[_hz] = {
+                'er_medio': _f(_eh['serie'].mean()) if _eh else None,
+                'pct_tendencia': _f(_eh.get('pct_tendencia')) if _eh else None,
+                'pct_ruido': _f(_eh.get('pct_ruido')) if _eh else None,
+                'hurst_medio': _f(_hs.mean()),
+                # Contrapeso de pct_tendencia: mismo criterio que la fila
+                # '% Tiempo en mean reversion' de la categoría 7.
+                'pct_reversion': _f((_hs < 0.52).mean()),
+            }
+
+        # Dependencia (ACF/PACF) por escala de calendario — mismo criterio y
+        # mismas funciones (_pacf1, estado_adn) que ya arman la categoría 9 del
+        # informe, para que la tarjeta y la fila de esa categoría coincidan
+        # siempre. Claves PLANAS (no un dict anidado): TarjetasKPI._refrescar
+        # lee kpi['global'] con origen.get(spec['clave']) igual que el resto.
+        _dependencia_kpi = {}
+        for _escala in ('dia', 'semanal', 'mensual', 'trimestral'):
+            _st_dep = stats_temporales.get(_escala, {})
+            _pv = _f(_pacf1(_st_dep)) if _st_dep else None
+            _um = _f(_st_dep.get('umbral')) if _st_dep else None
+            _dependencia_kpi[f'dependencia_{_escala}_pacf1'] = _pv
+            _dependencia_kpi[f'dependencia_{_escala}_umbral'] = _um
+            _dependencia_kpi[f'dependencia_{_escala}_estado'] = (
+                estado_adn(_pv, _um) if (_pv is not None and _um is not None) else None)
+
+        _PLOT['kpi'] = {
+            'global': {
+                'cagr': _f(ret_anual),
+                'sharpe': _f(sharpe),
+                'sortino': _f(sortino),
+                'calmar': _f(calmar_ratio),
+                'max_dd': _f(mdd),
+                'dd_medio': _f(drawdown_medio),
+                'vol_anual': _f(vol_anual),
+                'vol_diaria': _f(vol_diaria),
+                'var95': _f(p05_r),
+                'var99': _f(p01_r),
+                'total_velas': int(len(df)),
+                # ── forma de la distribución ──
+                'kurtosis': _f(r.kurtosis()),
+                'skew': _f(r.skew()),
+                'es_normal': bool(p_jb >= 0.05) if _f(p_jb) is not None else None,
+                'jb_p_value': _f(p_jb),
+                # ── estructura y régimen ──
+                'half_life_velas': _f(half_life_velas),
+                'half_life_dias': _f(half_life_dias),
+                'estacionariedad_precio': veredicto_precio,
+                'estacionariedad_retornos': veredicto_retornos,
+                'clustering_presente': bool(clustering_presente),
+                'clustering_lb_p': _f(clustering_lb_p),
+                'clustering_lag1': _f(clustering_lag1),
+                # ── recuperación del Max Drawdown (tarjeta de la GUI) ──
+                'dd_recuperacion_texto': duracion_str,
+                'dd_recuperacion_rango': rango_fechas_str,
+                'dd_recuperacion_velas': int(recovery_velas_max),
+                'dd_recuperado': dd_recuperado,
+                **_dependencia_kpi,
+            },
+            'por_horizonte': _kpi_por_horizonte,
+        }
+
+        # Mismo patrón .tmp + os.replace que el PDF: el archivo lo lee la GUI en
+        # cuanto el proceso termina, y no debe encontrarse una escritura a medias.
+        _plot_path = os.environ['GUI_PLOTDATA_OUTPUT']
+        _plot_tmp = _plot_path + '.tmp'
+        try:
+            with open(_plot_tmp, 'wb') as f:
+                pickle.dump(_PLOT, f, protocol=4)
+                f.flush()
+                os.fsync(f.fileno())
+            for intento in range(5):
+                try:
+                    os.replace(_plot_tmp, _plot_path)
+                    break
+                except PermissionError:
+                    if intento == 4:
+                        raise
+                    time.sleep(0.3)
+            print(f"📊 Datos de graficos exportados: {_plot_path}")
+        except Exception as e:
+            # Un fallo aquí no debe invalidar el análisis: la GUI simplemente
+            # caerá al visor de PDF como con los informes antiguos.
+            print(f"⚠️  No se pudieron exportar los datos de graficos: {e}")
+            traceback.print_exc()
     
     if 'GUI_METRICS_OUTPUT' not in os.environ:
         carpeta_contenedora = os.path.dirname(OUTPUT_PDF)

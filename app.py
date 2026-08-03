@@ -45,7 +45,82 @@ def _ensure_config():
     dlg = FirstLaunchDialog()
     return dlg.exec() == dlg.DialogCode.Accepted
 
+def _modo_script():
+    """Rama «intérprete» del ejecutable empaquetado.
+
+    Con PyInstaller --onefile no hay ningún python.exe al que llamar para
+    los subprocesos de descarga/importación/análisis: sys.executable es el
+    propio .exe. La GUI lo relanza con «--run-script <ruta>» (ver
+    _comando_script en gui/widgets/console_widget.py) y aquí se ejecuta ese
+    script y se sale, sin llegar a abrir ninguna ventana.
+
+    Devuelve True si se consumió como script (el llamador debe salir)."""
+    if len(sys.argv) < 3 or sys.argv[1] != '--run-script':
+        return False
+    script = sys.argv[2]
+
+    # Con --windowed, PyInstaller puede dejar sys.stdout/stderr a None. El
+    # padre (QProcess) sí nos pasa tuberías válidas en los descriptores 1 y
+    # 2, así que se reabren a mano; sin esto la consola de la GUI se
+    # quedaría vacía. line_buffering para que el progreso llegue en vivo y
+    # no de golpe al terminar.
+    #
+    # La codificación hay que forzarla AQUÍ, en el propio proceso: el
+    # bootloader de PyInstaller arranca Python con una configuración
+    # «isolated» (use_environment = 0), así que el PYTHONIOENCODING que la
+    # GUI mete en el entorno del hijo NO tiene ningún efecto en el .exe
+    # congelado. Sin esto la salida se emite en la codepage ANSI (cp1252) y
+    # el padre, que la decodifica como UTF-8, muestra las tablas con «?» en
+    # los caracteres de caja y «�» en las acentuadas.
+    for nombre, fd in (('stdout', 1), ('stderr', 2)):
+        flujo = getattr(sys, nombre, None)
+        if flujo is None:
+            try:
+                setattr(sys, nombre, os.fdopen(fd, 'w', buffering=1,
+                                               encoding='utf-8', errors='replace'))
+            except OSError:
+                setattr(sys, nombre, open(os.devnull, 'w'))
+        else:
+            try:
+                flujo.reconfigure(encoding='utf-8', errors='replace',
+                                  line_buffering=True)
+            except Exception:
+                # Flujo sin reconfigure() (p. ej. un envoltorio nulo de
+                # PyInstaller): se reenvuelve el búfer binario si lo tiene.
+                try:
+                    import io
+                    setattr(sys, nombre, io.TextIOWrapper(
+                        flujo.buffer, encoding='utf-8', errors='replace',
+                        line_buffering=True))
+                except Exception:
+                    pass
+
+    # La ruta llega calculada contra el _MEIPASS del proceso PADRE; este
+    # proceso tiene el suyo propio, así que si no existe se resuelve por
+    # nombre dentro del paquete de este.
+    if not os.path.exists(script):
+        from core.config import SCRIPTS_DIR
+        alternativa = os.path.join(SCRIPTS_DIR, os.path.basename(script))
+        if os.path.exists(alternativa):
+            script = alternativa
+
+    # runpy.run_path NO añade la carpeta del script a sys.path (a diferencia
+    # de «python script.py»), así que los scripts que importan a un hermano
+    # —p.ej. categorias_comun— no lo encontrarían.
+    carpeta = os.path.dirname(os.path.abspath(script))
+    if carpeta not in sys.path:
+        sys.path.insert(0, carpeta)
+
+    sys.argv = [script] + sys.argv[3:]
+    import runpy
+    runpy.run_path(script, run_name='__main__')
+    return True
+
+
 def main():
+    if _modo_script():
+        return
+
     app_id = "AnalyticsSystemForAssets.App.1"
     try:
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)

@@ -63,8 +63,8 @@ from core.config import (
     velas_a_tiempo_legible, get_finnhub_api_key,
 )
 from core.backtest import (
-    simular, dividir_is_oos, calcular_metricas, montecarlo, MOTIVOS_SALIDA,
-    MECANISMOS_SALIDA,
+    simular, dividir_is_oos, calcular_metricas, montecarlo, resultado_filtrado,
+    MOTIVOS_SALIDA, MECANISMOS_SALIDA,
 )
 from core.optimizer import (
     optimizar_setup, n_combinaciones, LIMITE_COMBOS_DEFECTO, PREFIJO_RIESGO,
@@ -86,6 +86,7 @@ from core.data_providers import economic_calendar
 from gui.widgets.file_explorer import FileExplorer
 from gui.widgets.tf_common import TF_LABELS, parsear_tf_custom, regla_de_tf
 from gui.widgets.lwc_chart import LwcChart, WEBENGINE_OK
+from gui.widgets.plot_common import icono_ayuda as _icono_ayuda_popup
 
 FIG_BG = '#0d1424'
 AX_FG = '#c8d6e5'
@@ -147,7 +148,11 @@ MODOS_EQUITY = [
 MODOS_MFE_MAE = [
     'Eficiencia MFE/MAE',
     'Distribución MFE/MAE',
+    'Eficiencia Entrada/Salida',
 ]
+
+# modos del selector de dirección de la pestaña Resultados (ids del QButtonGroup)
+_MODO_TODOS, _MODO_LARGOS, _MODO_CORTOS, _MODO_COMPARAR = range(4)
 
 RUTA_ESTRATEGIAS_GUARDADAS_LEGACY = os.path.join(LIMPIADOS_DIR, 'backtest_estrategias.json')
 _TIPO_MAP_INV = {v: k for k, v in TIPO_MAP.items()}   # 'CRYPTO' -> 'Crypto'
@@ -573,6 +578,7 @@ class _BacktestThread(QThread):
                                   for s in self._setups],
                 'corte': corte,
                 'n_velas': n,
+                'velas_anio': velas_anio,
                 'wfa': wfa,
                 'montecarlo': mc,
                 'estrategia': ' + '.join(s.get('nombre') or s['plantilla']
@@ -670,6 +676,15 @@ def _fila_ayuda(tooltip):
     fila = QHBoxLayout()
     fila.addStretch()
     fila.addWidget(_icono_ayuda(tooltip))
+    return fila
+
+
+def _fila_ayuda_popup(logica, significado, uso, resultados):
+    """Como _fila_ayuda, pero con el icono_ayuda de plot_common (popup con
+    4 pestañas) — para las secciones de gráficos de Resultados."""
+    fila = QHBoxLayout()
+    fila.addStretch()
+    fila.addWidget(_icono_ayuda_popup(logica, significado, uso, resultados))
     return fila
 
 
@@ -4413,6 +4428,7 @@ _FILAS_METRICAS = [
     (None, '— Curva de capital —', None, None),
     ('r2_equity', 'R² de la equity curve', 3, ''),
     ('dd_promedio_pct', 'Drawdown promedio', 2, ' %'),
+    ('ulcer_index', 'Ulcer Index', 2, ' %'),
     ('tiempo_recuperacion_medio', 'Tiempo recuperación medio', 1, ''),
     ('tiempo_recuperacion_max', 'Tiempo recuperación máx.', 0, ''),
     (None, '— Robustez y costes —', None, None),
@@ -4421,6 +4437,14 @@ _FILAS_METRICAS = [
     ('pct_mejor_trade', 'Beneficio Total Atribuible al mejor trade', 1, ' %'),
     ('slippage_minimo_pct', 'Slippage mínimo viable', 3, ' %'),
     ('impacto_comisiones_pct', 'Impacto de comisiones', 2, ' %'),
+    (None, '— Eficiencia de ejecución —', None, None),
+    ('etd_r_medio', 'ETD medio (beneficio dejado en la mesa)', 2, ' R'),
+    ('eficiencia_entrada_media', 'Eficiencia de entrada', 1, ' %'),
+    ('eficiencia_salida_media', 'Eficiencia de salida', 1, ' %'),
+    (None, '— Exposición —', None, None),
+    ('exposicion_pct', 'Exposición al mercado (% del tiempo)', 1, ' %'),
+    ('exposicion_capital_pct', 'Capital medio comprometido', 1, ' %'),
+    ('retorno_ajustado_exposicion_pct', 'Retorno ajustado por exposición', 2, ' %'),
 ]
 
 _TOOLTIPS_METRICAS = {
@@ -4442,7 +4466,573 @@ _TOOLTIPS_METRICAS = {
                           "Negativo = el sistema ya es negativo sin slippage extra",
     'impacto_comisiones_pct': "Comisión pagada como % de la ganancia bruta "
                              "— en scalping puede devorar el edge entero",
+    'ulcer_index': "Penaliza la profundidad Y la duración de los drawdowns "
+                   "(a diferencia de Max Drawdown, que solo mira el peor "
+                   "punto) — dos sistemas con el mismo Max DD pueden tener "
+                   "Ulcer Index muy distinto si uno se recupera rápido y el "
+                   "otro no",
+    'etd_r_medio': "Media de (MFE − resultado final) por trade, en R. Alto "
+                  "= el sistema suele dejar beneficio no realizado sobre la "
+                  "mesa antes de cerrar",
+    'eficiencia_entrada_media': "Qué tan cerca del mínimo (long) o máximo "
+                                "(short) del rango que llegó a tocar el "
+                                "trade se hizo la entrada, en promedio",
+    'eficiencia_salida_media': "Qué tan cerca de la cima del recorrido se "
+                               "cerró el trade, en promedio: 100% = se salió "
+                               "justo en el máximo del rango que llegó a tocar "
+                               "(0% = en el mínimo). Cuánto beneficio se dejó "
+                               "en la mesa en términos absolutos lo dice el ETD",
+    'exposicion_pct': "% de velas del tramo con una posición abierta, desde "
+                      "que se empieza a construir hasta que se ha cerrado el "
+                      "100%. El tiempo que NO estás dentro es tiempo sin "
+                      "riesgo de mercado y con el capital libre",
+    'exposicion_capital_pct': "Fracción media del capital realmente "
+                              "comprometida, contando las velas en plano como "
+                              "0. Complementa a la de arriba: estar dentro con "
+                              "el 20% del tamaño vivo (tras una parcial, o a "
+                              "medio construir) no es estar dentro al 100%. "
+                              "Por encima de 100% = apalancamiento",
+    'retorno_ajustado_exposicion_pct': "Retorno anualizado dividido entre la "
+                                       "exposición: cuánto rinde el sistema "
+                                       "por cada unidad de tiempo dentro del "
+                                       "mercado. Un 11% anual estando solo el "
+                                       "10% del tiempo puntúa 110%; ese mismo "
+                                       "11% estando el 90% del tiempo puntúa "
+                                       "12.2%",
 }
+
+
+# ── renderizadores del bloque de resultados ──
+# Funciones a nivel de módulo en vez de métodos: reciben la tabla o el `dst`
+# (destino) sobre el que pintar, de modo que el mismo código sirve para el
+# resultado completo y para uno filtrado por dirección.
+
+# métricas que se leen de la curva de capital y no de los trades: con un filtro
+# de dirección activo se miden sobre una curva reconstruida, no sobre la equity
+# marcada a mercado del motor, y conviene avisarlo en su tooltip
+_METRICAS_DE_CURVA = frozenset((
+    'retorno_pct', 'retorno_anual_pct', 'max_dd_pct', 'sharpe', 'r2_equity',
+    'dd_promedio_pct', 'ulcer_index', 'tiempo_recuperacion_medio',
+    'tiempo_recuperacion_max', 'retorno_ajustado_exposicion_pct',
+))
+
+
+def _wfa_filtrado(wfa, resultado, velas_por_anio=None):
+    """Rehace el Walk-Forward sobre un resultado filtrado por dirección.
+
+    No hace falta re-simular: las ventanas del WFA son tramos [idx_ini, idx_fin)
+    de UNA sola simulación, así que basta con volver a pasar calcular_metricas
+    por los mismos bordes usando los trades del lado elegido."""
+    if not wfa:
+        return None
+    ventanas = []
+    for v in wfa:
+        m = calcular_metricas(resultado, v['idx_ini'], v['idx_fin'],
+                              velas_por_anio)
+        m['idx_ini'], m['idx_fin'] = v['idx_ini'], v['idx_fin']
+        ventanas.append(m)
+    return ventanas
+
+
+def render_tabla_metricas(tabla, metricas, claves, tf=None, nota_curva=None):
+    """Rellena una tabla de métricas de 4 columnas: nombre + 3 tramos.
+
+    claves: las 3 entradas de `metricas` a volcar, en orden — ('IS', 'OOS',
+    'Total') en la vista normal, ('Largos', 'Cortos', 'Total') al comparar
+    lados. Las cabeceras se ajustan solas.
+
+    nota_curva: si no es None, se añade al tooltip de las métricas derivadas de
+    la curva de capital para advertir de que están medidas sobre una curva
+    reconstruida."""
+    tabla.setHorizontalHeaderLabels(['Métrica', *claves])
+    for fila, (clave, nombre, dec, sufijo) in enumerate(_FILAS_METRICAS):
+        item_nombre = QTableWidgetItem(nombre)
+        tooltip = _TOOLTIPS_METRICAS.get(clave)
+        if nota_curva and clave in _METRICAS_DE_CURVA:
+            tooltip = f"{tooltip}\n\n{nota_curva}" if tooltip else nota_curva
+        if tooltip:
+            item_nombre.setToolTip(tooltip)
+        if clave is None:
+            # fila separadora: solo etiqueta, en negrita, sin datos
+            font = item_nombre.font()
+            font.setBold(True)
+            item_nombre.setFont(font)
+            item_nombre.setForeground(QColor(AZUL))
+            tabla.setItem(fila, 0, item_nombre)
+            for col in (1, 2, 3):
+                tabla.setItem(fila, col, QTableWidgetItem(''))
+            continue
+        tabla.setItem(fila, 0, item_nombre)
+        for col, tramo in enumerate(claves, start=1):
+            v = metricas[tramo][clave]
+            if clave in ('tiempo_recuperacion_medio', 'tiempo_recuperacion_max'):
+                tiempo_str = velas_a_tiempo_legible(v, tf)
+                velas_txt = str(int(v)) if dec == 0 and v is not None else _fmt(v, dec, '')
+                texto = f"{tiempo_str}  —  {velas_txt} velas" if v is not None else '—'
+            elif clave == 'win_rate':
+                texto = _fmt(v * 100 if v is not None else None, 1, ' %')
+            elif dec == 0:
+                texto = str(int(v)) if v is not None else '—'
+            else:
+                texto = _fmt(v, dec, sufijo)
+            it = QTableWidgetItem(texto)
+            it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            if clave in ('retorno_pct', 'retorno_anual_pct', 'expectancy_pct',
+                        'sqn', 'r2_equity', 'payoff_ratio',
+                        'retorno_ajustado_exposicion_pct') and v is not None:
+                it.setForeground(QColor(VERDE if v > 0 else ROJO))
+            tabla.setItem(fila, col, it)
+
+
+def clave_orden_trades(payload, col):
+    """Array de claves numericas para ordenar la columna `col`."""
+    tr = payload['resultado']['trades']
+    if col == 0:
+        return tr['idx_entrada'].astype('int64')
+    if col == 1:
+        return tr['idx_salida'].astype('int64')
+    if col == 2:
+        return tr['dir'].astype('int64')
+    if col == 3:
+        return tr['setup'].astype('int64')
+    if col == 4:
+        return tr['precio_entrada']
+    if col == 5:
+        return tr['precio_salida']
+    if col == 6:
+        return tr['pnl']
+    if col == 7:
+        return tr['motivo'].astype('int64')
+    if col == 8:
+        return tr['mfe_r']
+    if col == 9:
+        return tr['mae_r']
+    if col == 10:
+        return tr['etd_r']
+    if col == 11:
+        return tr['eficiencia_entrada']
+    if col == 12:
+        return tr['eficiencia_salida']
+    return tr['pnl']
+
+
+def render_tabla_trades(tabla, payload, orden=None):
+    ts = pd.DatetimeIndex(payload['timestamps'])
+    nombres_setup = payload.get('nombres_setup') or []
+    tr = payload['resultado']['trades']
+    n_tr = len(tr['pnl'])
+    if orden is None:
+        col = getattr(tabla, '_sort_col', -1)
+        if col >= 0:
+            keys = clave_orden_trades(payload, col)
+            asc = getattr(tabla, '_sort_order',
+                          Qt.SortOrder.AscendingOrder)
+            orden = (np.argsort(keys, kind='stable')
+                     if asc == Qt.SortOrder.AscendingOrder
+                     else np.argsort(keys, kind='stable')[::-1])
+        else:
+            orden = np.arange(n_tr)
+    tabla.setSortingEnabled(False)
+    tabla.setRowCount(n_tr)
+    # fila mostrada -> índice en el array de trades del payload; lo consulta
+    # quien necesite volver del clic al trade concreto
+    tabla._orden_filas = np.asarray(orden, dtype=np.int64)
+    for disp_r, r in enumerate(orden):
+        r = int(r)
+        i_in, i_out = tr['idx_entrada'][r], tr['idx_salida'][r]
+        sid = int(tr['setup'][r])
+        nombre_setup = (f"S{sid} · {nombres_setup[sid]}"
+                        if sid < len(nombres_setup) else str(sid))
+        vals = [
+            str(ts[i_in].strftime('%Y-%m-%d %H:%M')),
+            str(ts[i_out].strftime('%Y-%m-%d %H:%M')),
+            'Long' if tr['dir'][r] > 0 else 'Short',
+            nombre_setup,
+            f"{tr['precio_entrada'][r]:.4f}",
+            f"{tr['precio_salida'][r]:.4f}",
+            f"{tr['pnl'][r]:+.2f}",
+            MOTIVOS_SALIDA.get(int(tr['motivo'][r]), '?'),
+            f"{tr['mfe_r'][r]:+.2f}",
+            f"{tr['mae_r'][r]:+.2f}",
+            f"{tr['etd_r'][r]:+.2f}",
+            (f"{tr['eficiencia_entrada'][r]:.0f}"
+             if not np.isnan(tr['eficiencia_entrada'][r]) else "—"),
+            (f"{tr['eficiencia_salida'][r]:.0f}"
+             if not np.isnan(tr['eficiencia_salida'][r]) else "—"),
+        ]
+        for c_i, v in enumerate(vals):
+            it = QTableWidgetItem(v)
+            it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            if c_i == 6:
+                it.setForeground(QColor(VERDE if tr['pnl'][r] > 0 else ROJO))
+            tabla.setItem(disp_r, c_i, it)
+
+
+def render_tabla_setups(tabla, grupo, payload):
+    """Métricas por setup recalculadas sobre los trades del payload — así la
+    tabla sigue al filtro de dirección en vez de quedarse con el agregado que
+    calculó el hilo de backtest."""
+    base = payload.get('metricas_setup') or []
+    if not base:
+        grupo.setVisible(False)
+        return
+    grupo.setVisible(True)
+    tr = payload['resultado']['trades']
+    tabla.setRowCount(len(base))
+    for r, s in enumerate(base):
+        m = tr['setup'] == r
+        pnl = tr['pnl'][m]
+        r_setup = tr['r_multiple'][m]
+        n_s = int(m.sum())
+        win = float((pnl > 0).mean()) if n_s else None
+        pnl_total = float(pnl.sum())
+        expectancy = float(r_setup.mean()) if n_s else None
+        vals = [f"S{r} · {s['nombre']}", f"{s['riesgo_pct'] * 100:g} %",
+                str(n_s), _fmt(win * 100 if win is not None else None, 1, ' %'),
+                f"{pnl_total:+.2f}", _fmt(expectancy, 3, ' R')]
+        for c_i, v in enumerate(vals):
+            it = QTableWidgetItem(v)
+            it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            if c_i == 4:
+                it.setForeground(QColor(VERDE if pnl_total > 0 else ROJO))
+            tabla.setItem(r, c_i, it)
+
+
+def render_equity(dst, payload):
+    if payload is None:
+        return
+    eq = payload['resultado']['equity']
+    ts = pd.DatetimeIndex(payload['timestamps'])
+    corte = payload['corte']
+    cap0 = eq[0] if eq[0] > 0 else 1.0
+    n = len(eq)
+
+    pct_is = corte / n * 100 if n > 0 else 0
+    pct_oos = 100 - pct_is
+
+    modo = dst.combo_eq_modo.currentIndex()
+    if modo == 1:
+        y = eq
+        ylabel = 'Capital ($)'
+        fmt_val = lambda v: f'{v:,.0f}'
+    elif modo == 2:
+        y = np.log(eq / cap0) * 100.0
+        ylabel = 'Log-retorno %'
+        fmt_val = lambda v: f'{v:+.2f}%'
+    elif modo == 3:
+        eq_max = np.maximum.accumulate(eq)
+        y = (eq / eq_max - 1.0) * 100.0
+        ylabel = 'Drawdown %'
+        fmt_val = lambda v: f'{v:+.2f}%'
+    else:
+        y = (eq / cap0 - 1.0) * 100.0
+        ylabel = 'Retorno %'
+        fmt_val = lambda v: f'{v:+.2f}%'
+
+    c = payload['close']
+    c0 = c[0] if c[0] else 1.0
+    bh_eq = cap0 * c / c0
+    if modo == 1:
+        y_bh = bh_eq
+    elif modo == 2:
+        y_bh = np.log(bh_eq / cap0) * 100.0
+    elif modo == 3:
+        bh_max = np.maximum.accumulate(bh_eq)
+        y_bh = (bh_eq / bh_max - 1.0) * 100.0
+    else:
+        y_bh = (bh_eq / cap0 - 1.0) * 100.0
+
+    dst.grp_equity.setVisible(True)
+    dst.fig_equity.clear()
+    ax = dst.fig_equity.add_subplot(111)
+    _style_ax(ax)
+
+    ts_is = ts[:corte + 1]
+    ts_oos = ts[corte:]
+    y_is = y[:corte + 1]
+
+    # OOS aislado: rebasado al valor de equity justo en el punto de
+    # corte, ignorando lo acumulado en IS — así se ve el rendimiento que
+    # generó el tramo OOS por sí solo, no arrastrando el resultado de IS
+    # (que es lo que muestra la curva "Total").
+    eq_oos = eq[corte:]
+    base_oos = eq_oos[0] if len(eq_oos) else cap0
+    if modo == 1:
+        y_oos_solo = eq_oos / base_oos * cap0
+    elif modo == 2:
+        y_oos_solo = np.log(eq_oos / base_oos) * 100.0
+    elif modo == 3:
+        max_oos = np.maximum.accumulate(eq_oos)
+        y_oos_solo = (eq_oos / max_oos - 1.0) * 100.0
+    else:
+        y_oos_solo = (eq_oos / base_oos - 1.0) * 100.0
+
+    if modo == 3:
+        ax.fill_between(ts_is, 0, y_is, color='#e74c3c', alpha=0.40, label='IS')
+        if corte < n:
+            ax.fill_between(ts_oos, 0, y_oos_solo, color='#c0392b', alpha=0.35,
+                            label='OOS (aislado)')
+            # Total: drawdown continuo sobre todo el periodo (IS+OOS),
+            # calculado sobre el máximo acumulado de la equity completa
+            # — permite ver caídas que arrancan en IS y siguen en OOS,
+            # cosa que "OOS (aislado)" no muestra al rebasar su propio
+            # máximo al inicio del tramo OOS.
+            ax.plot(ts_oos, y[corte:], color=GRIS, linewidth=1.2, label='Total')
+        ax.axhline(0, color=GRIS, linewidth=0.5, linestyle='--')
+    else:
+        ax.plot(ts_is, y_is, color=AZUL, linewidth=1.2, label='IS')
+        if corte < n:
+            ax.plot(ts_oos, y[corte:], color=GRIS, linewidth=1.2,
+                    label='Total')
+            ax.plot(ts_oos, y_oos_solo, color='#ff9900', linewidth=1.2,
+                    label='OOS (aislado)')
+        if modo in (0, 2):
+            ax.axhline(0, color=GRIS, linewidth=0.5, linestyle='--')
+
+    if modo in (0, 1, 2) and getattr(dst, 'chk_bh', None) is not None \
+            and dst.chk_bh.isChecked():
+        ax.plot(ts, y_bh, color='#9b59b6', linewidth=1.1, linestyle='--',
+                alpha=0.85, label='Buy & Hold')
+        ax.text(ts[-1], y_bh[-1], f'  B&H {fmt_val(y_bh[-1])}',
+                color='#9b59b6', fontsize=7, ha='left', va='center')
+
+    if 0 < corte < n:
+        ax.axvline(ts[corte], color=GRIS, linewidth=0.8, linestyle='--', alpha=0.7)
+        ylim = ax.get_ylim()
+        ax.text(ts[corte], ylim[1] - (ylim[1] - ylim[0]) * 0.03,
+                f'  IS {pct_is:.0f}% / OOS {pct_oos:.0f}%',
+                fontsize=7, color=GRIS, ha='left', va='top',
+                bbox=dict(facecolor=FIG_BG, alpha=0.7, edgecolor='none', pad=2))
+
+    if corte > 0:
+        ax.text(ts[corte], y_is[-1], f'  {fmt_val(y_is[-1])}',
+                color=AZUL, fontsize=7, ha='left', va='center')
+    if corte < n:
+        va_tot, va_oos = ('bottom', 'top') if y[-1] >= y_oos_solo[-1] else ('top', 'bottom')
+        ax.text(ts[-1], y_oos_solo[-1], f'  OOS {fmt_val(y_oos_solo[-1])}',
+                color='#ff9900', fontsize=7, ha='left', va=va_oos)
+        ax.text(ts[-1], y[-1], f'  Total {fmt_val(y[-1])}',
+                color=GRIS, fontsize=7.5, fontweight='bold', ha='left', va=va_tot)
+
+    ax.set_ylabel(ylabel, fontsize=8, color=AX_FG)
+    ax.legend(fontsize=7, framealpha=0.2, loc='best')
+    try:
+        dst.fig_equity.tight_layout(pad=0.6)
+    except Exception:
+        pass
+    dst.canvas_equity.draw_idle()
+
+
+def render_montecarlo(dst, mc, capital, max_dd_base=None, retorno_base=None):
+    if not mc or mc['n_sims'] == 0:
+        dst.grp_mc.setVisible(False)
+        return
+    dst.grp_mc.setVisible(True)
+    dst.lbl_mc.setText(
+        f"Prob. de acabar en negativo: {mc['prob_negativo'] * 100:.1f}%   ·   "
+        f"Prob. de ruina (equity < 50% del inicial): {mc['prob_ruina'] * 100:.1f}%   ·   "
+        f"Retorno mediano: {(np.median(mc['finales']) / capital - 1) * 100:+.1f}%   ·   "
+        f"Max DD mediano: {np.median(mc['max_dds']):.1f}%")
+
+    dst.fig_mc.clear()
+    ax1 = dst.fig_mc.add_subplot(131)
+    ax2 = dst.fig_mc.add_subplot(132)
+    ax3 = dst.fig_mc.add_subplot(133)
+    for ax in (ax1, ax2, ax3):
+        _style_ax(ax)
+
+    cur = mc['curvas_pct']
+    x = np.arange(len(cur['p50']))
+    ax1.fill_between(x, cur['p5'], cur['p95'], color=AZUL, alpha=0.2)
+    ax1.plot(x, cur['p95'], color=AZUL, linewidth=0.7, linestyle='--', alpha=0.6)
+    ax1.plot(x, cur['p5'], color=AZUL, linewidth=0.7, linestyle='--', alpha=0.6)
+    ax1.plot(x, cur['p50'], color=AZUL, linewidth=1.0)
+    ax1.axhline(capital, color=GRIS, linewidth=0.7, linestyle='--')
+    ax1.set_title('Equity p5-p50-p95', fontsize=8, color=AX_FG)
+    ax1.set_xlabel('Trade nº', fontsize=7, color=AX_FG)
+
+    ret_fin = (mc['finales'] / capital - 1) * 100
+    ax2.hist(ret_fin, bins=40, color=VERDE, alpha=0.8)
+    ax2.axvline(0, color=GRIS, linewidth=0.7, linestyle='--')
+    if retorno_base is not None:
+        ax2.axvline(retorno_base, color=VERDE, linewidth=0.9, linestyle='--')
+    ax2.set_title('Retorno final %', fontsize=8, color=AX_FG)
+
+    ax3.hist(mc['max_dds'], bins=40, color=ROJO, alpha=0.8)
+    if max_dd_base is not None:
+        ax3.axvline(max_dd_base, color=ROJO, linewidth=0.9, linestyle='--')
+    ax3.set_title('Max drawdown %', fontsize=8, color=AX_FG)
+    try:
+        dst.fig_mc.tight_layout(pad=0.6)
+    except Exception:
+        pass
+    dst.canvas_mc.draw_idle()
+
+
+def render_mfe_mae(dst, payload):
+    if payload is None:
+        dst.grp_mfe_mae.setVisible(False)
+        return
+    tr = payload['resultado']['trades']
+    if len(tr['pnl']) == 0:
+        dst.grp_mfe_mae.setVisible(False)
+        return
+    dst.grp_mfe_mae.setVisible(True)
+
+    filtro = dst.combo_mfe_filtro.currentIndex()  # 0 todas, 1 ganadoras, 2 perdedoras
+    if filtro == 1:
+        mask = tr['pnl'] > 0
+    elif filtro == 2:
+        mask = tr['pnl'] <= 0
+    else:
+        mask = np.ones(len(tr['pnl']), dtype=bool)
+
+    mfe = tr['mfe_r'][mask]
+    mae = tr['mae_r'][mask]
+    r_realizado = tr['r_multiple'][mask]
+    pnl = tr['pnl'][mask]
+    percentil = dst.spin_percentil.value()
+
+    dst.fig_mfe_mae.clear()
+    if len(mfe) == 0:
+        ax = dst.fig_mfe_mae.add_subplot(111)
+        _style_ax(ax)
+        ax.text(0.5, 0.5, 'Sin operaciones para este filtro', ha='center',
+                va='center', color=AX_FG, fontsize=9, transform=ax.transAxes)
+        dst.canvas_mfe_mae.draw_idle()
+        return
+
+    colores = np.where(pnl > 0, VERDE, ROJO)
+    modo = dst.combo_mfe_modo.currentIndex()
+    ax1 = dst.fig_mfe_mae.add_subplot(121)
+    ax2 = dst.fig_mfe_mae.add_subplot(122)
+    for ax in (ax1, ax2):
+        _style_ax(ax)
+
+    if modo == 0:
+        p_mfe = np.percentile(mfe, percentil)
+        p_mae = np.percentile(mae, percentil)
+
+        ax1.scatter(mfe, r_realizado, c=colores, s=30, alpha=0.85,
+                   edgecolors=GRID_C, linewidths=0.4)
+        ax1.axvline(p_mfe, color=GRIS, linewidth=0.9, linestyle='--')
+        ax1.text(p_mfe, ax1.get_ylim()[1], f' P{percentil}={p_mfe:.2f}R',
+                 color=GRIS, fontsize=7, ha='left', va='top')
+        ax1.axhline(0, color=GRIS, linewidth=0.5, linestyle=':')
+        ax1.set_xlabel('MFE alcanzado (R)', fontsize=8, color=AX_FG)
+        ax1.set_ylabel('R realizado', fontsize=8, color=AX_FG)
+        ax1.set_title('Eficiencia MFE', fontsize=8, color=AX_FG)
+        # diagonal y=x: la distancia vertical de cada punto a esta línea
+        # es el ETD (MFE - R realizado) de ese trade
+        lim = ax1.get_xlim()
+        ax1.plot([0, lim[1]], [0, lim[1]], color=GRIS, linewidth=0.7,
+                 linestyle=':', alpha=0.5)
+        ax1.set_xlim(lim)
+
+        ax2.scatter(-mae, r_realizado, c=colores, s=30, alpha=0.85,
+                   edgecolors=GRID_C, linewidths=0.4)
+        ax2.set_xlim(right=0)
+        ax2.axvline(-p_mae, color=GRIS, linewidth=0.9, linestyle='--')
+        ax2.text(-p_mae, ax2.get_ylim()[1], f'P{percentil}={-p_mae:.2f}R ',
+                 color=GRIS, fontsize=7, ha='right', va='top')
+        ax2.axhline(0, color=GRIS, linewidth=0.5, linestyle=':')
+        ax2.set_xlabel('MAE alcanzado (R)', fontsize=8, color=AX_FG)
+        ax2.set_ylabel('R realizado', fontsize=8, color=AX_FG)
+        ax2.set_title('Eficiencia MAE', fontsize=8, color=AX_FG)
+    elif modo == 1:
+        ax1.hist(mfe, bins=30, color=VERDE, alpha=0.8)
+        p_mfe = np.percentile(mfe, percentil)
+        ax1.axvline(p_mfe, color=GRIS, linewidth=0.9, linestyle='--')
+        ax1.text(p_mfe, ax1.get_ylim()[1], f' P{percentil}={p_mfe:.2f}R', color=GRIS,
+                 fontsize=7, ha='left', va='top')
+        ax1.set_title('Máxima Excursión Favorable (R)', fontsize=8, color=AX_FG)
+        ax1.set_xlabel('MFE (R)', fontsize=8, color=AX_FG)
+        ax1.set_ylabel('Nº Trades', fontsize=8, color=AX_FG)
+
+        subset_mfe = mfe[mfe <= p_mfe]
+        if len(subset_mfe) > 0:
+            mu = subset_mfe.mean()
+            sigma = subset_mfe.std()
+            ax1.axvline(mu, color=AZUL, linewidth=1.1, linestyle='-', alpha=0.9)
+            ax1.axvline(mu + sigma, color=AZUL, linewidth=0.8, linestyle='-', alpha=0.35)
+            ax1.axvline(mu - sigma, color=AZUL, linewidth=0.8, linestyle='-', alpha=0.35)
+            ax1.text(0.98, 0.02,
+                     f'μ={mu:.2f}R\n+σ={mu + sigma:.2f}R\n−σ={mu - sigma:.2f}R',
+                     transform=ax1.transAxes, color=AZUL, fontsize=7,
+                     ha='right', va='bottom',
+                     bbox=dict(facecolor=FIG_BG, alpha=0.75, edgecolor='none', pad=3))
+
+        ax2.hist(-mae, bins=30, color=ROJO, alpha=0.8)
+        ax2.set_xlim(right=0)
+        p_mae = np.percentile(mae, percentil)
+        ax2.axvline(-p_mae, color=GRIS, linewidth=0.9, linestyle='--')
+        ax2.text(-p_mae, ax2.get_ylim()[1], f'P{percentil}={-p_mae:.2f}R ', color=GRIS,
+                 fontsize=7, ha='right', va='top')
+        ax2.set_title('Máxima Excursión Adversa (R)', fontsize=8, color=AX_FG)
+        ax2.set_xlabel('MAE (R)', fontsize=8, color=AX_FG)
+        ax2.set_ylabel('Nº Trades', fontsize=8, color=AX_FG)
+
+        subset_mae = mae[mae <= p_mae]
+        if len(subset_mae) > 0:
+            mu = subset_mae.mean()
+            sigma = subset_mae.std()
+            ax2.axvline(-mu, color=AZUL, linewidth=1.1, linestyle='-', alpha=0.9)
+            ax2.axvline(-(mu - sigma), color=AZUL, linewidth=0.8, linestyle='-', alpha=0.35)
+            ax2.axvline(-(mu + sigma), color=AZUL, linewidth=0.8, linestyle='-', alpha=0.35)
+            ax2.text(0.98, 0.02,
+                     f'μ={-mu:.2f}R\n+σ={-(mu - sigma):.2f}R\n−σ={-(mu + sigma):.2f}R',
+                     transform=ax2.transAxes, color=AZUL, fontsize=7,
+                     ha='right', va='bottom',
+                     bbox=dict(facecolor=FIG_BG, alpha=0.75, edgecolor='none', pad=3))
+    else:
+        ent = tr['eficiencia_entrada'][mask]
+        sal = tr['eficiencia_salida'][mask]
+        ent = ent[~np.isnan(ent)]
+        sal = sal[~np.isnan(sal)]
+
+        if len(ent) == 0:
+            ax1.text(0.5, 0.5, 'Sin datos', ha='center', va='center',
+                     color=AX_FG, fontsize=9, transform=ax1.transAxes)
+        else:
+            ax1.hist(ent, bins=20, range=(0, 100), color=AZUL, alpha=0.8)
+            p_ent = np.percentile(ent, percentil)
+            ax1.axvline(p_ent, color=GRIS, linewidth=0.9, linestyle='--')
+            ax1.text(p_ent, ax1.get_ylim()[1], f' P{percentil}={p_ent:.0f}%',
+                     color=GRIS, fontsize=7, ha='left', va='top')
+            mu = ent.mean()
+            ax1.axvline(mu, color=VERDE, linewidth=1.1, linestyle='-', alpha=0.9)
+            ax1.text(0.98, 0.02, f'μ={mu:.0f}%', transform=ax1.transAxes,
+                     color=VERDE, fontsize=7, ha='right', va='bottom',
+                     bbox=dict(facecolor=FIG_BG, alpha=0.75, edgecolor='none', pad=3))
+        ax1.set_xlim(0, 100)
+        ax1.set_title('Eficiencia de Entrada', fontsize=8, color=AX_FG)
+        ax1.set_xlabel('% del rango tocado por el trade', fontsize=8, color=AX_FG)
+        ax1.set_ylabel('Nº Trades', fontsize=8, color=AX_FG)
+
+        if len(sal) == 0:
+            ax2.text(0.5, 0.5, 'Sin datos', ha='center', va='center',
+                     color=AX_FG, fontsize=9, transform=ax2.transAxes)
+        else:
+            ax2.hist(sal, bins=20, range=(0, 100), color=AMBAR, alpha=0.8)
+            p_sal = np.percentile(sal, percentil)
+            ax2.axvline(p_sal, color=GRIS, linewidth=0.9, linestyle='--')
+            ax2.text(p_sal, ax2.get_ylim()[1], f' P{percentil}={p_sal:.0f}%',
+                     color=GRIS, fontsize=7, ha='left', va='top')
+            mu = sal.mean()
+            ax2.axvline(mu, color=VERDE, linewidth=1.1, linestyle='-', alpha=0.9)
+            ax2.text(0.98, 0.02, f'μ={mu:.0f}%', transform=ax2.transAxes,
+                     color=VERDE, fontsize=7, ha='right', va='bottom',
+                     bbox=dict(facecolor=FIG_BG, alpha=0.75, edgecolor='none', pad=3))
+        ax2.set_xlim(0, 100)
+        ax2.set_title('Eficiencia de Salida', fontsize=8, color=AX_FG)
+        ax2.set_xlabel('% del rango tocado por el trade', fontsize=8, color=AX_FG)
+        ax2.set_ylabel('Nº Trades', fontsize=8, color=AX_FG)
+
+    try:
+        dst.fig_mfe_mae.tight_layout(pad=0.6)
+    except Exception:
+        pass
+    dst.canvas_mfe_mae.draw_idle()
 
 
 class ResultadosWidget(QWidget):
@@ -4450,7 +5040,9 @@ class ResultadosWidget(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._payload = None
+        self._payload = None            # el que se está mostrando (puede ir filtrado)
+        self._payload_base = None       # el del backtest, sin filtrar
+        self._cache_dir = {}            # dirección -> payload derivado
         self._wfa_cache = None
         self._wfa_ts = None
         self._wfa_equity = None
@@ -4458,6 +5050,18 @@ class ResultadosWidget(QWidget):
         self._art_datos = []
         self._actualizando_xlim = False
         self._y_manual = False
+
+        # Repintar los paneles de matplotlib cuesta ~250 ms el gráfico de precio
+        # y hasta unos segundos el conjunto con series largas, mientras que
+        # recalcular las métricas cuesta ~2 ms. Al cambiar de dirección las
+        # tablas se rellenan en el acto y los gráficos se aplazan un ciclo del
+        # bucle de eventos, de modo que varios cambios seguidos colapsan en un
+        # solo repintado.
+        self._graficos_sucios = False
+        self._timer_graficos = QTimer(self)
+        self._timer_graficos.setSingleShot(True)
+        self._timer_graficos.setInterval(0)
+        self._timer_graficos.timeout.connect(self._pintar_graficos)
 
         # estado de trades (poblado en _dibujar_principal) para recortar
         # compra/venta/trayecto/cajas de salida al rango visible en cada frame
@@ -4508,12 +5112,10 @@ class ResultadosWidget(QWidget):
         self._scroll = scroll
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
-        root.addWidget(scroll)
-        cont = QWidget()
-        lay = QVBoxLayout(cont)
-        lay.setSpacing(10)
-        scroll.setWidget(cont)
 
+        # Título y selector de dirección van FUERA del scroll: la columna de
+        # bloques es larga y ambos deben seguir a la vista al bajar por ella —
+        # sobre todo el selector, que cambia el significado de todo lo de abajo.
         fila_titulo = QHBoxLayout()
         self.lbl_titulo = QLabel("Ejecuta un backtest desde el Optimizador")
         self.lbl_titulo.setObjectName("titulo")
@@ -4526,7 +5128,14 @@ class ResultadosWidget(QWidget):
         self.btn_favorito.setEnabled(False)
         self.btn_favorito.clicked.connect(self._guardar_favorito)
         fila_titulo.addWidget(self.btn_favorito)
-        lay.addLayout(fila_titulo)
+        root.addLayout(fila_titulo)
+        root.addLayout(self._construir_fila_direccion())
+        root.addWidget(scroll)
+
+        cont = QWidget()
+        lay = QVBoxLayout(cont)
+        lay.setSpacing(10)
+        scroll.setWidget(cont)
 
         # métricas IS/OOS/Total
         self.tabla_metricas = QTableWidget(len(_FILAS_METRICAS), 4)
@@ -4623,14 +5232,28 @@ class ResultadosWidget(QWidget):
         # curva de equity (IS vs OOS)
         self.grp_equity = QGroupBox()
         header_eq = QHBoxLayout()
-        lbl_eq = QLabel("Curva de Equity (IS vs OOS)")
-        lbl_eq.setObjectName("titulo")
-        header_eq.addWidget(lbl_eq)
-        header_eq.addWidget(_icono_ayuda(
-            "Evolución del capital a lo largo del backtest. La zona "
-            "sombreada distingue el tramo In-Sample del Out-of-Sample; "
-            "puedes superponer Buy & Hold para comparar contra simplemente "
-            "mantener el activo."))
+        # el texto cambia con el selector de dirección: al filtrar, la curva ya
+        # no es la del motor sino la reconstruida desde cierres realizados
+        self._lbl_equity = QLabel("Curva de Equity (IS vs OOS)")
+        self._lbl_equity.setObjectName("titulo")
+        header_eq.addWidget(self._lbl_equity)
+        header_eq.addWidget(_icono_ayuda_popup(
+            "La curva de equity trazada es la que produjo la simulación del backtest "
+            "vela a vela; el conmutador de modo permite verla como retorno %, capital "
+            "en $, log-retorno % o como drawdown continuo desde el máximo acumulado. "
+            "El tramo OOS también se recalcula de forma aislada, rebasando su equity "
+            "al valor justo en el punto de corte.",
+            "\"IS\" es el tramo con el que se ajustó o seleccionó el sistema; \"OOS\" "
+            "es el tramo posterior no usado para ajustar nada; \"OOS (aislado)\" "
+            "muestra el rendimiento de solo ese tramo, sin arrastrar lo acumulado en "
+            "IS; \"Total\" encadena ambos sin reiniciar.",
+            "Sirve para juzgar si el sistema mantuvo su comportamiento fuera de la "
+            "muestra con la que se construyó, y si superó a la alternativa pasiva de "
+            "Buy & Hold.",
+            "Un IS con buena pendiente seguido de un OOS plano o negativo es la señal "
+            "clásica de sobreajuste (el sistema memorizó el pasado, no encontró una "
+            "ventaja real); un OOS que mantiene una pendiente similar al IS es la "
+            "evidencia más fuerte de que el sistema generaliza."))
         header_eq.addStretch()
         self.chk_bh = QCheckBox("Mostrar Buy && Hold")
         self.chk_bh.setToolTip(
@@ -4713,10 +5336,11 @@ class ResultadosWidget(QWidget):
         fila_tr.addWidget(btn_lista_completa)
         lay.addLayout(fila_tr)
         self._dlg_trades = None
-        self.tabla_trades = QTableWidget(0, 10)
+        self.tabla_trades = QTableWidget(0, 13)
         self.tabla_trades.setHorizontalHeaderLabels(
             ['Entrada', 'Salida', 'Dir', 'Setup', 'P. entrada', 'P. salida',
-             'PnL', 'Motivo', 'MFE (R)', 'MAE (R)'])
+             'PnL', 'Motivo', 'MFE (R)', 'MAE (R)', 'ETD (R)', 'Ent. Ef %',
+             'Sal. Ef %'])
         self.tabla_trades.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.tabla_trades.verticalHeader().setVisible(False)
         self.tabla_trades.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -4737,11 +5361,22 @@ class ResultadosWidget(QWidget):
         lbl_wfa_titulo = QLabel("Walk-Forward Analysis")
         lbl_wfa_titulo.setObjectName("titulo")
         header_wfa.addWidget(lbl_wfa_titulo)
-        header_wfa.addWidget(_icono_ayuda(
-            "Divide la serie en ventanas sucesivas y mide el rendimiento de "
-            "cada una por separado, para comprobar si el sistema es "
-            "consistente a lo largo del tiempo o solo funcionó en un tramo "
-            "concreto."))
+        header_wfa.addWidget(_icono_ayuda_popup(
+            "El histórico se divide en ventanas sucesivas y se mide el rendimiento de "
+            "cada una por separado con las mismas métricas del backtest global, en vez "
+            "de mezclarlas en un único resultado agregado.",
+            "Cada barra/punto es una ventana temporal independiente; el selector de "
+            "vista permite leerlas como retorno individual, retorno acumulado, retorno "
+            "contra drawdown, número de trades, o como la curva de equity de encadenar "
+            "solo los tramos OOS.",
+            "Sirve para distinguir un sistema realmente consistente (todas las "
+            "ventanas rinden de forma parecida) de uno que solo funcionó gracias a un "
+            "tramo concreto y afortunado del histórico.",
+            "Barras de retorno mayoritariamente verdes y de magnitud parecida entre "
+            "ventanas indican consistencia; si una única ventana concentra casi todo "
+            "el beneficio (una barra muy alta entre varias planas o rojas), el "
+            "resultado global depende de suerte de tramo y es frágil aunque la métrica "
+            "agregada del backtest se vea bien."))
         header_wfa.addStretch()
         self.combo_wfa_modo = QComboBox()
         self.combo_wfa_modo.setMinimumWidth(160)
@@ -4771,11 +5406,24 @@ class ResultadosWidget(QWidget):
         # Montecarlo
         self.grp_mc = QGroupBox("Montecarlo (1000 remuestreos del orden de los trades)")
         lay_mc = QVBoxLayout(self.grp_mc)
-        lay_mc.insertLayout(0, _fila_ayuda(
-            "Reordena aleatoriamente la secuencia de trades miles de veces "
-            "para estimar el rango de resultados plausibles (drawdown, "
-            "capital final...) que no depende del orden exacto en que "
-            "ocurrieron — ayuda a distinguir suerte de ventaja real."))
+        lay_mc.insertLayout(0, _fila_ayuda_popup(
+            "Se toma la secuencia real de trades del backtest y se reordena "
+            "aleatoriamente miles de veces —mismos trades, distinto orden— "
+            "recalculando la curva de equity resultante en cada reordenación.",
+            "El panel izquierdo es el abanico de esas curvas (percentiles 5/50/95); "
+            "el central, la distribución de retorno final; el derecho, la del máximo "
+            "drawdown. Como el backtest real es una sola secuencia entre las muchas "
+            "posibles, esto separa qué parte del resultado depende del orden en que "
+            "llegaron los trades (azar) de lo atribuible a la estrategia.",
+            "Sirve para estimar el rango plausible de resultados a esperar en el "
+            "futuro, no solo el número puntual que dio el backtest, y para leer la "
+            "probabilidad de acabar en negativo o en ruina.",
+            "Las cifras sobre el gráfico (\"Prob. de acabar en negativo\", \"Prob. de "
+            "ruina\", retorno y Max DD medianos) resumen el riesgo real de la "
+            "estrategia más allá del resultado único del backtest; una banda p5-p95 "
+            "muy ancha en el panel izquierdo indica que el resultado final es muy "
+            "sensible al orden de los trades (alta varianza), mientras que una banda "
+            "estrecha indica un resultado robusto frente al azar del orden."))
         self.lbl_mc = QLabel("")
         self.lbl_mc.setObjectName("campo")
         lay_mc.addWidget(self.lbl_mc)
@@ -4793,11 +5441,23 @@ class ResultadosWidget(QWidget):
         lbl_mfe_titulo = QLabel("Análisis de Eficiencia (MFE/MAE)")
         lbl_mfe_titulo.setObjectName("titulo")
         header_mfe.addWidget(lbl_mfe_titulo)
-        header_mfe.addWidget(_icono_ayuda(
-            "MFE (excursión favorable máxima) y MAE (adversa máxima) miden, "
-            "en múltiplos de R, cuánto llegó a moverse el precio a favor y "
-            "en contra durante cada operación — revela si el stop/TP están "
-            "bien calibrados o si el sistema deja beneficio sobre la mesa."))
+        header_mfe.addWidget(_icono_ayuda_popup(
+            "MFE y MAE miden, en múltiplos de R, cuánto llegó a moverse el precio a "
+            "favor y en contra durante cada trade antes de cerrarse, más allá del "
+            "resultado con el que se cerró finalmente. La distancia de un punto a la "
+            "diagonal y=x en la vista de dispersión es el ETD (lo que ese trade dejó "
+            "de capturar).",
+            "Un MFE alto con un R realizado muy inferior significa que el trade llegó "
+            "a estar muy en ganancia pero se cerró con mucho menos (beneficio no "
+            "capturado); un MAE profundo con el trade aun así ganador indica que el "
+            "precio estuvo cerca de tocar stop antes de girar a favor.",
+            "Sirve para diagnosticar si el stop-loss y el take-profit están bien "
+            "calibrados al comportamiento real del precio durante el trade.",
+            "Si el percentil marcado del MAE está muy por debajo (en valor absoluto) "
+            "del stop configurado, hay margen para ajustarlo más ceñido sin saltarse "
+            "la mayoría de los trades; si el percentil del MFE supera claramente el "
+            "take-profit configurado, el sistema probablemente esté cerrando demasiado "
+            "pronto y dejando beneficio sobre la mesa de forma sistemática."))
         header_mfe.addStretch()
         self.combo_mfe_modo = QComboBox()
         self.combo_mfe_modo.setMinimumWidth(160)
@@ -4850,13 +5510,179 @@ class ResultadosWidget(QWidget):
             return True
         return super().eventFilter(obj, event)
 
+    # ── selector de dirección ──
+    def _construir_fila_direccion(self):
+        """Fila `Mostrar: Todos | Solo Largos | Solo Cortos | Comparar lados`.
+
+        Los cuatro modos son excluyentes. Los tres primeros filtran TODA la
+        vista (métricas, gráfico de precio, curva de capital, setups, trades,
+        WFA, Montecarlo y MFE/MAE); el cuarto deja la vista sin filtrar y solo
+        cambia las columnas de la tabla de métricas a Largos / Cortos / Total."""
+        fila = QVBoxLayout()
+        fila.setSpacing(2)
+        sel = QHBoxLayout()
+        lbl = QLabel("Mostrar:")
+        lbl.setObjectName("titulo")
+        sel.addWidget(lbl)
+        self._grupo_dir = QButtonGroup(self)
+        for i, texto in enumerate(('Todos', 'Solo Largos', 'Solo Cortos',
+                                   'Comparar lados')):
+            rb = QRadioButton(texto)
+            rb.setAutoExclusive(True)
+            rb.setEnabled(False)
+            self._grupo_dir.addButton(rb, i)
+            sel.addWidget(rb)
+        self._grupo_dir.button(_MODO_TODOS).setChecked(True)
+        self._grupo_dir.idClicked.connect(lambda _i: self._aplicar_direccion())
+        sel.addWidget(_icono_ayuda_popup(
+            "Se toman los trades que ya produjo el backtest y se descartan los "
+            "del lado no seleccionado, sin re-simular. Como la curva de capital "
+            "del motor está marcada a mercado y mezcla ambos lados, al filtrar "
+            "se reconstruye componiendo únicamente los retornos de los trades "
+            "que sobreviven: la curva de cierres realizados de operar solo ese "
+            "lado. \"Todos\" no pasa por ese proceso, así que muestra "
+            "exactamente el resultado del backtest.",
+            "Las métricas de trade (nº, win rate, profit factor, expectancy, "
+            "SQN, payoff, eficiencias) son exactas para el lado elegido. Las de "
+            "curva (retorno, max drawdown, Sharpe, R², Ulcer, tiempos de "
+            "recuperación) se miden sobre la curva reconstruida — su tooltip lo "
+            "recuerda cuando hay un filtro activo.",
+            "Sirve para detectar si el sistema tiene edge en un solo lado: un "
+            "sesgo direccional oculto, un stop que solo funciona en un sentido, "
+            "o una pata que solo añade ruido y comisiones. \"Comparar lados\" "
+            "pone largos y cortos uno al lado del otro para verlo de un vistazo.",
+            "Si un lado tiene expectancy negativa y el otro la sostiene, la "
+            "lectura es que el sistema es en realidad unidireccional y la pata "
+            "mala está restando; antes de amputarla conviene mirar su nº de "
+            "trades, porque con muestras pequeñas la diferencia puede ser azar."))
+        sel.addStretch()
+        fila.addLayout(sel)
+        self.lbl_direccion = QLabel("")
+        self.lbl_direccion.setObjectName("campo")
+        fila.addWidget(self.lbl_direccion)
+        return fila
+
+    def _modo_direccion(self):
+        return self._grupo_dir.checkedId()
+
+    def _actualizar_botones_direccion(self):
+        """Habilita los modos que tienen sentido para este backtest y devuelve
+        el resumen de reparto largos/cortos."""
+        tr = self._payload_base['resultado']['trades']
+        n_l = int((tr['dir'] > 0).sum())
+        n_c = int((tr['dir'] < 0).sum())
+        self._grupo_dir.button(_MODO_TODOS).setEnabled(True)
+        self._grupo_dir.button(_MODO_LARGOS).setEnabled(n_l > 0)
+        self._grupo_dir.button(_MODO_CORTOS).setEnabled(n_c > 0)
+        # comparar lados solo dice algo si el sistema opera en ambos sentidos
+        self._grupo_dir.button(_MODO_COMPARAR).setEnabled(n_l > 0 and n_c > 0)
+        boton = self._grupo_dir.checkedButton()
+        if boton is None or not boton.isEnabled():
+            self._grupo_dir.button(_MODO_TODOS).setChecked(True)
+        return n_l, n_c
+
+    def _payload_de_direccion(self, direccion):
+        """Payload equivalente al del backtest pero con solo los trades de una
+        dirección. Al ser intercambiable con el original, todos los
+        renderizadores lo filtran sin enterarse."""
+        if direccion in self._cache_dir:
+            return self._cache_dir[direccion]
+        p = self._payload_base
+        cap0 = float(p['config'].get('capital_inicial', 10000.0))
+        res = resultado_filtrado(p['resultado'], direccion, cap0)
+        n, corte, va = p['n_velas'], p['corte'], p.get('velas_anio')
+        pf = {**p, 'resultado': res,
+              'metricas': {'IS': calcular_metricas(res, 0, corte, va),
+                           'OOS': calcular_metricas(res, corte, n, va),
+                           'Total': calcular_metricas(res, 0, n, va)},
+              'montecarlo': (montecarlo(res['trades'], cap0, n_sims=1000,
+                                        semilla=1234)
+                             if res['n_trades'] else None),
+              'wfa': _wfa_filtrado(p.get('wfa'), res, va)}
+        self._cache_dir[direccion] = pf
+        return pf
+
+    @_no_crash
+    def _aplicar_direccion(self):
+        """Recalcula y repinta la vista para el modo seleccionado. Es el único
+        punto de entrada del render: lo llaman tanto `mostrar()` como los
+        botones del selector."""
+        p = self._payload_base
+        if p is None:
+            return
+        modo = self._modo_direccion()
+        # "Todos" y "Comparar lados" muestran el resultado del backtest tal
+        # cual: los números de la vista principal no pasan por ningún filtro
+        if modo in (_MODO_TODOS, _MODO_COMPARAR):
+            self._payload = p
+        else:
+            self._payload = self._payload_de_direccion(
+                1 if modo == _MODO_LARGOS else -1)
+
+        lado = {_MODO_LARGOS: 'largos', _MODO_CORTOS: 'cortos'}.get(modo)
+        nota = (f"Con el filtro de {lado} activo esta métrica se mide sobre la "
+                f"curva de capital reconstruida (solo cierres realizados de los "
+                f"{lado}), no sobre la equity marcada a mercado del backtest "
+                f"completo.") if lado else None
+
+        if modo == _MODO_COMPARAR:
+            claves = ('Largos', 'Cortos', 'Total')
+            met_tabla = {'Largos': self._payload_de_direccion(1)['metricas']['Total'],
+                         'Cortos': self._payload_de_direccion(-1)['metricas']['Total'],
+                         'Total': p['metricas']['Total']}
+            nota = ("En las columnas Largos y Cortos esta métrica se mide sobre "
+                    "la curva de capital reconstruida de ese lado; la columna "
+                    "Total la mide sobre la equity real del backtest.")
+        else:
+            claves = ('IS', 'OOS', 'Total')
+            met_tabla = self._payload['metricas']
+
+        # las tablas de métricas y de setups son inmediatas a cualquier escala
+        # (<1 ms): son las que responden al clic del selector
+        render_tabla_metricas(self.tabla_metricas, met_tabla, claves,
+                              p.get('tf'), nota)
+        render_tabla_setups(self.tabla_setups, self.grp_setups, self._payload)
+        self._lbl_equity.setText(
+            f"Curva de Equity — solo {lado} (cierres realizados)" if lado
+            else "Curva de Equity (IS vs OOS)")
+
+        # el resto se aplaza un ciclo del bucle de eventos. La tabla de trades
+        # va aquí y no arriba porque con miles de operaciones son decenas de
+        # miles de celdas (~320 ms con 6.000 trades), tanto como los gráficos.
+        self._graficos_sucios = True
+        self._timer_graficos.start()
+
+    @_no_crash
+    def _pintar_graficos(self):
+        if self._payload is None:
+            return
+        self._graficos_sucios = False
+        payload = self._payload
+        ts = pd.DatetimeIndex(payload['timestamps'])
+        self._llenar_tabla_trades(self.tabla_trades, payload)
+        if self._dlg_trades is not None:
+            self._llenar_tabla_trades(self._dlg_trades.tabla, payload)
+        self._dibujar_principal()
+        self._dibujar_equity(payload)
+        if getattr(self, 'btn_vista', None) is not None and self.btn_vista.isChecked():
+            self._mostrar_lwc(payload)
+        self._wfa_cache = payload.get('wfa')
+        self._wfa_ts = ts
+        self._wfa_equity = payload['resultado']['equity']
+        self._dibujar_wfa(payload.get('wfa'), ts, self._wfa_equity)
+        self._dibujar_mc(payload.get('montecarlo'),
+                         payload['config'].get('capital_inicial', 10000.0),
+                         payload['metricas']['Total'].get('max_dd_pct'),
+                         payload['metricas']['Total'].get('retorno_pct'))
+        self._dibujar_mfe_mae(payload)
+
     # ── render principal ──
     @_no_crash
     def mostrar(self, payload):
-        self._payload = payload
+        self._payload_base = payload
+        self._cache_dir = {}
         self._y_manual = False
         ts = pd.DatetimeIndex(payload['timestamps'])
-        met = payload['metricas']
         estrategia = html.escape(payload['estrategia'])
         badge = _titulo_activo_html(payload['csv'], payload.get('tf'))
         self.lbl_titulo.setTextFormat(Qt.TextFormat.RichText)
@@ -4872,49 +5698,12 @@ class ResultadosWidget(QWidget):
         self.btn_favorito.setEnabled(True)
         self.btn_favorito.setText("⭐ Guardar como favorito")
 
-        # métricas
-        for fila, (clave, nombre, dec, sufijo) in enumerate(_FILAS_METRICAS):
-            item_nombre = QTableWidgetItem(nombre)
-            tooltip = _TOOLTIPS_METRICAS.get(clave)
-            if tooltip:
-                item_nombre.setToolTip(tooltip)
-            if clave is None:
-                # fila separadora: solo etiqueta, en negrita, sin datos
-                font = item_nombre.font()
-                font.setBold(True)
-                item_nombre.setFont(font)
-                item_nombre.setForeground(QColor(AZUL))
-                self.tabla_metricas.setItem(fila, 0, item_nombre)
-                for col in (1, 2, 3):
-                    self.tabla_metricas.setItem(fila, col, QTableWidgetItem(''))
-                continue
-            self.tabla_metricas.setItem(fila, 0, item_nombre)
-            for col, tramo in enumerate(('IS', 'OOS', 'Total'), start=1):
-                v = met[tramo][clave]
-                if clave in ('tiempo_recuperacion_medio', 'tiempo_recuperacion_max'):
-                    tf_label = payload.get('tf')
-                    tiempo_str = velas_a_tiempo_legible(v, tf_label)
-                    velas_txt = str(int(v)) if dec == 0 and v is not None else _fmt(v, dec, '')
-                    texto = f"{tiempo_str}  —  {velas_txt} velas" if v is not None else '—'
-                elif clave == 'win_rate':
-                    texto = _fmt(v * 100 if v is not None else None, 1, ' %')
-                elif dec == 0:
-                    texto = str(int(v)) if v is not None else '—'
-                else:
-                    texto = _fmt(v, dec, sufijo)
-                it = QTableWidgetItem(texto)
-                it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                if clave in ('retorno_pct', 'retorno_anual_pct', 'expectancy_pct',
-                            'sqn', 'r2_equity', 'payoff_ratio') and v is not None:
-                    it.setForeground(QColor(VERDE if v > 0 else ROJO))
-                self.tabla_metricas.setItem(fila, col, it)
-
-        # gráfico principal (precio + paneles de osciladores apilados)
-        self._dibujar_principal()
-        self._dibujar_equity(payload)
-        # si la vista moderna (LWC) está activa, refrescarla con el nuevo backtest
-        if getattr(self, 'btn_vista', None) is not None and self.btn_vista.isChecked():
-            self._mostrar_lwc(payload)
+        # selector de dirección: el modo elegido se conserva entre ejecuciones
+        # (quien está analizando los cortos de un sistema no quiere que se
+        # reinicie en cada ▶), salvo que este backtest no opere ese lado
+        n_l, n_c = self._actualizar_botones_direccion()
+        self.lbl_direccion.setText(
+            f"{n_l:,} largos · {n_c:,} cortos · {n_l + n_c:,} trades")
 
         # fechas de los QDateEdit
         self.fecha_ini.setDate(QDate(ts[0].year, ts[0].month, ts[0].day))
@@ -4925,39 +5714,7 @@ class ResultadosWidget(QWidget):
         self.grp_codigo.setVisible(bool(codigo))
         self.txt_codigo.setPlainText(codigo)
 
-        # métricas por setup
-        ms = payload.get('metricas_setup') or []
-        self.grp_setups.setVisible(bool(ms))
-        self.tabla_setups.setRowCount(len(ms))
-        for r, s in enumerate(ms):
-            wr = _fmt(s['win_rate'] * 100 if s['win_rate'] is not None else None, 1, ' %')
-            vals = [f"S{r} · {s['nombre']}", f"{s['riesgo_pct'] * 100:g} %",
-                    str(s['n_trades']), wr, f"{s['pnl_total']:+.2f}",
-                    _fmt(s['expectancy_pct'], 3, ' R')]
-            for c_i, v in enumerate(vals):
-                it = QTableWidgetItem(v)
-                it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                if c_i == 4:
-                    it.setForeground(QColor(VERDE if s['pnl_total'] > 0 else ROJO))
-                self.tabla_setups.setItem(r, c_i, it)
-
-        # trades
-        self._llenar_tabla_trades(self.tabla_trades, payload)
-        if self._dlg_trades is not None:
-            self._llenar_tabla_trades(self._dlg_trades.tabla, payload)
-
-        # WFA
-        self._wfa_cache = payload.get('wfa')
-        self._wfa_ts = ts
-        self._wfa_equity = payload['resultado']['equity']
-        self._dibujar_wfa(payload.get('wfa'), ts, self._wfa_equity)
-        # Montecarlo
-        self._dibujar_mc(payload.get('montecarlo'),
-                         payload['config'].get('capital_inicial', 10000.0),
-                         payload['metricas']['Total'].get('max_dd_pct'),
-                         payload['metricas']['Total'].get('retorno_pct'))
-        # Análisis de Eficiencia (MFE/MAE)
-        self._dibujar_mfe_mae(payload)
+        self._aplicar_direccion()
 
     @_no_crash
     def _guardar_favorito(self):
@@ -5861,8 +6618,19 @@ class ResultadosWidget(QWidget):
         it_in, it_out = tabla.item(fila, 0), tabla.item(fila, 1)
         if it_in is None or it_out is None:
             return
-        entrada = pd.Timestamp(it_in.text())
-        salida = pd.Timestamp(it_out.text())
+        it_p_in, it_p_out = tabla.item(fila, 4), tabla.item(fila, 5)
+        try:
+            precios = ((float(it_p_in.text()), float(it_p_out.text()))
+                       if it_p_in is not None and it_p_out is not None else None)
+        except ValueError:
+            precios = None
+        self._centrar_en(pd.Timestamp(it_in.text()), pd.Timestamp(it_out.text()),
+                         precios)
+
+    def _centrar_en(self, entrada, salida, precios=None):
+        """Reencuadra el gráfico principal sobre la ventana [entrada, salida],
+        con un margen proporcional a la duración del trade, y ajusta el eje Y
+        al recorrido de precio si se pasan (precio_entrada, precio_salida)."""
         ts = pd.DatetimeIndex(self._payload['timestamps'])
         margen_min = (ts[-1] - ts[0]) / 40
         duracion = salida - entrada
@@ -5870,12 +6638,8 @@ class ResultadosWidget(QWidget):
         self._y_manual = False  # re-autoescalar el precio a esta ventana concreta
         self._dibujar_principal(xlim=(entrada - margen, salida + margen))
 
-        it_p_in, it_p_out = tabla.item(fila, 4), tabla.item(fila, 5)
-        if it_p_in is not None and it_p_out is not None and self._ax_principal is not None:
-            try:
-                p_in, p_out = float(it_p_in.text()), float(it_p_out.text())
-            except ValueError:
-                return
+        if precios is not None and self._ax_principal is not None:
+            p_in, p_out = precios
             lo, hi = min(p_in, p_out), max(p_in, p_out)
             pad = (hi - lo) * 0.25 or (abs(p_in) * 0.02 or 1.0)
             self._ax_principal.set_ylim(lo - pad, hi + pad)
@@ -5883,72 +6647,10 @@ class ResultadosWidget(QWidget):
             self.canvas.draw_idle()
 
     def _llenar_tabla_trades(self, tabla, payload, orden=None):
-        ts = pd.DatetimeIndex(payload['timestamps'])
-        nombres_setup = payload.get('nombres_setup') or []
-        tr = payload['resultado']['trades']
-        n_tr = len(tr['pnl'])
-        if orden is None:
-            col = getattr(tabla, '_sort_col', -1)
-            if col >= 0:
-                keys = self._clave_orden_trades(payload, col)
-                asc = getattr(tabla, '_sort_order',
-                              Qt.SortOrder.AscendingOrder)
-                orden = (np.argsort(keys, kind='stable')
-                         if asc == Qt.SortOrder.AscendingOrder
-                         else np.argsort(keys, kind='stable')[::-1])
-            else:
-                orden = np.arange(n_tr)
-        tabla.setSortingEnabled(False)
-        tabla.setRowCount(n_tr)
-        for disp_r, r in enumerate(orden):
-            r = int(r)
-            i_in, i_out = tr['idx_entrada'][r], tr['idx_salida'][r]
-            sid = int(tr['setup'][r])
-            nombre_setup = (f"S{sid} · {nombres_setup[sid]}"
-                            if sid < len(nombres_setup) else str(sid))
-            vals = [
-                str(ts[i_in].strftime('%Y-%m-%d %H:%M')),
-                str(ts[i_out].strftime('%Y-%m-%d %H:%M')),
-                'Long' if tr['dir'][r] > 0 else 'Short',
-                nombre_setup,
-                f"{tr['precio_entrada'][r]:.4f}",
-                f"{tr['precio_salida'][r]:.4f}",
-                f"{tr['pnl'][r]:+.2f}",
-                MOTIVOS_SALIDA.get(int(tr['motivo'][r]), '?'),
-                f"{tr['mfe_r'][r]:+.2f}",
-                f"{tr['mae_r'][r]:+.2f}",
-            ]
-            for c_i, v in enumerate(vals):
-                it = QTableWidgetItem(v)
-                it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                if c_i == 6:
-                    it.setForeground(QColor(VERDE if tr['pnl'][r] > 0 else ROJO))
-                tabla.setItem(disp_r, c_i, it)
+        return render_tabla_trades(tabla, payload, orden)
 
     def _clave_orden_trades(self, payload, col):
-        """Array de claves numericas para ordenar la columna `col`."""
-        tr = payload['resultado']['trades']
-        if col == 0:
-            return tr['idx_entrada'].astype('int64')
-        if col == 1:
-            return tr['idx_salida'].astype('int64')
-        if col == 2:
-            return tr['dir'].astype('int64')
-        if col == 3:
-            return tr['setup'].astype('int64')
-        if col == 4:
-            return tr['precio_entrada']
-        if col == 5:
-            return tr['precio_salida']
-        if col == 6:
-            return tr['pnl']
-        if col == 7:
-            return tr['motivo'].astype('int64')
-        if col == 8:
-            return tr['mfe_r']
-        if col == 9:
-            return tr['mae_r']
-        return tr['pnl']
+        return clave_orden_trades(payload, col)
 
     @_no_crash
     def _ordenar_tabla_trades(self, tabla, col):
@@ -5976,10 +6678,11 @@ class ResultadosWidget(QWidget):
             dlg.setWindowTitle("Trades — lista completa")
             dlg.resize(900, 600)
             dlg_lay = QVBoxLayout(dlg)
-            tabla = QTableWidget(0, 10)
+            tabla = QTableWidget(0, 13)
             tabla.setHorizontalHeaderLabels(
                 ['Entrada', 'Salida', 'Dir', 'Setup', 'P. entrada', 'P. salida',
-                 'PnL', 'Motivo', 'MFE (R)', 'MAE (R)'])
+                 'PnL', 'Motivo', 'MFE (R)', 'MAE (R)', 'ETD (R)', 'Ent. Ef %',
+                 'Sal. Ef %'])
             tabla.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
             tabla.verticalHeader().setVisible(False)
             tabla.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -6001,128 +6704,7 @@ class ResultadosWidget(QWidget):
         self._dlg_trades.activateWindow()
 
     def _dibujar_equity(self, payload):
-        if payload is None:
-            return
-        eq = payload['resultado']['equity']
-        ts = pd.DatetimeIndex(payload['timestamps'])
-        corte = payload['corte']
-        cap0 = eq[0] if eq[0] > 0 else 1.0
-        n = len(eq)
-
-        pct_is = corte / n * 100 if n > 0 else 0
-        pct_oos = 100 - pct_is
-
-        modo = self.combo_eq_modo.currentIndex()
-        if modo == 1:
-            y = eq
-            ylabel = 'Capital ($)'
-            fmt_val = lambda v: f'{v:,.0f}'
-        elif modo == 2:
-            y = np.log(eq / cap0) * 100.0
-            ylabel = 'Log-retorno %'
-            fmt_val = lambda v: f'{v:+.2f}%'
-        elif modo == 3:
-            eq_max = np.maximum.accumulate(eq)
-            y = (eq / eq_max - 1.0) * 100.0
-            ylabel = 'Drawdown %'
-            fmt_val = lambda v: f'{v:+.2f}%'
-        else:
-            y = (eq / cap0 - 1.0) * 100.0
-            ylabel = 'Retorno %'
-            fmt_val = lambda v: f'{v:+.2f}%'
-
-        c = payload['close']
-        c0 = c[0] if c[0] else 1.0
-        bh_eq = cap0 * c / c0
-        if modo == 1:
-            y_bh = bh_eq
-        elif modo == 2:
-            y_bh = np.log(bh_eq / cap0) * 100.0
-        elif modo == 3:
-            bh_max = np.maximum.accumulate(bh_eq)
-            y_bh = (bh_eq / bh_max - 1.0) * 100.0
-        else:
-            y_bh = (bh_eq / cap0 - 1.0) * 100.0
-
-        self.grp_equity.setVisible(True)
-        self.fig_equity.clear()
-        ax = self.fig_equity.add_subplot(111)
-        _style_ax(ax)
-
-        ts_is = ts[:corte + 1]
-        ts_oos = ts[corte:]
-        y_is = y[:corte + 1]
-
-        # OOS aislado: rebasado al valor de equity justo en el punto de
-        # corte, ignorando lo acumulado en IS — así se ve el rendimiento que
-        # generó el tramo OOS por sí solo, no arrastrando el resultado de IS
-        # (que es lo que muestra la curva "Total").
-        eq_oos = eq[corte:]
-        base_oos = eq_oos[0] if len(eq_oos) else cap0
-        if modo == 1:
-            y_oos_solo = eq_oos / base_oos * cap0
-        elif modo == 2:
-            y_oos_solo = np.log(eq_oos / base_oos) * 100.0
-        elif modo == 3:
-            max_oos = np.maximum.accumulate(eq_oos)
-            y_oos_solo = (eq_oos / max_oos - 1.0) * 100.0
-        else:
-            y_oos_solo = (eq_oos / base_oos - 1.0) * 100.0
-
-        if modo == 3:
-            ax.fill_between(ts_is, 0, y_is, color='#e74c3c', alpha=0.40, label='IS')
-            if corte < n:
-                ax.fill_between(ts_oos, 0, y_oos_solo, color='#c0392b', alpha=0.35,
-                                label='OOS (aislado)')
-                # Total: drawdown continuo sobre todo el periodo (IS+OOS),
-                # calculado sobre el máximo acumulado de la equity completa
-                # — permite ver caídas que arrancan en IS y siguen en OOS,
-                # cosa que "OOS (aislado)" no muestra al rebasar su propio
-                # máximo al inicio del tramo OOS.
-                ax.plot(ts_oos, y[corte:], color=GRIS, linewidth=1.2, label='Total')
-            ax.axhline(0, color=GRIS, linewidth=0.5, linestyle='--')
-        else:
-            ax.plot(ts_is, y_is, color=AZUL, linewidth=1.2, label='IS')
-            if corte < n:
-                ax.plot(ts_oos, y[corte:], color=GRIS, linewidth=1.2,
-                        label='Total')
-                ax.plot(ts_oos, y_oos_solo, color='#ff9900', linewidth=1.2,
-                        label='OOS (aislado)')
-            if modo in (0, 2):
-                ax.axhline(0, color=GRIS, linewidth=0.5, linestyle='--')
-
-        if modo in (0, 1, 2) and getattr(self, 'chk_bh', None) is not None \
-                and self.chk_bh.isChecked():
-            ax.plot(ts, y_bh, color='#9b59b6', linewidth=1.1, linestyle='--',
-                    alpha=0.85, label='Buy & Hold')
-            ax.text(ts[-1], y_bh[-1], f'  B&H {fmt_val(y_bh[-1])}',
-                    color='#9b59b6', fontsize=7, ha='left', va='center')
-
-        if 0 < corte < n:
-            ax.axvline(ts[corte], color=GRIS, linewidth=0.8, linestyle='--', alpha=0.7)
-            ylim = ax.get_ylim()
-            ax.text(ts[corte], ylim[1] - (ylim[1] - ylim[0]) * 0.03,
-                    f'  IS {pct_is:.0f}% / OOS {pct_oos:.0f}%',
-                    fontsize=7, color=GRIS, ha='left', va='top',
-                    bbox=dict(facecolor=FIG_BG, alpha=0.7, edgecolor='none', pad=2))
-
-        if corte > 0:
-            ax.text(ts[corte], y_is[-1], f'  {fmt_val(y_is[-1])}',
-                    color=AZUL, fontsize=7, ha='left', va='center')
-        if corte < n:
-            va_tot, va_oos = ('bottom', 'top') if y[-1] >= y_oos_solo[-1] else ('top', 'bottom')
-            ax.text(ts[-1], y_oos_solo[-1], f'  OOS {fmt_val(y_oos_solo[-1])}',
-                    color='#ff9900', fontsize=7, ha='left', va=va_oos)
-            ax.text(ts[-1], y[-1], f'  Total {fmt_val(y[-1])}',
-                    color=GRIS, fontsize=7.5, fontweight='bold', ha='left', va=va_tot)
-
-        ax.set_ylabel(ylabel, fontsize=8, color=AX_FG)
-        ax.legend(fontsize=7, framealpha=0.2, loc='best')
-        try:
-            self.fig_equity.tight_layout(pad=0.6)
-        except Exception:
-            pass
-        self.canvas_equity.draw_idle()
+        return render_equity(self, payload)
 
     def _recolectar_indicadores(self, payload):
         """Devuelve un dict de conjuntos únicos (mas, bbs, rsis, atrs,
@@ -6529,165 +7111,10 @@ class ResultadosWidget(QWidget):
         self.tabla_wfa.setFixedHeight(alto_total)
 
     def _dibujar_mc(self, mc, capital, max_dd_base=None, retorno_base=None):
-        if not mc or mc['n_sims'] == 0:
-            self.grp_mc.setVisible(False)
-            return
-        self.grp_mc.setVisible(True)
-        self.lbl_mc.setText(
-            f"Prob. de acabar en negativo: {mc['prob_negativo'] * 100:.1f}%   ·   "
-            f"Prob. de ruina (equity < 50% del inicial): {mc['prob_ruina'] * 100:.1f}%   ·   "
-            f"Retorno mediano: {(np.median(mc['finales']) / capital - 1) * 100:+.1f}%   ·   "
-            f"Max DD mediano: {np.median(mc['max_dds']):.1f}%")
-
-        self.fig_mc.clear()
-        ax1 = self.fig_mc.add_subplot(131)
-        ax2 = self.fig_mc.add_subplot(132)
-        ax3 = self.fig_mc.add_subplot(133)
-        for ax in (ax1, ax2, ax3):
-            _style_ax(ax)
-
-        cur = mc['curvas_pct']
-        x = np.arange(len(cur['p50']))
-        ax1.fill_between(x, cur['p5'], cur['p95'], color=AZUL, alpha=0.2)
-        ax1.plot(x, cur['p95'], color=AZUL, linewidth=0.7, linestyle='--', alpha=0.6)
-        ax1.plot(x, cur['p5'], color=AZUL, linewidth=0.7, linestyle='--', alpha=0.6)
-        ax1.plot(x, cur['p50'], color=AZUL, linewidth=1.0)
-        ax1.axhline(capital, color=GRIS, linewidth=0.7, linestyle='--')
-        ax1.set_title('Equity p5-p50-p95', fontsize=8, color=AX_FG)
-        ax1.set_xlabel('Trade nº', fontsize=7, color=AX_FG)
-
-        ret_fin = (mc['finales'] / capital - 1) * 100
-        ax2.hist(ret_fin, bins=40, color=VERDE, alpha=0.8)
-        ax2.axvline(0, color=GRIS, linewidth=0.7, linestyle='--')
-        if retorno_base is not None:
-            ax2.axvline(retorno_base, color=VERDE, linewidth=0.9, linestyle='--')
-        ax2.set_title('Retorno final %', fontsize=8, color=AX_FG)
-
-        ax3.hist(mc['max_dds'], bins=40, color=ROJO, alpha=0.8)
-        if max_dd_base is not None:
-            ax3.axvline(max_dd_base, color=ROJO, linewidth=0.9, linestyle='--')
-        ax3.set_title('Max drawdown %', fontsize=8, color=AX_FG)
-        try:
-            self.fig_mc.tight_layout(pad=0.6)
-        except Exception:
-            pass
-        self.canvas_mc.draw_idle()
+        return render_montecarlo(self, mc, capital, max_dd_base, retorno_base)
 
     def _dibujar_mfe_mae(self, payload):
-        if payload is None:
-            self.grp_mfe_mae.setVisible(False)
-            return
-        tr = payload['resultado']['trades']
-        if len(tr['pnl']) == 0:
-            self.grp_mfe_mae.setVisible(False)
-            return
-        self.grp_mfe_mae.setVisible(True)
-
-        filtro = self.combo_mfe_filtro.currentIndex()  # 0 todas, 1 ganadoras, 2 perdedoras
-        if filtro == 1:
-            mask = tr['pnl'] > 0
-        elif filtro == 2:
-            mask = tr['pnl'] <= 0
-        else:
-            mask = np.ones(len(tr['pnl']), dtype=bool)
-
-        mfe = tr['mfe_r'][mask]
-        mae = tr['mae_r'][mask]
-        r_realizado = tr['r_multiple'][mask]
-        pnl = tr['pnl'][mask]
-        percentil = self.spin_percentil.value()
-
-        self.fig_mfe_mae.clear()
-        if len(mfe) == 0:
-            ax = self.fig_mfe_mae.add_subplot(111)
-            _style_ax(ax)
-            ax.text(0.5, 0.5, 'Sin operaciones para este filtro', ha='center',
-                    va='center', color=AX_FG, fontsize=9, transform=ax.transAxes)
-            self.canvas_mfe_mae.draw_idle()
-            return
-
-        colores = np.where(pnl > 0, VERDE, ROJO)
-        modo = self.combo_mfe_modo.currentIndex()
-        ax1 = self.fig_mfe_mae.add_subplot(121)
-        ax2 = self.fig_mfe_mae.add_subplot(122)
-        for ax in (ax1, ax2):
-            _style_ax(ax)
-
-        if modo == 0:
-            p_mfe = np.percentile(mfe, percentil)
-            p_mae = np.percentile(mae, percentil)
-
-            ax1.scatter(mfe, r_realizado, c=colores, s=30, alpha=0.85,
-                       edgecolors=GRID_C, linewidths=0.4)
-            ax1.axvline(p_mfe, color=GRIS, linewidth=0.9, linestyle='--')
-            ax1.text(p_mfe, ax1.get_ylim()[1], f' P{percentil}={p_mfe:.2f}R',
-                     color=GRIS, fontsize=7, ha='left', va='top')
-            ax1.axhline(0, color=GRIS, linewidth=0.5, linestyle=':')
-            ax1.set_xlabel('MFE alcanzado (R)', fontsize=8, color=AX_FG)
-            ax1.set_ylabel('R realizado', fontsize=8, color=AX_FG)
-            ax1.set_title('Eficiencia MFE', fontsize=8, color=AX_FG)
-
-            ax2.scatter(-mae, r_realizado, c=colores, s=30, alpha=0.85,
-                       edgecolors=GRID_C, linewidths=0.4)
-            ax2.set_xlim(right=0)
-            ax2.axvline(-p_mae, color=GRIS, linewidth=0.9, linestyle='--')
-            ax2.text(-p_mae, ax2.get_ylim()[1], f'P{percentil}={-p_mae:.2f}R ',
-                     color=GRIS, fontsize=7, ha='right', va='top')
-            ax2.axhline(0, color=GRIS, linewidth=0.5, linestyle=':')
-            ax2.set_xlabel('MAE alcanzado (R)', fontsize=8, color=AX_FG)
-            ax2.set_ylabel('R realizado', fontsize=8, color=AX_FG)
-            ax2.set_title('Eficiencia MAE', fontsize=8, color=AX_FG)
-        else:
-            ax1.hist(mfe, bins=30, color=VERDE, alpha=0.8)
-            p_mfe = np.percentile(mfe, percentil)
-            ax1.axvline(p_mfe, color=GRIS, linewidth=0.9, linestyle='--')
-            ax1.text(p_mfe, ax1.get_ylim()[1], f' P{percentil}={p_mfe:.2f}R', color=GRIS,
-                     fontsize=7, ha='left', va='top')
-            ax1.set_title('Máxima Excursión Favorable (R)', fontsize=8, color=AX_FG)
-            ax1.set_xlabel('MFE (R)', fontsize=8, color=AX_FG)
-            ax1.set_ylabel('Nº Trades', fontsize=8, color=AX_FG)
-
-            subset_mfe = mfe[mfe <= p_mfe]
-            if len(subset_mfe) > 0:
-                mu = subset_mfe.mean()
-                sigma = subset_mfe.std()
-                ax1.axvline(mu, color=AZUL, linewidth=1.1, linestyle='-', alpha=0.9)
-                ax1.axvline(mu + sigma, color=AZUL, linewidth=0.8, linestyle='-', alpha=0.35)
-                ax1.axvline(mu - sigma, color=AZUL, linewidth=0.8, linestyle='-', alpha=0.35)
-                ax1.text(0.98, 0.02,
-                         f'μ={mu:.2f}R\n+σ={mu + sigma:.2f}R\n−σ={mu - sigma:.2f}R',
-                         transform=ax1.transAxes, color=AZUL, fontsize=7,
-                         ha='right', va='bottom',
-                         bbox=dict(facecolor=FIG_BG, alpha=0.75, edgecolor='none', pad=3))
-
-            ax2.hist(-mae, bins=30, color=ROJO, alpha=0.8)
-            ax2.set_xlim(right=0)
-            p_mae = np.percentile(mae, percentil)
-            ax2.axvline(-p_mae, color=GRIS, linewidth=0.9, linestyle='--')
-            ax2.text(-p_mae, ax2.get_ylim()[1], f'P{percentil}={-p_mae:.2f}R ', color=GRIS,
-                     fontsize=7, ha='right', va='top')
-            ax2.set_title('Máxima Excursión Adversa (R)', fontsize=8, color=AX_FG)
-            ax2.set_xlabel('MAE (R)', fontsize=8, color=AX_FG)
-            ax2.set_ylabel('Nº Trades', fontsize=8, color=AX_FG)
-
-            subset_mae = mae[mae <= p_mae]
-            if len(subset_mae) > 0:
-                mu = subset_mae.mean()
-                sigma = subset_mae.std()
-                ax2.axvline(-mu, color=AZUL, linewidth=1.1, linestyle='-', alpha=0.9)
-                ax2.axvline(-(mu - sigma), color=AZUL, linewidth=0.8, linestyle='-', alpha=0.35)
-                ax2.axvline(-(mu + sigma), color=AZUL, linewidth=0.8, linestyle='-', alpha=0.35)
-                ax2.text(0.98, 0.02,
-                         f'μ={-mu:.2f}R\n+σ={-(mu - sigma):.2f}R\n−σ={-(mu + sigma):.2f}R',
-                         transform=ax2.transAxes, color=AZUL, fontsize=7,
-                         ha='right', va='bottom',
-                         bbox=dict(facecolor=FIG_BG, alpha=0.75, edgecolor='none', pad=3))
-
-        try:
-            self.fig_mfe_mae.tight_layout(pad=0.6)
-        except Exception:
-            pass
-        self.canvas_mfe_mae.draw_idle()
+        return render_mfe_mae(self, payload)
 
 
 # ══════════════ sub-pestaña Optimizador (comparativa de combinaciones) ══════════════

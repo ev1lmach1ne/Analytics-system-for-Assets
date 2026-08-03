@@ -166,7 +166,8 @@ def _simular_numba(o, h, l, c, ent_long, ent_short, sal_long, sal_short,
                    max_trades, max_entradas,
                    capital_inicial, comision_pct, slippage_pct):
     """Bucle del motor. Devuelve (trades[n,12], n_trades, equity[n],
-    entradas[n,6], n_entradas, stop_track[n], entrada_track[n])."""
+    entradas[n,6], n_entradas, stop_track[n], entrada_track[n],
+    unidades_track[n])."""
     n = len(c)
     trades = np.zeros((max_trades, _N_COLS_TRADE))
     n_trades = 0
@@ -178,6 +179,11 @@ def _simular_numba(o, h, l, c, ent_long, ent_short, sal_long, sal_short,
     # del stop (ver «Mostrar operación» en la GUI), no afecta al resultado.
     stop_track = np.full(n, np.nan)
     entrada_track = np.full(n, np.nan)
+    # unidades abiertas al cierre de cada vela (0 fuera de posición). A
+    # diferencia de los dos anteriores esto SÍ alimenta una métrica —el capital
+    # medio comprometido—, así que lleva 0 y no NaN: una vela sin posición no es
+    # un hueco, es exposición cero.
+    unidades_track = np.zeros(n)
 
     cap = capital_inicial
     en_pos = False
@@ -702,6 +708,9 @@ def _simular_numba(o, h, l, c, ent_long, ent_short, sal_long, sal_short,
         # ── equity mark-to-market al cierre ──
         if en_pos:
             equity[i] = cap + (c[i] - precio_in) * unidades * dir_pos
+            # 'unidades' ya refleja los tramos añadidos y las parciales cerradas
+            # en esta vela, así que es el tamaño realmente vivo al cierre
+            unidades_track[i] = unidades
         else:
             equity[i] = cap
 
@@ -712,7 +721,7 @@ def _simular_numba(o, h, l, c, ent_long, ent_short, sal_long, sal_short,
                 stop_track[i] = stop_precio
 
     return (trades[:n_trades], n_trades, equity, entradas[:n_entradas],
-            n_entradas, stop_track, entrada_track)
+            n_entradas, stop_track, entrada_track, unidades_track)
 
 
 def simular(o, h, l, c, senales, config):
@@ -974,7 +983,7 @@ def simular(o, h, l, c, senales, config):
     max_entradas = min((n // 2 + 1) * max_por_posicion_e + 1, 3 * n + 8)
 
     (trades_arr, n_trades, equity, entradas_arr, n_entradas,
-     stop_track, entrada_track) = _simular_numba(
+     stop_track, entrada_track, unidades_track) = _simular_numba(
         o, h, l, c,
         np.ascontiguousarray(senales['entradas_long'], dtype=np.bool_),
         np.ascontiguousarray(senales['entradas_short'], dtype=np.bool_),
@@ -1046,22 +1055,48 @@ def simular(o, h, l, c, senales, config):
     trades['costo_comision'] = trades['notional_redondo'] * comision_pct_v
 
     # MFE/MAE: excursión favorable/adversa máxima durante la vida del trade,
-    # en múltiplos de R (mismo denominador que r_multiple) — aproximación
-    # estándar: usa el rango high/low de las velas [idx_entrada, idx_salida]
-    # inclusive, sin distinguir si el cierre fue a mercado o intra-vela.
+    # en múltiplos de R (mismo denominador que r_multiple).
+    #
+    # La vela de ENTRADA cuenta entera: se entra al open, así que todo su rango
+    # se recorrió con la posición abierta. La de SALIDA solo cuenta entera si el
+    # trade siguió vivo hasta su cierre (motivo 3 = salida por tiempo, 4 = fin
+    # de datos). En cualquier otra salida —al open por señal, o intra-vela por
+    # stop/TP/parcial— la posición ya estaba cerrada durante parte de esa vela,
+    # y contar su rango completo atribuiría al trade excursiones que nunca
+    # fueron capturables: inflaría el ETD con beneficio que no llegó a existir y
+    # hundiría la eficiencia de salida (un TP clavado en una vela que lo
+    # desborda marcaría muy por debajo del 100% que merece).
+    #
+    # Los precios de entrada y salida se añaden siempre como candidatos: ambos
+    # se tocaron con la posición abierta, por definición. Incluir el de entrada
+    # además garantiza mfe/mae >= 0 aunque el slippage deje precio_entrada fuera
+    # del rango high/low de su vela.
     mfe_precio = np.zeros(n_trades)
     mae_precio = np.zeros(n_trades)
+    salida_precio_rel = np.zeros(n_trades)   # distancia del extremo adverso a la salida
     for i in range(n_trades):
         i0, i1 = trades['idx_entrada'][i], trades['idx_salida'][i]
-        seg_h = h[i0:i1 + 1]
-        seg_l = l[i0:i1 + 1]
         pin = trades['precio_entrada'][i]
+        pout = trades['precio_salida'][i]
+        motivo_i = trades['motivo'][i]
+        cierra_al_close = (motivo_i == 3 or motivo_i == 4)
+        # max(i0 + 1, ...): la vela de entrada entra SIEMPRE, aunque el trade
+        # se cierre en ella misma (i0 == i1, típico de un stop tocado el mismo
+        # día que se abre). Descontarla dejaría el trade sin rango alguno y con
+        # una eficiencia de entrada degenerada al 0%.
+        fin = max(i0 + 1, i1 + 1 if cierra_al_close else i1)
+        seg_h = h[i0:fin]
+        seg_l = l[i0:fin]
+        alto = max(seg_h.max(), pin, pout)
+        bajo = min(seg_l.min(), pin, pout)
         if trades['dir'][i] > 0:
-            mfe_precio[i] = seg_h.max() - pin
-            mae_precio[i] = pin - seg_l.min()
+            mfe_precio[i] = alto - pin
+            mae_precio[i] = pin - bajo
+            salida_precio_rel[i] = pout - bajo
         else:
-            mfe_precio[i] = pin - seg_l.min()
-            mae_precio[i] = seg_h.max() - pin
+            mfe_precio[i] = pin - bajo
+            mae_precio[i] = alto - pin
+            salida_precio_rel[i] = alto - pout
 
     with np.errstate(divide='ignore', invalid='ignore'):
         trades['mfe_r'] = np.where(riesgo_absoluto > 0,
@@ -1069,13 +1104,53 @@ def simular(o, h, l, c, senales, config):
         trades['mae_r'] = np.where(riesgo_absoluto > 0,
             mae_precio * trades['unidades'] / riesgo_absoluto, 0.0)
 
+    # ETD (End Trade Drawdown): cuánto beneficio no realizado se devolvió antes
+    # de cerrar, en R. Diferencia absoluta, no cociente: es la forma estable de
+    # expresar "lo que dejé en la mesa" (ver más abajo por qué el cociente no lo
+    # es). Nunca negativo, porque el precio de salida entra en el cálculo del MFE.
+    trades['etd_r'] = trades['mfe_r'] - trades['r_multiple']
+
+    # Eficiencias de entrada y salida (Sweeney): posición relativa del precio de
+    # entrada y del de salida dentro del rango [mín, máx] que el trade llegó a
+    # recorrer. Ambas comparten denominador —el rango completo— y por eso caen
+    # siempre en [0, 100]: entrada y salida son, por definición, precios que se
+    # tocaron con la posición abierta.
+    #
+    #   entrada 100% = se compró justo en el mínimo (o se vendió en el máximo)
+    #   salida  100% = se cerró justo en la cima del recorrido
+    #
+    # La salida NO se normaliza por el MFE (r_multiple / mfe_r). Ese cociente
+    # parece medir lo mismo, pero su denominador tiende a cero justo en los
+    # trades que peor van: un perdedor que avanzó 0.01 R a favor y luego se paró
+    # en el stop daba −8600 %. En un sistema con stop y TP eso afectaba a ~3 de
+    # cada 4 trades y hundía la media a valores sin sentido, mientras el
+    # histograma —acotado a 0-100— solo dibujaba el cuarto restante. El "% del
+    # MFE capturado" sigue disponible y estable a través de etd_r.
+    rango_precio = mfe_precio + mae_precio
+    denom_r = trades['mfe_r'] + trades['mae_r']
+    with np.errstate(divide='ignore', invalid='ignore'):
+        trades['eficiencia_entrada'] = np.where(
+            denom_r > 0,
+            np.clip(trades['mfe_r'] / denom_r * 100.0, 0.0, 100.0), np.nan)
+        trades['eficiencia_salida'] = np.where(
+            rango_precio > 0,
+            np.clip(salida_precio_rel / rango_precio * 100.0, 0.0, 100.0), np.nan)
+
     eq_max = np.maximum.accumulate(equity)
     with np.errstate(divide='ignore', invalid='ignore'):
         drawdown = np.where(eq_max > 0, equity / eq_max - 1.0, 0.0)
 
+    # Fracción del capital comprometida en el mercado al cierre de cada vela
+    # (0 fuera de posición). Puede pasar de 1.0: el sizing es por riesgo, no por
+    # capital, así que un stop estrecho compra más notional del que hay en caja
+    # — eso es apalancamiento real y se reporta como tal, sin recortar.
+    with np.errstate(divide='ignore', invalid='ignore'):
+        exposicion_track = np.where(equity > 0, unidades_track * c / equity, 0.0)
+
     return {'trades': trades, 'entradas': entradas, 'equity': equity,
             'drawdown': drawdown,
             'stop_track': stop_track, 'entrada_track': entrada_track,
+            'exposicion_track': exposicion_track,
             'capital_final': float(equity[-1]) if n else 0.0,
             'n_trades': int(n_trades)}
 
@@ -1143,6 +1218,90 @@ def _r2_equity(eq):
     return 1.0 - ss_res / ss_tot
 
 
+def resultado_filtrado(resultado, direccion=0, capital_inicial=None):
+    """Recorta un resultado de simular() a una sola dirección de trade.
+
+    direccion: +1 solo largos, -1 solo cortos, 0 (por defecto) todos.
+
+    Devuelve un dict con la misma forma que simular() — apto para pasarlo tal
+    cual a calcular_metricas() o a montecarlo() — pero con los arrays de
+    'trades' y 'entradas' filtrados por 'dir' y con la equity RECONSTRUIDA.
+
+    Por qué hay que reconstruirla: resultado['equity'] se marca a mercado vela
+    a vela (incluye el PnL no realizado de la posición abierta), así que es una
+    única curva que mezcla ambos lados y no se puede trocear. Aquí se compone
+    capital_inicial * cumprod(1 + ret_pct) sobre los trades que sobreviven al
+    filtro, escalonando el salto en la vela de SALIDA de cada uno: la curva de
+    cierres realizados de "qué habría pasado operando solo ese lado".
+
+    Consecuencia a tener presente: con direccion=0 los recuentos y las métricas
+    de trade (n_trades, win rate, profit factor, expectancy...) coinciden
+    exactamente con las del resultado original, pero las métricas de curva
+    (retorno, max drawdown, Sharpe, R², Ulcer, tiempos de recuperación) pueden
+    diferir ligeramente, porque el original las mide sobre la equity marcada a
+    mercado y aquí se miden sobre la de cierres realizados. Es el precio de que
+    los tres modos (todos / largos / cortos) sean comparables entre sí.
+
+    exposicion_track se conserva pero puesto a 0 en las velas que no pertenecen
+    a ningún trade del filtro. Es correcto porque el motor mantiene una sola
+    posición a la vez, de modo que los intervalos [entrada, salida] de trades
+    distintos nunca se solapan.
+    """
+    tr = resultado['trades']
+    equity_orig = np.asarray(resultado['equity'], dtype=np.float64)
+    n = len(equity_orig)
+    direccion = int(direccion)
+
+    n_tr = len(tr['dir'])
+    m = (np.ones(n_tr, dtype=bool) if direccion == 0
+         else (tr['dir'] == direccion))
+    tr_f = {k: v[m] for k, v in tr.items()}
+    # posición de cada trade superviviente en el array sin filtrar: permite a la
+    # GUI volver del trade mostrado al original (centrar el gráfico, etc.)
+    tr_f['idx_original'] = np.nonzero(m)[0].astype(np.int64)
+
+    entr = resultado.get('entradas')
+    if entr is not None and len(entr.get('dir', ())):
+        me = (np.ones(len(entr['dir']), dtype=bool) if direccion == 0
+              else (entr['dir'] == direccion))
+        entr_f = {k: v[me] for k, v in entr.items()}
+    else:
+        entr_f = entr
+
+    cap0 = float(capital_inicial if capital_inicial is not None
+                 else (equity_orig[0] if n else 0.0))
+    if cap0 <= 0:
+        cap0 = 1.0
+
+    equity = np.full(n, cap0, dtype=np.float64)
+    if n and len(tr_f['idx_salida']):
+        orden = np.argsort(tr_f['idx_salida'], kind='stable')
+        idx_sal = tr_f['idx_salida'][orden].astype(np.int64)
+        acum = cap0 * np.cumprod(1.0 + tr_f['ret_pct'][orden].astype(np.float64))
+        # nº de trades ya cerrados en cada vela -> valor de la curva ahí
+        cerrados = np.searchsorted(idx_sal, np.arange(n), side='right')
+        equity = np.where(cerrados > 0, acum[np.maximum(cerrados - 1, 0)], cap0)
+
+    eq_max = np.maximum.accumulate(equity) if n else equity
+    with np.errstate(divide='ignore', invalid='ignore'):
+        drawdown = np.where(eq_max > 0, equity / eq_max - 1.0, 0.0)
+
+    expo = resultado.get('exposicion_track')
+    if expo is not None and n:
+        dentro = np.zeros(n, dtype=bool)
+        for a, b in zip(tr_f['idx_entrada'], tr_f['idx_salida']):
+            dentro[int(a):int(b) + 1] = True
+        expo = np.where(dentro, np.asarray(expo, dtype=np.float64), 0.0)
+
+    return {'trades': tr_f, 'entradas': entr_f, 'equity': equity,
+            'drawdown': drawdown,
+            'stop_track': resultado.get('stop_track'),
+            'entrada_track': resultado.get('entrada_track'),
+            'exposicion_track': expo,
+            'capital_final': float(equity[-1]) if n else 0.0,
+            'n_trades': int(m.sum())}
+
+
 def calcular_metricas(resultado, idx_ini=0, idx_fin=None, velas_por_anio=None):
     """Métricas de un tramo [idx_ini, idx_fin) del resultado de simular().
     Un trade pertenece al tramo si su vela de ENTRADA cae dentro.
@@ -1170,6 +1329,21 @@ def calcular_metricas(resultado, idx_ini=0, idx_fin=None, velas_por_anio=None):
       se calcula con el tramo en ganancia neta (pnl_total > 0): en pérdidas
       la "ganancia bruta" puede quedar accidentalmente positiva y pequeña,
       disparando el ratio a valores sin sentido.
+
+    Y un bloque de EXPOSICIÓN, que responde a cuánto tiempo y cuánto capital
+    hace falta inmovilizar para conseguir ese retorno:
+    - exposicion_pct: % de las velas del tramo con posición abierta. A
+      diferencia del resto de métricas, un trade NO se asigna al tramo por su
+      vela de entrada: su intervalo se recorta a la ventana, porque un trade
+      que entra en IS y sale en OOS ocupa tiempo real en ambos.
+    - exposicion_capital_pct: fracción media del capital comprometida, contando
+      las velas en plano como 0. Distingue lo que exposicion_pct no puede: estar
+      dentro con el 20% del tamaño vivo no es estar dentro con el 100%. Puede
+      superar el 100% (apalancamiento). Requiere 'exposicion_track' en el
+      resultado; con dicts de trades armados a mano queda None.
+    - retorno_ajustado_exposicion_pct: retorno anualizado / exposición. Un 11%
+      anual con el 10% de exposición da 110%; el mismo 11% con el 90% da 12.2%.
+      None si no se anualiza (velas_por_anio) o si no hubo exposición.
     """
     equity = resultado['equity']
     n = len(equity)
@@ -1188,10 +1362,32 @@ def calcular_metricas(resultado, idx_ini=0, idx_fin=None, velas_por_anio=None):
            'r2_equity': None, 'dd_promedio_pct': None,
            'tiempo_recuperacion_medio': None, 'tiempo_recuperacion_max': None,
            'sqn': None, 'payoff_ratio': None, 'pct_mejor_trade': None,
-           'slippage_minimo_pct': None, 'impacto_comisiones_pct': None}
+           'slippage_minimo_pct': None, 'impacto_comisiones_pct': None,
+           'ulcer_index': None, 'etd_r_medio': None,
+           'eficiencia_entrada_media': None, 'eficiencia_salida_media': None,
+           'exposicion_pct': 0.0, 'exposicion_capital_pct': None,
+           'retorno_ajustado_exposicion_pct': None}
 
     if idx_fin <= idx_ini:
         return out
+
+    # ── exposición: unión de los intervalos [entrada, salida] ──
+    # Sumar (idx_salida - idx_entrada) contaría velas repetidas, porque las
+    # salidas parciales generan varias filas que comparten idx_entrada y solo
+    # cambian idx_salida. La unión las colapsa y llega hasta la última parcial,
+    # que es cuando la posición está cerrada del todo. El motor mantiene una
+    # sola posición a la vez, así que intervalos de posiciones distintas nunca
+    # se solapan. Inclusive en el extremo: un trade que entra y sale en la misma
+    # vela (stop tocado el día de la entrada) ocupa 1 vela, no 0.
+    en_mercado = np.zeros(n, dtype=bool)
+    for a, b in zip(tr['idx_entrada'], tr['idx_salida']):
+        en_mercado[int(a):int(b) + 1] = True
+    out['exposicion_pct'] = float(en_mercado[idx_ini:idx_fin].mean()) * 100.0
+
+    expo_track = resultado.get('exposicion_track')
+    if expo_track is not None:
+        out['exposicion_capital_pct'] = float(
+            np.mean(expo_track[idx_ini:idx_fin])) * 100.0
 
     eq = equity[idx_ini:idx_fin]
     eq0 = eq[0] if eq[0] > 0 else 1.0
@@ -1200,6 +1396,7 @@ def calcular_metricas(resultado, idx_ini=0, idx_fin=None, velas_por_anio=None):
     with np.errstate(divide='ignore', invalid='ignore'):
         dd = np.where(eq_max > 0, eq / eq_max - 1.0, 0.0)
     out['max_dd_pct'] = float(dd.min()) * 100.0
+    out['ulcer_index'] = float(np.sqrt(np.mean(dd ** 2))) * 100.0
     out['r2_equity'] = _r2_equity(eq)
 
     episodios = _analizar_drawdowns(eq)
@@ -1222,6 +1419,13 @@ def calcular_metricas(resultado, idx_ini=0, idx_fin=None, velas_por_anio=None):
         if anios > 0 and eq[-1] > 0:
             out['retorno_anual_pct'] = float((eq[-1] / eq0) ** (1.0 / anios) - 1.0) * 100.0
 
+    # retorno por unidad de tiempo expuesto: lo que permite comparar un sistema
+    # que renta poco pero casi nunca está dentro con otro que renta lo mismo
+    # sin salir nunca. Conserva el signo: en pérdidas el ratio es negativo.
+    if out['retorno_anual_pct'] is not None and out['exposicion_pct'] > 0:
+        out['retorno_ajustado_exposicion_pct'] = \
+            out['retorno_anual_pct'] / out['exposicion_pct'] * 100.0
+
     if len(pnl):
         ganadores = pnl > 0
         out['win_rate'] = float(ganadores.mean())
@@ -1240,6 +1444,21 @@ def calcular_metricas(resultado, idx_ini=0, idx_fin=None, velas_por_anio=None):
         r_mult = tr['r_multiple'][m]
         if len(r_mult) >= 2 and np.std(r_mult) > 0:
             out['sqn'] = float(np.sqrt(len(r_mult)) * np.mean(r_mult) / np.std(r_mult))
+        # columnas derivadas opcionales: calcular_metricas también admite dicts
+        # de trades construidos a mano (tests, herramientas externas) que solo
+        # traen lo básico, así que se ausentan sin romper el resto de métricas
+        def _col(nombre):
+            return tr[nombre][m] if nombre in tr else np.full(int(m.sum()), np.nan)
+
+        etd_v = _col('etd_r')
+        ent_v = _col('eficiencia_entrada')
+        sal_v = _col('eficiencia_salida')
+        if np.any(~np.isnan(etd_v)):
+            out['etd_r_medio'] = float(np.nanmean(etd_v))
+        if np.any(~np.isnan(ent_v)):
+            out['eficiencia_entrada_media'] = float(np.nanmean(ent_v))
+        if np.any(~np.isnan(sal_v)):
+            out['eficiencia_salida_media'] = float(np.nanmean(sal_v))
         if ganadores.any() and (~ganadores).any():
             perdida_media = float(-pnl[~ganadores].mean())
             if perdida_media > 0:

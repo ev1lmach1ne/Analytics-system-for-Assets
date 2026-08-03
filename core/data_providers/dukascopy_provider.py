@@ -51,15 +51,29 @@ _BATCH_HOURS = 500            # horas por lote (control de memoria + progreso).
 # Descargas de decadas en 1m pueden tardar dias reales (Dukascopy limita la
 # concurrencia). Cada lote ya resampleado se guarda en disco segun se
 # completa; si el proceso se corta a mitad, relanzar la misma descarga
-# (mismo simbolo/tf/rango) reanuda desde el ultimo lote guardado en vez de
+# (mismo simbolo/tf/inicio) reanuda desde el ultimo lote guardado en vez de
 # volver a empezar.
+#
+# La clave NO incluye la fecha fin a proposito: en modo "toda la historia"
+# el fin se recalcula en cada corrida (es "ahora"/la ultima fecha publicada
+# por Dukascopy) y cambia de una ejecucion a otra, incluso el mismo dia. Si
+# la clave dependiera del fin, cada reintento generaria una clave distinta
+# y jamas encontraria los checkpoints de la corrida anterior (exactamente
+# el sintoma de "empieza desde 0%"). Cada lote es siempre el mismo rango de
+# horas fijo (start + N*_BATCH_HOURS) sin importar donde termine el rango
+# total, asi que reusarlos por indice es seguro; para detectar el caso
+# borde en que el ultimo lote de una corrida anterior quedo mas corto de lo
+# que ahora deberia ser (el fin crecio), cada checkpoint guarda tambien
+# cuantas horas cubria, y solo se reutiliza si coincide con las horas que
+# le corresponden en la corrida actual.
 _CHECKPOINT_DIR = os.path.join(tempfile.gettempdir(), 'analytics_cache', 'dukascopy_checkpoints')
-_CHECKPOINT_MAX_AGE_DAYS = 7  # limpieza de checkpoints huerfanos muy viejos
+_CHECKPOINT_MAX_AGE_DAYS = 7  # limpieza de checkpoints huerfanos muy viejos (tambien acota
+                              # cuanto tiempo vive el cache incremental de "toda la historia")
 
 
-def _checkpoint_key(symbol: str, tf: str, start: datetime, end: datetime) -> str:
+def _checkpoint_key(symbol: str, tf: str, start: datetime) -> str:
     safe_symbol = symbol.replace('/', '_').replace(':', '_')
-    return f"{safe_symbol}_{tf}_{start.strftime('%Y%m%dT%H')}_{end.strftime('%Y%m%dT%H')}"
+    return f"{safe_symbol}_{tf}_{start.strftime('%Y%m%dT%H')}"
 
 
 def _checkpoint_batch_path(key: str, batch_idx: int) -> str:
@@ -74,14 +88,6 @@ def _cleanup_old_checkpoints():
         for path in glob.glob(os.path.join(_CHECKPOINT_DIR, '*.pkl')):
             if os.path.getmtime(path) < cutoff:
                 os.remove(path)
-    except Exception:
-        pass
-
-
-def _cleanup_checkpoints_for_key(key: str):
-    try:
-        for path in glob.glob(os.path.join(_CHECKPOINT_DIR, f"{key}__batch*.pkl")):
-            os.remove(path)
     except Exception:
         pass
 
@@ -379,7 +385,7 @@ class DukascopyProvider(BaseProvider):
         batches = [hours[i:i + _BATCH_HOURS] for i in range(0, total, _BATCH_HOURS)]
 
         _cleanup_old_checkpoints()
-        checkpoint_key = _checkpoint_key(symbol, tf, start, end)
+        checkpoint_key = _checkpoint_key(symbol, tf, start)
         os.makedirs(_CHECKPOINT_DIR, exist_ok=True)
         resumed_batches = 0
 
@@ -387,7 +393,11 @@ class DukascopyProvider(BaseProvider):
             cp_path = _checkpoint_batch_path(checkpoint_key, batch_idx)
             if os.path.exists(cp_path):
                 try:
-                    saved_chunk = pd.read_pickle(cp_path)
+                    saved_n_hours, saved_chunk = pd.read_pickle(cp_path)
+                    if saved_n_hours != len(batch):
+                        raise ValueError(
+                            f"checkpoint cubre {saved_n_hours}h, este lote ahora tiene {len(batch)}h"
+                        )
                     if saved_chunk is not None and len(saved_chunk) > 0:
                         ohlc_chunks.append(saved_chunk)
                     resumed_batches += 1
@@ -401,7 +411,7 @@ class DukascopyProvider(BaseProvider):
                 except Exception as e:
                     if progress_callback:
                         progress_callback(
-                            f"  ⚠ Checkpoint del lote {batch_idx + 1}/{len(batches)} corrupto o ilegible "
+                            f"  ⚠ Checkpoint del lote {batch_idx + 1}/{len(batches)} invalido "
                             f"({e.__class__.__name__}): se volvera a descargar"
                         )
 
@@ -427,7 +437,10 @@ class DukascopyProvider(BaseProvider):
             if batch_chunk is not None:
                 ohlc_chunks.append(batch_chunk)
             try:
-                (batch_chunk if batch_chunk is not None else pd.DataFrame()).to_pickle(cp_path)
+                pd.to_pickle(
+                    (len(batch), batch_chunk if batch_chunk is not None else pd.DataFrame()),
+                    cp_path,
+                )
             except Exception as e:
                 # No bloquear la descarga si falla el guardado del checkpoint
                 # (ej. disco lleno o sin permisos), pero avisar: si se
@@ -459,8 +472,11 @@ class DukascopyProvider(BaseProvider):
         ohlc.rename(columns={'time': 'timestamp'}, inplace=True)
         ohlc['timestamp'] = ohlc['timestamp'].dt.tz_localize('UTC')
 
-        # Descarga completa: los checkpoints de esta clave ya no hacen falta.
-        _cleanup_checkpoints_for_key(checkpoint_key)
+        # Los checkpoints NO se borran al completar: como la clave no depende
+        # del fin, sirven de cache incremental para la proxima descarga de
+        # "toda la historia" de este simbolo/tf (solo habra que bajar las
+        # horas nuevas). Los huerfanos se limpian solos via
+        # _cleanup_old_checkpoints tras _CHECKPOINT_MAX_AGE_DAYS de inactividad.
 
         if progress_callback:
             progress_callback(f"Velas {tf} generadas: {len(ohlc):,}")

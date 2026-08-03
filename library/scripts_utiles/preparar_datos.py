@@ -7,20 +7,29 @@ from pathlib import Path
 import os
 import csv
 import sys
-import tkinter as tk
-from tkinter import filedialog
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 from core.config import CONFIG_PATH, QUESTDB_HOST, QUESTDB_HTTP_PORT, DB_CONFIG
 from core.parsing import parse_columna_flexible
-import customtkinter as ctk
 import re
-sys.stdout.reconfigure(encoding='utf-8')
+
+# tkinter/customtkinter se importan DENTRO de las ramas interactivas, no aquí:
+# solo hacen falta cuando el script se usa suelto desde la línea de comandos.
+# Lanzado desde la GUI siempre llegan CSV_INPUT y CONFIG_SKIP, así que esas
+# ramas no se ejecutan — y al ir empaquetado con PyInstaller esos módulos no
+# viajan dentro del .exe, con lo que importarlos arriba rompía la importación
+# entera ("No module named 'tkinter'").
+# errors='replace' explícito: reconfigure(encoding=...) a secas deja errors en
+# 'strict', y eso deshace la tolerancia que app.py deja puesta al lanzar el
+# script desde el .exe empaquetado.
+sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
 CSV_INPUT = os.environ.get('CSV_INPUT', '')
 
 # ── 1. FILE DIALOG (skip if CSV_INPUT env is set) ──
 if not CSV_INPUT:
     try:
+        import tkinter as tk
+        from tkinter import filedialog
         root = tk.Tk()
         root.withdraw()
         CSV_INPUT = filedialog.askopenfilename(title="Selecciona el archivo CSV", filetypes=[("CSV", "*.csv")])
@@ -39,6 +48,7 @@ if CONFIG_SKIP:
     TIMEFRAME     = os.environ.get('CONFIG_TF', '1h')
     TIPO_ACTIVO   = os.environ.get('CONFIG_ACTIVO', 'FUTURO')
 else:
+    import customtkinter as ctk
     SEL_NOMBRE  = ['']
     SEL_TIPO    = [0]  # 0=Futuro, 1=Stock, 2=Crypto
     SEL_TF      = [6]  # index in TF_LABELS (default = 1h)

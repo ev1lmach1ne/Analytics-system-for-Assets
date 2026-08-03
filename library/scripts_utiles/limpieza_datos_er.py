@@ -7,7 +7,10 @@ import os
 import warnings
 warnings.filterwarnings('ignore')
 import sys
-sys.stdout.reconfigure(encoding='utf-8')
+# errors='replace' explícito: reconfigure(encoding=...) a secas deja errors en
+# 'strict', deshaciendo la tolerancia que app.py deja puesta al lanzar el
+# script desde el .exe empaquetado.
+sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 from core.config import CONFIG_PATH, LIMPIADOS_DIR, DB_CONFIG, normalizar_categoria_descarga
 from core.metrics import calcular_umbrales_er, contar_regimen_hurst, hurst_rs_numba, calcular_hurst_array

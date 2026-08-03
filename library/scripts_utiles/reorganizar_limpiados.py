@@ -49,8 +49,13 @@ _ACTIVO_A_CATEGORIA = {
 
 def _categoria_de_carpeta(asset_dir: str) -> str:
     """Lee el primer .meta.json que encuentre dentro de la carpeta del
-    activo y resuelve la categoria de forma determinista (ver comentario
-    de _ACTIVO_A_CATEGORIA)."""
+    activo y resuelve la categoria de forma determinista.
+
+    Se mira primero 'categoria', que la pestana Importar deduce de la ruta
+    de descarga de origen (p.ej. ccxt/CRYPTO/link_usdt -> CRYPTO): es un
+    dato fino y fiable. Solo si falta o no es una categoria conocida se cae
+    a 'activo', que sale de un desplegable que arranca en Futuro/Cfd y que
+    el usuario puede no haber tocado (ver comentario de _ACTIVO_A_CATEGORIA)."""
     try:
         nombres = os.listdir(asset_dir)
     except OSError:
@@ -63,6 +68,9 @@ def _categoria_de_carpeta(asset_dir: str) -> str:
                 meta = json.load(f)
         except (OSError, json.JSONDecodeError):
             continue
+        categoria = (meta.get('categoria') or '').upper()
+        if categoria in CATEGORIAS_CONOCIDAS and categoria != 'OTROS':
+            return categoria
         activo = (meta.get('activo') or '').upper()
         if activo in _ACTIVO_A_CATEGORIA:
             return _ACTIVO_A_CATEGORIA[activo]
