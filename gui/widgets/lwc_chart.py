@@ -23,8 +23,10 @@ import pandas as pd
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel
 from PyQt6.QtCore import QUrl
 
+from core.backtest import ORDEN_RELLENADA
 from core.strategies import (
     sma, ema, rsi, atr, bollinger, stochastic, williams_r, cci, _kama_serie,
+    _zigzag_pivotes, tramos_zigzag_vigentes,
 )
 from core.candle_patterns import detectar_patrones
 
@@ -68,6 +70,9 @@ _VERDE_FLECHA = '#1b8a3a'   # compra (abre largo / cierra corto) — más oscuro
 _ROJO_FLECHA = '#ff1744'    # venta (abre corto / cierra largo)
 _AZUL = '#4fc3f7'
 _AMBAR = '#f1c40f'
+_AZUL_ZIGZAG = '#2962FF'    # azul del ZigZag de TradingView; distinto de _AZUL,
+                            # que abre la paleta de medias
+_AMARILLO_FIB = '#c9a227'   # tramos de Fibonacci, apagado para quedar de fondo
 
 # paletas de indicadores/osciladores duplicadas de tab_backtest.py
 # (_dibujar_principal / _dibujar_panel_oscilador) para que la vista moderna
@@ -225,7 +230,8 @@ class LwcChart(QWidget):
         return self._js_cache
 
     def mostrar(self, payload, mostrar_trayecto=True, mostrar_stop=False,
-                mostrar_noticias=False, eventos_noticias=None, indicadores=None):
+                mostrar_noticias=False, eventos_noticias=None, indicadores=None,
+                capas=None):
         """Pinta velas + marcadores de operaciones del payload del backtest
         (mismo dict que consume ResultadosWidget). mostrar_trayecto/mostrar_stop
         reflejan los checkboxes homónimos de la vista clásica, para que ambas
@@ -236,14 +242,15 @@ class LwcChart(QWidget):
         _recolectar_indicadores (tab_backtest.py) — si se pasa, se dibujan
         los mismos overlays (medias/Bollinger/KAMA/patrones) y paneles de
         oscilador (RSI/ATR/Stochastic/Williams %R/CCI) que en la vista
-        clásica."""
+        clásica. capas: {'zigzag','fib','ordenes'} -> bool, los tres ojos de la
+        vista clásica; ausente = todas encendidas."""
         self._ensure_view()
         if self.view is None or payload is None:
             return
         (candles, markers, trayectos, stop_track_pts, entrada_track_pts,
          eventos, overlays, bandas, osciladores) = self._construir_datos(
             payload, mostrar_trayecto, mostrar_stop, mostrar_noticias,
-            eventos_noticias, indicadores)
+            eventos_noticias, indicadores, capas)
         # mismo criterio de alto que el canvas clásico (ver
         # ResultadosWidget._dibujar_principal en tab_backtest.py), para que
         # ambas vistas reserven el mismo espacio al tener paneles de oscilador
@@ -270,7 +277,7 @@ class LwcChart(QWidget):
     @staticmethod
     def _construir_datos(payload, mostrar_trayecto=True, mostrar_stop=False,
                           mostrar_noticias=False, eventos_noticias=None,
-                          indicadores=None):
+                          indicadores=None, capas=None):
         ts = pd.DatetimeIndex(payload['timestamps'])
         unix = (ts.asi8 // 1_000_000_000).astype(np.int64)   # segundos UTC
         o = np.asarray(payload['open'], dtype=float)
@@ -286,9 +293,15 @@ class LwcChart(QWidget):
         n_tr = len(tr.get('pnl', []))
         n = len(unix)
 
-        def _marcador(t, arriba, color, texto):
+        def _marcador(t, arriba, color, texto, precio):
+            # anclado al PRECIO de ejecución, no al borde de la vela: es lo que
+            # permite comprobar a ojo que una orden límite se llenó en su nivel
+            # y que una entrada a mercado incorpora el slippage simulado.
+            # Contrapartida: con 'atPrice*' la librería deja de apilar los
+            # marcadores para evitar solapes, así que dos operaciones a precios
+            # parecidos en la misma vela se pisan.
             markers.append({'time': int(t), 'text': texto, 'color': color,
-                            'position': 'aboveBar' if arriba else 'belowBar',
+                            'position': 'atPriceMiddle', 'price': float(precio),
                             'shape': 'arrowDown' if arriba else 'arrowUp'})
 
         for r in range(n_tr):
@@ -297,11 +310,11 @@ class LwcChart(QWidget):
                 continue
             ent, sal = float(tr['precio_entrada'][r]), float(tr['precio_salida'][r])
             if int(tr['dir'][r]) > 0:      # largo: compra al entrar, venta al salir
-                _marcador(unix[ie], False, _VERDE_FLECHA, 'C')
-                _marcador(unix[ix], True, _ROJO_FLECHA, 'V')
+                _marcador(unix[ie], False, _VERDE_FLECHA, 'C', ent)
+                _marcador(unix[ix], True, _ROJO_FLECHA, 'V', sal)
             else:                          # corto: venta al entrar, compra al salir
-                _marcador(unix[ie], True, _ROJO_FLECHA, 'V')
-                _marcador(unix[ix], False, _VERDE_FLECHA, 'C')
+                _marcador(unix[ie], True, _ROJO_FLECHA, 'V', ent)
+                _marcador(unix[ix], False, _VERDE_FLECHA, 'C', sal)
             if mostrar_trayecto:
                 trayectos.append([{'time': int(unix[ie]), 'value': ent},
                                   {'time': int(unix[ix]), 'value': sal}])
@@ -343,13 +356,15 @@ class LwcChart(QWidget):
             markers.append({
                 'time': int(unix[ik]), 'text': 'T',
                 'color': _VERDE_FLECHA if largo else _ROJO_FLECHA,
-                'position': 'belowBar' if largo else 'aboveBar',
+                'position': 'atPriceMiddle', 'price': float(entr['precio'][k]),
                 'shape': 'circle',
             })
 
         overlays, bandas, osciladores, patron_markers = (
             LwcChart._construir_indicadores(unix, c, h, l, o, indicadores))
         markers += patron_markers
+        overlays += LwcChart._construir_capas_limite(
+            unix, h, l, resultado, indicadores, capas)
 
         # dedup: cuando un trade se cierra y otro se abre en la misma vela
         # (ej. reversión) se generan dos marcadores idénticos (mismo time/
@@ -358,7 +373,10 @@ class LwcChart(QWidget):
         vistos = set()
         markers_unicos = []
         for m in markers:
-            clave = (m['time'], m['position'], m['shape'], m['color'])
+            # el precio entra en la clave: ahora todos los marcadores comparten
+            # position='atPriceMiddle', así que sin él dos ejecuciones a precios
+            # distintos en la misma vela se descartarían como duplicadas
+            clave = (m['time'], m.get('price'), m['shape'], m['color'])
             if clave in vistos:
                 continue
             vistos.add(clave)
@@ -382,6 +400,94 @@ class LwcChart(QWidget):
                                  {'time': int(t_ev), 'value': hi}])
         return (candles, markers, trayectos, stop_track_pts, entrada_track_pts,
                 eventos, overlays, bandas, osciladores)
+
+    @staticmethod
+    def _construir_capas_limite(unix, h, l, resultado, indicadores, capas):
+        """Series de las tres capas de la entrada por orden límite: polilínea
+        del ZigZag, tramos de Fibonacci de cada orden ejecutada y las propias
+        órdenes (estas sí, todas, con su color según el desenlace).
+
+        Devuelve overlays con el mismo formato que _construir_indicadores, para
+        que la vista moderna enseñe lo mismo que la clásica (ver
+        ResultadosWidget._dibujar_principal en tab_backtest.py).
+
+        Los segmentos que no cubren todo el histórico se emiten como series de
+        longitud n con huecos ("whitespace", punto sin 'value'), igual que
+        stop_track más arriba: es como Lightweight Charts corta una línea.
+        """
+        capas = capas or {}
+        overlays = []
+        if not indicadores:
+            return overlays
+        n = len(unix)
+        df_zz = pd.DataFrame({'high': h, 'low': l})
+
+        def _serie_con_huecos(valores):
+            return [{'time': int(unix[i])} if not np.isfinite(valores[i])
+                    else {'time': int(unix[i]), 'value': float(valores[i])}
+                    for i in range(n)]
+
+        if capas.get('zigzag', True):
+            for desviacion, piernas in sorted(indicadores.get('zigzags', ())):
+                # puntos ralos: LineSeries une los pivotes consecutivos, así que
+                # no hace falta rellenar las velas intermedias
+                datos = [{'time': int(unix[i]), 'value': float(precio)}
+                         for i, _conf, precio, _tipo
+                         in _zigzag_pivotes(df_zz, desviacion, piernas)
+                         if i < n]
+                if datos:
+                    overlays.append({'color': _AZUL_ZIGZAG, 'data': datos})
+
+        ol = (resultado or {}).get('ordenes_limite') or {}
+        n_ordenes = len(ol.get('idx_alta', ()))
+        if not n_ordenes:
+            return overlays
+
+        # solo las órdenes rellenadas dibujan su swing, igual que en la vista
+        # clásica (ver _dibujar_principal en tab_backtest.py): colocar la orden
+        # no significa que el retroceso llegara a producirse
+        fibs = indicadores.get('fibs') or {}
+        if capas.get('fib', True) and fibs:
+            origen = np.full(n, np.nan)
+            extremo = np.full(n, np.nan)
+            cache = {}
+            for k in range(n_ordenes):
+                if int(ol['resultado'][k]) != ORDEN_RELLENADA:
+                    continue
+                sid = int(ol['setup'][k])
+                if sid not in fibs:
+                    continue
+                desv, piernas, _nivel = fibs[sid]
+                if (desv, piernas) not in cache:
+                    cache[(desv, piernas)] = tramos_zigzag_vigentes(
+                        df_zz, desv, piernas)
+                tramos = cache[(desv, piernas)]
+                i0, i1 = int(ol['idx_alta'][k]), int(ol['idx_fin'][k])
+                if i0 >= n or i1 >= n:
+                    continue
+                origen[i0:i1 + 1] = tramos['anterior'][i0]
+                extremo[i0:i1 + 1] = tramos['ultimo'][i0]
+            if np.isfinite(origen).any():
+                overlays.append({'color': _AMARILLO_FIB,
+                                 'data': _serie_con_huecos(origen)})
+                overlays.append({'color': _AMARILLO_FIB,
+                                 'data': _serie_con_huecos(extremo)})
+
+        if capas.get('ordenes', True):
+            # una serie por desenlace, para que cada una lleve su color
+            for codigo, color in ((0, _VERDE), (1, _GRIS), (2, _AMBAR)):
+                precios = np.full(n, np.nan)
+                for k in range(n_ordenes):
+                    if int(ol['resultado'][k]) != codigo:
+                        continue
+                    i0, i1 = int(ol['idx_alta'][k]), int(ol['idx_fin'][k])
+                    if i0 >= n or i1 >= n:
+                        continue
+                    precios[i0:i1 + 1] = float(ol['precio'][k])
+                if np.isfinite(precios).any():
+                    overlays.append({'color': color,
+                                     'data': _serie_con_huecos(precios)})
+        return overlays
 
     @staticmethod
     def _construir_indicadores(unix, y, h, l, o, indicadores):

@@ -160,6 +160,9 @@ def optimizar_setup(df, setup_base, sweep_params, sweep_riesgo, config_global,
             'trailing_atr': float(setup.get('trailing_atr', 0.0)),
             'parciales': setup.get('parciales', []),
             'tramos': setup.get('tramos', []),
+            'limite_vigencia_velas': int(setup.get('limite_vigencia_velas', 0)),
+            'limite_cancelar_avance_r': float(
+                setup.get('limite_cancelar_avance_r', 0.0)),
         }}
         for clave_mec in MECANISMOS_SALIDA:
             if setup.get(clave_mec):

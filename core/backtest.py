@@ -15,6 +15,26 @@ library/Backtests, que es el más correcto de los scripts históricos):
 - Una sola posición a la vez por setup (long o short, sin invertir directo);
   la posición SÍ puede construirse en varios tramos (ver «Entrada escalonada»).
 
+Órdenes límite (opcional; sin ellas todo lo anterior es exactamente igual):
+una señal puede, en vez de entrar a mercado, dejar una orden PENDIENTE a un
+precio concreto, que se rellena en cuanto una vela posterior lo toca. Se activa
+con las claves opcionales 'orden_long_precio'/'orden_short_precio' de `senales`
+(float[n], NaN = ninguna orden en esa vela). Reglas:
+- Solo hay UN slot de orden pendiente, igual que solo hay una posición: una
+  señal nueva no pisa una orden viva, tiene que resolverse antes.
+- Se rellena si low<=precio (long) o high>=precio (short), al precio de la
+  orden — o al open si este ya abrió MEJOR (una orden límite no se ejecuta
+  peor que su precio, pero sí mejor).
+- Se cancela por tres vías: el bit del setup en 'cancelar_orden_long/short'
+  (mismo bitmask que las salidas), la caducidad config_por_setup[sid]
+  ['limite_vigencia_velas'] (0 = sin caducidad), o config_por_setup[sid]
+  ['limite_cancelar_avance_r'] (0 = off), que la cancela si el precio avanza
+  esos R a favor sin haberla tocado: el movimiento se fue sin nosotros.
+- Una entrada rellenada por límite es indistinguible de una a mercado para
+  todo lo posterior (sizing, stop, TP, tramos, motivos de salida). El detalle
+  de qué órdenes se rellenaron, cancelaron o expiraron va aparte, en
+  'ordenes_limite', y no alimenta ninguna métrica.
+
 simular() devuelve, además de 'trades'/'entradas'/'equity', dos series de
 longitud n alineadas con las velas — instrumentación para el gráfico, no
 afectan al resultado: 'stop_track' (nivel de stop vigente en cada vela; NaN
@@ -120,6 +140,19 @@ _N_COLS_TRADE = 12
 (_E_IDX, _E_DIR, _E_SETUP, _E_PRECIO, _E_UNIDADES, _E_TRAMO) = range(6)
 _N_COLS_ENTRADA = 6
 
+# columnas del array de órdenes límite (instrumentación: una orden RELLENADA
+# también aparece como apertura normal en 'entradas', así que las métricas no
+# dependen de este array). _O_PRECIO es siempre el precio PEDIDO, también en las
+# rellenadas: el de ejecución vive en el trade.
+(_O_IDX_ALTA, _O_IDX_FIN, _O_DIR, _O_SETUP, _O_PRECIO, _O_RESULTADO) = range(6)
+_N_COLS_ORDEN = 6
+_O_RELLENADA, _O_CANCELADA, _O_EXPIRADA = range(3)
+RESULTADOS_ORDEN = {0: 'Rellenada', 1: 'Cancelada', 2: 'Expirada'}
+# Único desenlace con ejecución real: el precio retrocedió al límite y la orden
+# saltó. La GUI filtra por él para no dibujar el retroceso de órdenes que solo
+# se colocaron. Público porque lo consumen las dos vistas del gráfico.
+ORDEN_RELLENADA = _O_RELLENADA
+
 
 @njit(nogil=True)
 def _aplicar_gestion_parcial(g_tipo, g_val, dir_pos, stop_precio, precio_ref,
@@ -163,16 +196,21 @@ def _simular_numba(o, h, l, c, ent_long, ent_short, sal_long, sal_short,
                    tramo_has_conds, n_tramos_setup,
                    mec_pct_setup, mec_ml_setup, mec_ms_setup,
                    mec_gt_setup, mec_gv_setup, mec_has_conds,
-                   max_trades, max_entradas,
+                   orden_long_precio, orden_short_precio,
+                   cancel_orden_long, cancel_orden_short,
+                   vigencia_setup, avance_cancel_setup,
+                   max_trades, max_entradas, max_ordenes,
                    capital_inicial, comision_pct, slippage_pct):
     """Bucle del motor. Devuelve (trades[n,12], n_trades, equity[n],
     entradas[n,6], n_entradas, stop_track[n], entrada_track[n],
-    unidades_track[n])."""
+    unidades_track[n], ordenes[n,5], n_ordenes)."""
     n = len(c)
     trades = np.zeros((max_trades, _N_COLS_TRADE))
     n_trades = 0
     entradas = np.zeros((max_entradas, _N_COLS_ENTRADA))
     n_entradas = 0
+    ordenes = np.zeros((max_ordenes, _N_COLS_ORDEN))
+    n_ordenes = 0
     equity = np.full(n, capital_inicial)
     # nivel de stop vigente y precio de entrada (medio ponderado) vela a vela,
     # NaN fuera de posición — instrumentación para dibujar la trayectoria real
@@ -214,6 +252,16 @@ def _simular_numba(o, h, l, c, ent_long, ent_short, sal_long, sal_short,
     pendiente_parcial = False
     pendiente_tramo = False
     pendiente_setup = 0
+    # orden límite pendiente: un único slot global, igual que la posición (el
+    # arbitraje de qué setup se queda cada vela ya lo hizo
+    # generar_senales_sistema). precio_fill_pendiente > 0 hace que la apertura
+    # se ejecute a ese precio en vez de al open (ver el bloque de apertura).
+    orden_pendiente = False
+    orden_dir = 0
+    orden_precio = 0.0
+    orden_setup = 0
+    orden_bar = 0
+    precio_fill_pendiente = 0.0
 
     for i in range(n):
         # se marca True en cualquier cierre COMPLETO ocurrido en esta vela
@@ -334,9 +382,76 @@ def _simular_numba(o, h, l, c, ent_long, ent_short, sal_long, sal_short,
             tramo_actual += 1
             pendiente_tramo = False
 
+        # ── resolver la orden límite pendiente ──
+        # va ANTES del bloque de apertura para que una orden que se rellena en
+        # esta vela abra posición en esta misma vela, cayendo por ese bloque.
+        if (not en_pos) and orden_pendiente:
+            bit_orden = np.int64(1) << np.int64(orden_setup)
+            if orden_dir > 0:
+                cancelada = (cancel_orden_long[i] & bit_orden) != 0
+            else:
+                cancelada = (cancel_orden_short[i] & bit_orden) != 0
+            vigencia = vigencia_setup[orden_setup]
+            if vigencia > 0 and (i - orden_bar) >= vigencia:
+                cancelada = True
+                resultado_orden = _O_EXPIRADA
+            else:
+                resultado_orden = _O_CANCELADA
+            # el movimiento se fue sin nosotros: el precio avanzó a favor lo
+            # esperado sin llegar a tocar el límite, así que el retroceso ya
+            # no va a producirse a ese nivel
+            avance_r = avance_cancel_setup[orden_setup]
+            if (not cancelada) and avance_r > 0.0:
+                ref_atr_o = atr[i] if atr[i] > 0 else orden_precio * 0.01
+                stop_atr_o = stops_setup[orden_setup]
+                dist_o = stop_atr_o * ref_atr_o if stop_atr_o > 0 else 2.0 * ref_atr_o
+                objetivo = orden_precio + avance_r * dist_o * orden_dir
+                if (orden_dir > 0 and h[i] >= objetivo) or \
+                        (orden_dir < 0 and l[i] <= objetivo):
+                    cancelada = True
+                    resultado_orden = _O_CANCELADA
+
+            if cancelada:
+                ordenes[n_ordenes, _O_IDX_ALTA] = orden_bar
+                ordenes[n_ordenes, _O_IDX_FIN] = i
+                ordenes[n_ordenes, _O_DIR] = orden_dir
+                ordenes[n_ordenes, _O_SETUP] = orden_setup
+                ordenes[n_ordenes, _O_PRECIO] = orden_precio
+                ordenes[n_ordenes, _O_RESULTADO] = resultado_orden
+                n_ordenes += 1
+                orden_pendiente = False
+            else:
+                if orden_dir > 0:
+                    tocada = l[i] <= orden_precio
+                    # si el open ya abrió por debajo del límite, se rellena
+                    # ahí: una orden límite no puede ejecutarse peor que su
+                    # precio, pero sí mejor
+                    mejora = o[i] < orden_precio
+                else:
+                    tocada = h[i] >= orden_precio
+                    mejora = o[i] > orden_precio
+                if tocada:
+                    precio_fill_pendiente = o[i] if mejora else orden_precio
+                    pendiente_entrada = orden_dir
+                    pendiente_setup = orden_setup
+                    ordenes[n_ordenes, _O_IDX_ALTA] = orden_bar
+                    ordenes[n_ordenes, _O_IDX_FIN] = i
+                    ordenes[n_ordenes, _O_DIR] = orden_dir
+                    ordenes[n_ordenes, _O_SETUP] = orden_setup
+                    # el precio REGISTRADO es siempre el pedido, no el de
+                    # ejecución: es el nivel en el que la orden estuvo esperando
+                    # y contra el que se juzga si estaba bien colocada. Lo que
+                    # acabó pagándose (que puede ser mejor, si el open saltó por
+                    # debajo) queda en el trade correspondiente.
+                    ordenes[n_ordenes, _O_PRECIO] = orden_precio
+                    ordenes[n_ordenes, _O_RESULTADO] = _O_RELLENADA
+                    n_ordenes += 1
+                    orden_pendiente = False
+
         if (not en_pos) and pendiente_entrada != 0:
             d = pendiente_entrada
-            precio = o[i] * (1.0 + slippage_pct * d)
+            base = precio_fill_pendiente if precio_fill_pendiente > 0.0 else o[i]
+            precio = base * (1.0 + slippage_pct * d)
             ref_atr = atr[i] if atr[i] > 0 else precio * 0.01
             stop_atr_s = stops_setup[pendiente_setup]
             tp_r_s = tps_setup[pendiente_setup]
@@ -375,6 +490,7 @@ def _simular_numba(o, h, l, c, ent_long, ent_short, sal_long, sal_short,
                 entradas[n_entradas, _E_TRAMO] = 0
                 n_entradas += 1
             pendiente_entrada = 0
+            precio_fill_pendiente = 0.0
 
         # ── gestión intra-vela de la posición abierta ──
         if en_pos:
@@ -698,7 +814,23 @@ def _simular_numba(o, h, l, c, ent_long, ent_short, sal_long, sal_short,
                     pendiente_tramo = True
 
         if not en_pos or pendiente_salida:
-            if ent_long[i]:
+            # una orden límite viva no se pisa con una señal nueva: primero
+            # tiene que rellenarse, cancelarse o expirar
+            if orden_pendiente:
+                pass
+            elif not np.isnan(orden_long_precio[i]):
+                orden_pendiente = True
+                orden_dir = 1
+                orden_precio = orden_long_precio[i]
+                orden_setup = setup_id[i]
+                orden_bar = i
+            elif not np.isnan(orden_short_precio[i]):
+                orden_pendiente = True
+                orden_dir = -1
+                orden_precio = orden_short_precio[i]
+                orden_setup = setup_id[i]
+                orden_bar = i
+            elif ent_long[i]:
                 pendiente_entrada = 1
                 pendiente_setup = setup_id[i]
             elif ent_short[i]:
@@ -721,7 +853,8 @@ def _simular_numba(o, h, l, c, ent_long, ent_short, sal_long, sal_short,
                 stop_track[i] = stop_precio
 
     return (trades[:n_trades], n_trades, equity, entradas[:n_entradas],
-            n_entradas, stop_track, entrada_track, unidades_track)
+            n_entradas, stop_track, entrada_track, unidades_track,
+            ordenes[:n_ordenes], n_ordenes)
 
 
 def simular(o, h, l, c, senales, config):
@@ -776,6 +909,10 @@ def simular(o, h, l, c, senales, config):
     # comportamiento histórico), 1 = R
     be_unis = np.zeros(64, dtype=np.int64)
     trails = np.full(64, 0.0)
+    # caducidad y cancelación por avance a favor de las órdenes límite
+    # (0 = desactivado, que es el comportamiento sin órdenes límite)
+    vigencias = np.zeros(64, dtype=np.int64)
+    avances_cancel = np.zeros(64, dtype=np.float64)
     for sid, pct in (config.get('riesgo_por_setup') or {}).items():
         sid = int(sid)
         if 0 <= sid < 64:
@@ -798,6 +935,10 @@ def simular(o, h, l, c, senales, config):
             be_unis[sid] = 1
         if 'trailing_atr' in cfg_s:
             trails[sid] = float(cfg_s['trailing_atr'])
+        if 'limite_vigencia_velas' in cfg_s:
+            vigencias[sid] = int(cfg_s['limite_vigencia_velas'])
+        if 'limite_cancelar_avance_r' in cfg_s:
+            avances_cancel[sid] = float(cfg_s['limite_cancelar_avance_r'])
 
     # ── salidas parciales ──
     max_parc = 8
@@ -981,9 +1122,21 @@ def simular(o, h, l, c, senales, config):
     # posición, mismo techo que max_trades.
     max_por_posicion_e = int(n_tramos_all.max())
     max_entradas = min((n // 2 + 1) * max_por_posicion_e + 1, 3 * n + 8)
+    # órdenes límite: como mucho se resuelve una por vela (solo hay un slot
+    # pendiente y resolverlo lo libera para la siguiente vela)
+    max_ordenes = n + 1
+
+    # órdenes límite: NaN = ninguna orden en esa vela. Ausentes ⇒ el motor se
+    # comporta exactamente como antes de existir esta primitiva.
+    def _precios_orden(clave):
+        vals = senales.get(clave)
+        if vals is None:
+            return np.full(n, np.nan)
+        return np.ascontiguousarray(vals, dtype=np.float64)
 
     (trades_arr, n_trades, equity, entradas_arr, n_entradas,
-     stop_track, entrada_track, unidades_track) = _simular_numba(
+     stop_track, entrada_track, unidades_track,
+     ordenes_arr, n_ordenes) = _simular_numba(
         o, h, l, c,
         np.ascontiguousarray(senales['entradas_long'], dtype=np.bool_),
         np.ascontiguousarray(senales['entradas_short'], dtype=np.bool_),
@@ -996,7 +1149,13 @@ def simular(o, h, l, c, senales, config):
         tramo_pct_all, tramo_trig_all, tramo_val_all, tramo_ml, tramo_ms,
         tramo_gt_all, tramo_gv_all, tramo_has_conds, n_tramos_all,
         mec_pct_all, mec_ml, mec_ms, mec_gt_all, mec_gv_all, mec_has_conds,
-        max_trades, max_entradas,
+        _precios_orden('orden_long_precio'), _precios_orden('orden_short_precio'),
+        _mascara_salida(senales.get('cancelar_orden_long',
+                                    np.zeros(n, dtype=np.int64))),
+        _mascara_salida(senales.get('cancelar_orden_short',
+                                    np.zeros(n, dtype=np.int64))),
+        vigencias, avances_cancel,
+        max_trades, max_entradas, max_ordenes,
         float(config.get('capital_inicial', 10000.0)),
         float(config.get('comision_pct', 0.0005)),
         float(config.get('slippage_pct', 0.0002)),
@@ -1028,6 +1187,19 @@ def simular(o, h, l, c, senales, config):
         'precio': ea[:, _E_PRECIO],
         'unidades': ea[:, _E_UNIDADES],
         'tramo': ea[:, _E_TRAMO].astype(np.int64),
+    }
+
+    # órdenes límite: instrumentación. Una orden rellenada YA figura como
+    # apertura normal en 'entradas', así que esto solo sirve para ver también
+    # las que se cancelaron o expiraron sin llegar a operarse.
+    oa = ordenes_arr
+    ordenes_limite = {
+        'idx_alta': oa[:, _O_IDX_ALTA].astype(np.int64),
+        'idx_fin': oa[:, _O_IDX_FIN].astype(np.int64),
+        'dir': oa[:, _O_DIR].astype(np.int8),
+        'setup': oa[:, _O_SETUP].astype(np.int64),
+        'precio': oa[:, _O_PRECIO],
+        'resultado': oa[:, _O_RESULTADO].astype(np.int64),
     }
 
     # retorno del trade como fracción del equity al entrar (para Montecarlo
@@ -1148,7 +1320,7 @@ def simular(o, h, l, c, senales, config):
         exposicion_track = np.where(equity > 0, unidades_track * c / equity, 0.0)
 
     return {'trades': trades, 'entradas': entradas, 'equity': equity,
-            'drawdown': drawdown,
+            'ordenes_limite': ordenes_limite, 'drawdown': drawdown,
             'stop_track': stop_track, 'entrada_track': entrada_track,
             'exposicion_track': exposicion_track,
             'capital_final': float(equity[-1]) if n else 0.0,

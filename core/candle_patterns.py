@@ -603,9 +603,15 @@ def agregar_por_periodo(idx, dir_arr, aciertos, signed_ret, timestamps, regla,
     Bloques con menos de min_ocurrencias se omiten: con muy pocas
     ocurrencias el hit rate de ese bloque es ruido, no señal.
 
-    Devuelve {'fechas','n','hit_rate','edge_pb'} — arrays paralelos, uno por
-    bloque que pasa el mínimo."""
+    Devuelve {'fechas','fecha_ini','fecha_fin','n','hit_rate','edge_pb'} —
+    arrays paralelos, uno por bloque que pasa el mínimo. 'fecha_ini'/'fecha_fin'
+    son los bordes REALES del bin que usó pandas: quien dibuje puede pintar una
+    barra que ocupe exactamente el bloque de calendario que representa, en vez
+    de estimar un ancho a partir de la regla (los meses/trimestres/años no duran
+    todos lo mismo, y 'fechas' es la etiqueta del bin, no su inicio)."""
     vacio = {'fechas': np.array([], dtype='datetime64[ns]'),
+             'fecha_ini': np.array([], dtype='datetime64[ns]'),
+             'fecha_fin': np.array([], dtype='datetime64[ns]'),
              'n': np.array([], dtype=np.int64),
              'hit_rate': np.array([], dtype=np.float64),
              'edge_pb': np.array([], dtype=np.float64)}
@@ -631,8 +637,18 @@ def agregar_por_periodo(idx, dir_arr, aciertos, signed_ret, timestamps, regla,
     dir_medio = g['dir'].mean()
     edge = ret_fwd_medio - dir_medio * drift_base
 
+    # bordes reales de cada bin. 'label' no cambia el binning, solo qué extremo
+    # se usa como etiqueta, así que este índice va bin a bin en paralelo con el
+    # de arriba; y como los bins son contiguos y completos (pandas rellena los
+    # vacíos), el fin de uno es el inicio del siguiente — basta desplazar el
+    # índice un periodo en vez de resamplear otra vez sobre todas las filas.
+    ini_all = df.resample(regla, label='left').size().index
+    fin_all = ini_all.shift(1, freq=regla)
+
     return {
         'fechas': n.index.values[mask.values],
+        'fecha_ini': ini_all.values[mask.values],
+        'fecha_fin': fin_all.values[mask.values],
         'n': n.values[mask.values].astype(np.int64),
         'hit_rate': hit_rate.values[mask.values],
         'edge_pb': edge.values[mask.values] * 10000,

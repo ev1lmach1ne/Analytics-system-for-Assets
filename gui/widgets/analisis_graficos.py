@@ -29,9 +29,9 @@ from matplotlib.dates import date2num, AutoDateLocator, ConciseDateFormatter
 
 from gui.widgets.plot_common import (
     make_canvas, style_ax, ax_placeholder, leyenda, icono_ayuda, no_crash,
-    BarraGrafico, fmt, agregar_crosshair, FIG_BG, AX_FG, GRID_C, VERDE, ROJO,
-    GRIS, AMBAR, AZUL, NARANJA, TEXTO_TENUE, ER_TENDENCIA, ER_TRANSICION,
-    ER_RUIDO)
+    BarraGrafico, fmt, agregar_crosshair, eje_fechas, FIG_BG, AX_FG, GRID_C,
+    VERDE, ROJO, GRIS, AMBAR, AZUL, NARANJA, TEXTO_TENUE, ER_TENDENCIA,
+    ER_TRANSICION, ER_RUIDO)
 
 ESTILO = """
 QScrollArea { border: none; background: transparent; }
@@ -74,19 +74,9 @@ def _x(bundle_x):
     return arr
 
 
-def _eje_fechas(ax, x):
-    """Etiquetas de fecha compactas y sin solapes.
-
-    Con el formateador por defecto, un panel estrecho (los cuadrantes del
-    dashboard NATR, por ejemplo) pinta fechas completas superpuestas.
-    ConciseDateFormatter reparte el año/mes/día entre el eje y el offset.
-    """
-    if not np.issubdtype(np.asarray(x).dtype, np.datetime64):
-        return
-    loc = AutoDateLocator(minticks=3, maxticks=7)
-    ax.xaxis.set_major_locator(loc)
-    ax.xaxis.set_major_formatter(ConciseDateFormatter(loc))
-    ax.xaxis.get_offset_text().set_color(AX_FG)
+# el helper vive en plot_common (lo comparten este módulo y las tarjetas de
+# tab_patrones); se mantiene el nombre local para no tocar sus ~20 llamadas
+_eje_fechas = eje_fechas
 
 
 def _campana(ax, media, std, sigmas, sufijo_freq, titulo, vars_=None):

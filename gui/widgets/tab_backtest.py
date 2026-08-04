@@ -45,7 +45,7 @@ from PyQt6.QtWidgets import (
     QSlider, QListWidget, QListWidgetItem, QTabWidget, QFormLayout, QGroupBox,
     QInputDialog, QDateEdit, QSizePolicy, QApplication, QDialog, QProgressBar,
     QButtonGroup, QStyledItemDelegate, QStyle, QStackedWidget, QMenu,
-    QMessageBox, QRadioButton,
+    QMessageBox, QRadioButton, QToolButton, QGraphicsOpacityEffect,
 )
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
@@ -64,7 +64,7 @@ from core.config import (
 )
 from core.backtest import (
     simular, dividir_is_oos, calcular_metricas, montecarlo, resultado_filtrado,
-    MOTIVOS_SALIDA, MECANISMOS_SALIDA,
+    MOTIVOS_SALIDA, MECANISMOS_SALIDA, RESULTADOS_ORDEN, ORDEN_RELLENADA,
 )
 from core.optimizer import (
     optimizar_setup, n_combinaciones, LIMITE_COMBOS_DEFECTO, PREFIJO_RIESGO,
@@ -79,6 +79,8 @@ from core.strategies import (
     trigger_etapa, salida_mecanismo_por_defecto, validar_parciales,
     validar_tramos, validar_setup, AVISO_EXCESO_PARCIALES, tramo_entrada_por_defecto, trigger_tramo,
     sma, ema, rsi, atr, bollinger, stochastic, williams_r, cci, _kama_serie,
+    _sar_serie, donchian, _zigzag_pivotes, _ZIGZAG_DESVIACION_REGLA,
+    _entrada_por_defecto, NIVELES_FIB, tramos_zigzag_vigentes,
     preparar_eventos_noticias,
 )
 from core.candle_patterns import detectar_patrones
@@ -104,10 +106,29 @@ AZUL = '#4fc3f7'
 VERDE_FLECHA = '#1b8a3a'   # compra (abre largo / cierra corto)
 ROJO_FLECHA = '#ff1744'    # venta (abre corto / cierra largo)
 
+# ZigZag: el azul por defecto del indicador de TradingView que se tomó como
+# referencia. No se reutiliza AZUL porque es el primer color de la paleta de
+# medias y la polilínea se confundiría con una media móvil.
+AZUL_ZIGZAG = '#2962FF'
+# tramos de Fibonacci: ámbar apagado, para que la banda quede por detrás de
+# todo sin competir con las velas ni con los segmentos de las órdenes
+AMARILLO_FIB = '#c9a227'
+
 # color fijo por periodo para las medias (SMA/EMA) dibujadas en el gráfico de
 # Resultados — así una media de 200 siempre se identifica por su color sin
 # importar el orden en que aparezcan los demás setups/filtros.
 COLOR_MEDIA_FIJO = {20: '#2B7FFF', 50: '#FF8904', 200: '#800000'}
+# resto de medias: paleta rotatoria, en orden de periodo creciente
+PALETA_MEDIA = [AZUL, AMBAR, '#2ecc71', '#9b59b6', '#e67e22']
+
+# un color por familia de overlay. Viven aquí y no como literales dentro del
+# dibujo porque el panel de capas los usa para su cuadradito: si cada sitio
+# tuviera el suyo, el color del panel dejaría de corresponderse con la línea.
+COLOR_BOLLINGER = '#9b59b6'
+COLOR_KAMA = '#ab47bc'
+COLOR_DONCHIAN = '#26a69a'
+COLOR_SAR = '#8d6e63'
+COLOR_PATRONES = '#2ecc71'
 
 # ── paneles apilados del gráfico de operaciones (precio + osciladores) ──
 # El precio y cada oscilador activo comparten una única Figure/Axes-stack
@@ -127,6 +148,10 @@ TOP_PANEL, BOTTOM_STACK = 0.94, 0.075
 GAP_PANEL = 0.018
 ETIQUETA_PANEL = {'precio': 'Precio', 'rsi': 'RSI', 'atr': 'ATR',
                   'stoch': 'Estocástico', 'williams': 'Williams %R', 'cci': 'CCI'}
+# primer color de la paleta de cada panel: es el que representa al oscilador en
+# el cuadradito del panel de capas
+COLOR_PANEL_OSC = {'rsi': '#f1c40f', 'atr': '#2ecc71', 'stoch': '#26c6da',
+                   'williams': '#ec407a', 'cci': '#5c6bc0'}
 
 MODOS_WFA = [
     'Retorno %',
@@ -179,6 +204,38 @@ def _titulo_activo_html(csv_path, tf):
         return f"<b style='font-size:14px'>{nombre}</b>"
     return (f"<b style='font-size:14px'>{nombre}</b> "
             f"<span style='color:#4fc3f7'>· {html.escape(tf)}</span>")
+
+
+def _texto_periodo(ts):
+    """'01/01/2020 → 15/03/2025 · 5 años 2 meses' a partir del índice de
+    tiempos del backtest. Cadena vacía si no hay velas.
+
+    La duración es APROXIMADA (mes = 30,44 días, año = 12 de esos meses): es
+    una etiqueta para dar escala al resto del título, no un dato del que
+    dependa ninguna métrica — para eso está velas_anio, que sí sale del
+    muestreo real.
+
+    Se cuentan meses y de ahí se derivan los años, en vez de dividir por 365,25
+    y quedarse con el resto: así un año justo (365 días) no se queda en
+    "0 años 11 meses" por el redondeo hacia abajo.
+    """
+    if len(ts) == 0:
+        return ''
+    dias = (ts[-1] - ts[0]).total_seconds() / 86400
+    if dias < 31:
+        n = int(dias)
+        dur = f"{n} día{'s' if n != 1 else ''}"
+    else:
+        meses_totales = max(1, round(dias / 30.44))
+        anios, meses = divmod(meses_totales, 12)
+        if anios:
+            dur = f"{anios} año{'s' if anios != 1 else ''}"
+            if meses:
+                dur += f" {meses} mes{'es' if meses != 1 else ''}"
+        else:
+            dur = f"{meses} mes{'es' if meses != 1 else ''}"
+    return (f"{ts[0].strftime('%d/%m/%Y')} → {ts[-1].strftime('%d/%m/%Y')} "
+            f"· {dur}")
 
 
 def _migrar_estrategias_legacy():
@@ -466,6 +523,9 @@ class _BacktestThread(QThread):
                     'trailing_atr': float(setup.get('trailing_atr', 0.0)),
                     'parciales': setup.get('parciales', []),
                     'tramos': setup.get('tramos', []),
+                    'limite_vigencia_velas': int(setup.get('limite_vigencia_velas', 0)),
+                    'limite_cancelar_avance_r': float(
+                        setup.get('limite_cancelar_avance_r', 0.0)),
                 }
                 for clave_mec in MECANISMOS_SALIDA:
                     if setup.get(clave_mec):
@@ -834,7 +894,8 @@ def _spec_regla(tipo, num):
     return {'tipo': tipo, 'periodo': int(num)}
 
 
-def _acumular_indicador_spec(spec, mas, rsis, atrs, bbs):
+def _acumular_indicador_spec(spec, mas, rsis, atrs, bbs, donchianes=None,
+                             zigzags=None):
     """Clasifica un spec de indicador ({'tipo':'EMA','periodo':200}, etc.) en
     los sets que consumen ResultadosWidget._dibujar_principal/_dibujar_indicadores.
     Ignora specs sin indicador real (close/open/high/low/valor)."""
@@ -848,6 +909,11 @@ def _acumular_indicador_spec(spec, mas, rsis, atrs, bbs):
         atrs.add(per)
     elif t in ('BB_sup', 'BB_inf', 'BB_media'):
         bbs.add((per, float(spec.get('desv', 2.0))))
+    elif t in ('DONCHIAN_SUP', 'DONCHIAN_INF') and donchianes is not None:
+        donchianes.add(per)
+    elif t == 'ZIGZAG' and zigzags is not None:
+        # desde una regla la desviación es fija y el «Periodo» son las piernas
+        zigzags.add((_ZIGZAG_DESVIACION_REGLA, per))
 
 
 class EditorReglas(QGroupBox):
@@ -1049,6 +1115,12 @@ class EditorCondiciones(QGroupBox):
                    "por sí. Las celdas activas editan sus parámetros.")
         if desc.get('nota'):
             tooltip += f"\n⚠ {desc['nota']}"
+        lados = [d.get('direccion') for d in self._filas_plantilla]
+        if len(lados) == 2 and set(lados) == {'long', 'short'} and any(
+                sp['clave'] == 'direccion'
+                for sp in ESTRATEGIAS.get(self._plantilla, {}).get('params', [])):
+            tooltip += ("\nSelecciona esta fila y pulsa «− Quitar» para dejar "
+                        "solo el otro lado (Long/Short).")
 
         if desc.get('izq') is None:
             # la tabla no sabe representar este indicador (Stochastic, %R,
@@ -1179,17 +1251,38 @@ class EditorCondiciones(QGroupBox):
             self.tabla.setCellWidget(r, col, w)
         _repintar_seleccion_fila(self.tabla)
 
+    def _intentar_quitar_lado(self, r):
+        """Si la fila r es una de las DOS filas de plantilla (long+short) y la
+        plantilla tiene un parámetro 'direccion' que controla cuántas hay,
+        borrarla equivale a poner ese parámetro al lado contrario — mismo
+        resultado que el combo 'Dirección' de Parámetros, pero desde la
+        tabla. Devuelve True si lo hizo (patrones de velas y Custom (reglas)
+        no califican: no tienen un 'direccion' global que gobierne la fila)."""
+        if self.n_filas_plantilla != 2 or self._on_param is None:
+            return False
+        lados = [d.get('direccion') for d in self._filas_plantilla]
+        if set(lados) != {'long', 'short'}:
+            return False
+        specs = ESTRATEGIAS.get(self._plantilla, {}).get('params', [])
+        if not any(sp['clave'] == 'direccion' for sp in specs):
+            return False
+        self._on_param('direccion', 'Short' if lados[r] == 'long' else 'Long')
+        return True
+
     def _del_fila(self):
-        # las filas de la señal de la plantilla no se pueden quitar: son la
-        # lógica del sistema, no un filtro añadido
+        # las filas de la señal de la plantilla no se pueden quitar en
+        # general: son la lógica del sistema, no un filtro añadido — salvo
+        # que sean las dos mitades (long/short) de una plantilla con
+        # 'direccion', en cuyo caso borrar una equivale a dejar solo el otro
+        # lado (ver _intentar_quitar_lado).
         primera = self.n_filas_plantilla
+        r = self.tabla.currentRow()
+        if 0 <= r < primera:
+            self._intentar_quitar_lado(r)
+            return
         if self.tabla.rowCount() <= primera:
             return
-        r = self.tabla.currentRow()
-        if r >= primera:
-            self.tabla.removeRow(r)
-        else:
-            self.tabla.removeRow(self.tabla.rowCount() - 1)
+        self.tabla.removeRow(r if r >= primera else self.tabla.rowCount() - 1)
 
     def condiciones(self):
         """Lista plana de condiciones (AND entre sí dentro de su misma
@@ -1255,11 +1348,27 @@ _MAPA_REGIMEN = {
     'Rango (ER)': 'er_rango', 'Tendencia (Hurst)': 'hurst_tendencia',
     'Reversión (Hurst)': 'hurst_reversion',
 }
+# La entrada por orden límite está terminada en el motor pero aún no se abre al
+# uso: se lista en gris y no se puede elegir (ver _bloquear_entrada_limite).
+_ETIQUETA_LIMITE_FIB = 'Límite en nivel Fibonacci (próximamente)'
+_MAPA_TIPO_ENTRADA = {
+    'A mercado': 'mercado',
+    _ETIQUETA_LIMITE_FIB: 'limite_fib',
+}
+_MAPA_TIPO_ENTRADA_INV = {v: k for k, v in _MAPA_TIPO_ENTRADA.items()}
+_MAPA_VOLATILIDAD = {
+    'Ninguna': 'ninguno',
+    'ATR alto (percentil ≥)': 'atr_percentil_alto',
+    'ATR bajo (percentil ≤)': 'atr_percentil_bajo',
+    'Desv. estándar alta (percentil ≥)': 'stdev_percentil_alto',
+    'Desv. estándar baja (percentil ≤)': 'stdev_percentil_bajo',
+}
 _MAPA_SESION = {
     'Ninguna': 'ninguna', 'Overnight': 'overnight', 'Londres': 'londres',
     'NY': 'ny', 'Personalizada': 'personalizada',
 }
 _MAPA_REGIMEN_INV = {v: k for k, v in _MAPA_REGIMEN.items()}
+_MAPA_VOLATILIDAD_INV = {v: k for k, v in _MAPA_VOLATILIDAD.items()}
 _MAPA_SESION_INV = {v: k for k, v in _MAPA_SESION.items()}
 _MAPA_IMPACTO_NOTICIAS = {'Bajo': 'bajo', 'Medio': 'medio', 'Alto': 'alto'}
 _MAPA_IMPACTO_NOTICIAS_INV = {v: k for k, v in _MAPA_IMPACTO_NOTICIAS.items()}
@@ -1302,6 +1411,11 @@ _MECANISMOS_SALIDA_UI = {
 # mínimo del spin de la fila: nunca 0, para que la fila no se autodestruya
 # mientras la editas (para apagar el mecanismo se usa su campo de arriba)
 _MIN_VALOR_MECANISMO = {'salida_tiempo': 1}
+
+# clave escalar del setup -> atributo del spin que la edita (ver _deshacer)
+_ATTR_ESCALAR_MECANISMO = {
+    'stop_atr': 'sp_stop', 'tp_r': 'sp_tp', 'salida_n_velas': 'sp_tiempo',
+    'be_atr': 'sp_be', 'trailing_atr': 'sp_trailing'}
 
 # disparador de una etapa de salida parcial (ver core/strategies.trigger_etapa)
 _MAPA_TRIGGER = {'Señal de la plantilla': 'senal', 'R:R alcanzado': 'r',
@@ -1821,6 +1935,7 @@ class OptimizadorWidget(QWidget):
         # ── editor del setup seleccionado ──
         self.grp_setup = QGroupBox("Setup seleccionado")
         f_set = QFormLayout(self.grp_setup)
+        self._form_setup = f_set
         _insertar_ayuda_form(f_set,
             "Edición completa del setup marcado en la lista de arriba: "
             "plantilla y sus parámetros, riesgo, entrada, salida y filtros. "
@@ -1859,6 +1974,86 @@ class OptimizadorWidget(QWidget):
         self.editor_reglas.tabla.cellChanged.connect(
             lambda *_: self._guardar_setup_actual())
         f_set.addRow(self.editor_reglas)
+
+        # ── cómo se EJECUTA la señal de entrada (a mercado o esperando un
+        # retroceso con una orden límite) — aplica a cualquier plantilla ──
+        self.cmb_tipo_entrada = QComboBox()
+        self.cmb_tipo_entrada.addItems(list(_MAPA_TIPO_ENTRADA))
+        self._bloquear_entrada_limite()
+        self.cmb_tipo_entrada.setToolTip(
+            "Qué hace el setup cuando su plantilla da señal:\n"
+            "· A mercado — entra al open de la vela siguiente (lo de siempre).\n"
+            "· Límite en nivel Fibonacci — no entra: deja una orden esperando\n"
+            "  en el retroceso del último tramo del ZigZag. Si el precio no\n"
+            "  vuelve a ese nivel, la operación sencillamente no ocurre.\n"
+            "  Próximamente: por ahora no se puede seleccionar.")
+        self.cmb_tipo_entrada.currentTextChanged.connect(self._on_tipo_entrada_changed)
+        f_set.addRow("Tipo de entrada:", self.cmb_tipo_entrada)
+
+        fila_fib = QHBoxLayout()
+        self.cmb_nivel_fib = QComboBox()
+        self.cmb_nivel_fib.addItems([f"{v:g}" for v in NIVELES_FIB])
+        self.cmb_nivel_fib.setCurrentText('0.618')
+        self.cmb_nivel_fib.setToolTip(
+            "Profundidad del retroceso donde se coloca la orden. Cuanto más "
+            "profundo, mejor precio pero menos probabilidad de que se rellene.")
+        self.cmb_nivel_fib.currentTextChanged.connect(self._guardar_setup_actual)
+        self.sp_zz_desviacion = QDoubleSpinBox()
+        self.sp_zz_desviacion.setRange(0.01, 100.0)
+        self.sp_zz_desviacion.setDecimals(2)
+        self.sp_zz_desviacion.setValue(5.0)
+        self.sp_zz_desviacion.setSuffix(" %")
+        self.sp_zz_desviacion.setToolTip(
+            "ZigZag: movimiento mínimo que debe recorrer el precio para "
+            "reconocer un cambio de tramo.")
+        self.sp_zz_desviacion.valueChanged.connect(self._guardar_setup_actual)
+        self.sp_zz_piernas = QSpinBox()
+        self.sp_zz_piernas.setRange(2, 500)
+        self.sp_zz_piernas.setValue(10)
+        self.sp_zz_piernas.setToolTip(
+            "ZigZag: velas totales que confirman un pivote, la mitad a cada "
+            "lado. Cuantas más, más tarde se confirma el tramo (y más tarde "
+            "puede colocarse la orden), pero menos pivotes de ruido.")
+        self.sp_zz_piernas.valueChanged.connect(self._guardar_setup_actual)
+        fila_fib.addWidget(QLabel("nivel"))
+        fila_fib.addWidget(self.cmb_nivel_fib)
+        fila_fib.addWidget(QLabel("ZigZag"))
+        fila_fib.addWidget(self.sp_zz_desviacion)
+        fila_fib.addWidget(self.sp_zz_piernas)
+        fila_fib.addStretch()
+        self._fila_fib_widget = QWidget()
+        self._fila_fib_widget.setLayout(fila_fib)
+        f_set.addRow("Retroceso:", self._fila_fib_widget)
+
+        fila_vig = QHBoxLayout()
+        self.sp_vigencia_limite = QSpinBox()
+        self.sp_vigencia_limite.setRange(0, 5000)
+        self.sp_vigencia_limite.setValue(0)
+        self.sp_vigencia_limite.setSuffix(" velas")
+        self.sp_vigencia_limite.setSpecialValueText("Sin caducidad")
+        self.sp_vigencia_limite.setToolTip(
+            "Cancela la orden si no se ha rellenado en N velas "
+            "(0 = vive hasta rellenarse o hasta que un tramo nuevo la anule).")
+        self.sp_vigencia_limite.valueChanged.connect(self._guardar_setup_actual)
+        self.sp_cancelar_avance_r = QDoubleSpinBox()
+        self.sp_cancelar_avance_r.setRange(0.0, 50.0)
+        self.sp_cancelar_avance_r.setDecimals(1)
+        self.sp_cancelar_avance_r.setValue(0.0)
+        self.sp_cancelar_avance_r.setSuffix(" R")
+        self.sp_cancelar_avance_r.setSpecialValueText("No cancelar")
+        self.sp_cancelar_avance_r.setToolTip(
+            "Cancela la orden si el precio avanza esta distancia a favor sin "
+            "haberla tocado: el movimiento se fue sin nosotros y el retroceso "
+            "ya no va a llegar a ese nivel.")
+        self.sp_cancelar_avance_r.valueChanged.connect(self._guardar_setup_actual)
+        fila_vig.addWidget(QLabel("caduca a"))
+        fila_vig.addWidget(self.sp_vigencia_limite)
+        fila_vig.addWidget(QLabel("o si avanza"))
+        fila_vig.addWidget(self.sp_cancelar_avance_r)
+        fila_vig.addStretch()
+        self._fila_vigencia_widget = QWidget()
+        self._fila_vigencia_widget.setLayout(fila_vig)
+        f_set.addRow("Vida de la orden:", self._fila_vigencia_widget)
 
         # modo edge: probar la señal desnuda, sin stop ni TP
         self.btn_edge = QPushButton("⚡ Prueba de Ventaja (Edge)")
@@ -2060,6 +2255,11 @@ class OptimizadorWidget(QWidget):
                             ("− Quitar", self._del_etapa_parcial)]:
             b = QPushButton(texto)
             b.clicked.connect(slot)
+            if texto == "− Quitar":
+                b.setToolTip(
+                    "Borra la etapa de salida seleccionada, o — si seleccionas "
+                    "la fila de Stop/TP/Break-even/Trailing/Tiempo — desactiva "
+                    "ese mecanismo (lo pone a 0, igual que en su campo de arriba).")
             fila_p.addWidget(b)
         self.btn_deshacer_parciales = self._crear_boton_deshacer()
         fila_p.addWidget(self.btn_deshacer_parciales)
@@ -2087,7 +2287,7 @@ class OptimizadorWidget(QWidget):
         # ── filtros de entrada del setup (no afectan a las salidas) ──
         grp_filtros = QGroupBox("Filtros del setup")
         grp_filtros.setToolTip(
-            "Día/régimen/sesión restringen cuándo puede abrirse una posición "
+            "Día/régimen/volatilidad/sesión restringen cuándo puede abrirse una posición "
             "NUEVA (nunca cierran una ya abierta). Las condiciones extra de "
             "entrada/salida, más abajo, sí pueden aplicarse también a la "
             "salida si así se configuran.")
@@ -2116,6 +2316,40 @@ class OptimizadorWidget(QWidget):
             "de la vela (mismos umbrales fijos que la pestaña Patrones)")
         self.sp_regimen_periodo.valueChanged.connect(self._guardar_setup_actual)
         f_filtros.addRow("Periodo (ventana):", self.sp_regimen_periodo)
+
+        self.cmb_volatilidad = QComboBox()
+        self.cmb_volatilidad.addItems(list(_MAPA_VOLATILIDAD))
+        self.cmb_volatilidad.setToolTip(
+            "Solo se abren posiciones NUEVAS cuando la volatilidad de la vela "
+            "está en el tramo elegido de su propia historia reciente. El corte "
+            "es un PERCENTIL, no un valor absoluto: 'ATR alto ≥ 70' significa "
+            "«solo el 30% de velas más volátiles de la ventana», y vale igual "
+            "para cualquier activo y timeframe sin recalibrar.")
+        self.cmb_volatilidad.currentTextChanged.connect(self._on_volatilidad_changed)
+        f_filtros.addRow("Volatilidad:", self.cmb_volatilidad)
+        fila_vol = QHBoxLayout()
+        self.sp_volatilidad_periodo = QSpinBox()
+        self.sp_volatilidad_periodo.setRange(10, 5000)
+        self.sp_volatilidad_periodo.setValue(100)
+        self.sp_volatilidad_periodo.setToolTip(
+            "Histórico contra el que se compara la volatilidad actual. El "
+            "indicador (ATR o desviación estándar) se calcula siempre sobre 14 "
+            "velas; esta ventana solo decide cuánto pasado se usa para situar "
+            "su percentil.")
+        self.sp_volatilidad_percentil = QDoubleSpinBox()
+        self.sp_volatilidad_percentil.setRange(0.0, 100.0)
+        self.sp_volatilidad_percentil.setDecimals(1)
+        self.sp_volatilidad_percentil.setValue(50.0)
+        self.sp_volatilidad_periodo.valueChanged.connect(self._guardar_setup_actual)
+        self.sp_volatilidad_percentil.valueChanged.connect(self._guardar_setup_actual)
+        fila_vol.addWidget(QLabel("ventana"))
+        fila_vol.addWidget(self.sp_volatilidad_periodo)
+        fila_vol.addWidget(QLabel("percentil"))
+        fila_vol.addWidget(self.sp_volatilidad_percentil)
+        fila_vol.addStretch()
+        self._fila_volatilidad_widget = QWidget()
+        self._fila_volatilidad_widget.setLayout(fila_vol)
+        f_filtros.addRow("Umbral:", self._fila_volatilidad_widget)
 
         self.cmb_sesion = QComboBox()
         self.cmb_sesion.addItems(list(_MAPA_SESION))
@@ -2650,6 +2884,15 @@ class OptimizadorWidget(QWidget):
             self.cmb_be_unidad.setCurrentText(
                 _MAPA_BE_UNIDAD_INV.get(s.get('be_unidad', 'atr'), '× ATR'))
             self.sp_trailing.setValue(s.get('trailing_atr', 0.0))
+            entrada = s.get('entrada') or _entrada_por_defecto()
+            self.cmb_tipo_entrada.setCurrentText(
+                _MAPA_TIPO_ENTRADA_INV.get(entrada.get('tipo', 'mercado'), 'A mercado'))
+            self.cmb_nivel_fib.setCurrentText(f"{entrada.get('nivel_fib', 0.618):g}")
+            self.sp_zz_desviacion.setValue(entrada.get('zigzag_desviacion', 5.0))
+            self.sp_zz_piernas.setValue(entrada.get('zigzag_piernas', 10))
+            self.sp_vigencia_limite.setValue(int(s.get('limite_vigencia_velas', 0)))
+            self.sp_cancelar_avance_r.setValue(
+                float(s.get('limite_cancelar_avance_r', 0.0)))
             # migrar viejas condiciones_salida a parciales
             parciales = s.get('parciales', [])
             if not parciales:
@@ -2684,6 +2927,11 @@ class OptimizadorWidget(QWidget):
             self.cmb_regimen.setCurrentText(
                 _MAPA_REGIMEN_INV.get(filtros.get('regimen', {}).get('metodo', 'ninguno'), 'Ninguno'))
             self.sp_regimen_periodo.setValue(filtros.get('regimen', {}).get('periodo', 100))
+            volatilidad = filtros.get('volatilidad') or {}
+            self.cmb_volatilidad.setCurrentText(
+                _MAPA_VOLATILIDAD_INV.get(volatilidad.get('metodo', 'ninguno'), 'Ninguna'))
+            self.sp_volatilidad_periodo.setValue(volatilidad.get('periodo', 100))
+            self.sp_volatilidad_percentil.setValue(volatilidad.get('percentil', 50.0))
             self.cmb_sesion.setCurrentText(
                 _MAPA_SESION_INV.get(filtros.get('sesion', {}).get('tipo', 'ninguna'), 'Ninguna'))
             self.sp_hora_ini.setValue(filtros.get('sesion', {}).get('hora_inicio', 0))
@@ -2698,6 +2946,7 @@ class OptimizadorWidget(QWidget):
             self.chk_noticias_cerrar.setChecked(noticias.get('cerrar_posiciones', False))
         finally:
             self._cargando = False
+        self._actualizar_visibilidad_entrada()
         self._actualizar_visibilidad_filtros()
         self._refresh_definicion()
         self._actualizar_boton_deshacer()
@@ -2740,6 +2989,15 @@ class OptimizadorWidget(QWidget):
         s = self._setup_actual()
         if s is None or self._cargando:
             return
+        if clave == 'direccion' and s['params'].get('direccion') != valor:
+            # cambio de estructura (nº de filas long/short): a diferencia de
+            # otros params, este SÍ se apila para deshacer — ver
+            # EditorCondiciones._intentar_quitar_lado, que llama aquí para
+            # borrar un lado desde la tabla de Entrada.
+            pila = s.setdefault('_deshacer', [])
+            pila.append(('direccion_param', s['params'].get('direccion')))
+            del pila[:-20]
+            self._actualizar_boton_deshacer()
         s['params'][clave] = valor
         tipo_w = self._param_widgets.get(clave)
         if tipo_w is not None:
@@ -2913,6 +3171,8 @@ class OptimizadorWidget(QWidget):
 
     def _actualizar_visibilidad_filtros(self):
         self.sp_regimen_periodo.setEnabled(self.cmb_regimen.currentText() != 'Ninguno')
+        self._fila_volatilidad_widget.setEnabled(
+            self.cmb_volatilidad.currentText() != 'Ninguna')
         horas_visible = self.cmb_sesion.currentText() == 'Personalizada'
         self._fila_horas_widget.setVisible(horas_visible)
         if self._lbl_horas is not None:
@@ -2923,6 +3183,42 @@ class OptimizadorWidget(QWidget):
 
     @_no_crash
     def _on_regimen_changed(self, _texto):
+        self._actualizar_visibilidad_filtros()
+        self._guardar_setup_actual()
+
+    def _bloquear_entrada_limite(self):
+        """Deja la entrada por orden límite a la vista pero en gris y sin poder
+        elegirse.
+
+        Se deshabilita el item en el modelo en vez de quitarlo del combo: los
+        setups ya guardados con ese tipo siguen mostrando el suyo real —
+        setCurrentIndex sí puede posarse en un item deshabilitado— en vez de
+        aparecer como "A mercado" y silenciosamente cambiar de estrategia."""
+        item = self.cmb_tipo_entrada.model().item(
+            list(_MAPA_TIPO_ENTRADA).index(_ETIQUETA_LIMITE_FIB))
+        if item is None:
+            return
+        item.setEnabled(False)
+        item.setData(QColor('#3a5a7a'), Qt.ItemDataRole.ForegroundRole)
+
+    @_no_crash
+    def _on_tipo_entrada_changed(self, _texto):
+        self._actualizar_visibilidad_entrada()
+        self._guardar_setup_actual()
+
+    def _actualizar_visibilidad_entrada(self):
+        """Los ajustes del retroceso y de la vida de la orden solo tienen
+        sentido con entrada límite."""
+        es_limite = self.cmb_tipo_entrada.currentText() != 'A mercado'
+        self._fila_fib_widget.setVisible(es_limite)
+        self._fila_vigencia_widget.setVisible(es_limite)
+        for widget in (self._fila_fib_widget, self._fila_vigencia_widget):
+            etiqueta = self._form_setup.labelForField(widget)
+            if etiqueta is not None:
+                etiqueta.setVisible(es_limite)
+
+    @_no_crash
+    def _on_volatilidad_changed(self, _texto):
         self._actualizar_visibilidad_filtros()
         self._guardar_setup_actual()
 
@@ -2976,6 +3272,13 @@ class OptimizadorWidget(QWidget):
         s = self._setup_actual()
         if s is None:
             return
+        fila = self.tabla_parciales.currentRow()
+        item = self.tabla_parciales.item(fila, 0)
+        if item is not None and item.data(Qt.ItemDataRole.UserRole) == _ROL_MECANISMO:
+            clave = item.data(_ROL_CLAVE_MECANISMO)
+            attr = _MECANISMOS_SALIDA_UI[clave][1]
+            getattr(self, attr).setValue(0.0)
+            return
         parciales = s.get('parciales', [])
         if len(parciales) <= 1:
             # sin etapas el setup solo cerraría por stop/TP/tiempo: la última
@@ -2985,7 +3288,6 @@ class OptimizadorWidget(QWidget):
                 "para cerrar toda la posición de una vez)")
             return
         self._empujar_deshacer(s, 'parciales')
-        fila = self.tabla_parciales.currentRow()
         if 0 <= fila < len(parciales):
             parciales.pop(fila)
         else:
@@ -3340,7 +3642,9 @@ class OptimizadorWidget(QWidget):
         _on_param_desde_fila usa para las filas de señal de la tabla de Entrada.
 
         El mínimo nunca es 0: para apagar el mecanismo se usa su campo de
-        arriba, así la fila no se borra sola mientras la estás editando."""
+        arriba (o «− Quitar» con esta fila seleccionada, ver
+        _del_etapa_parcial), así la fila no se borra sola mientras la estás
+        editando."""
         etiqueta, attr_spin, _sufijo, color = _MECANISMOS_SALIDA_UI[clave]
         origen = getattr(self, attr_spin)
         cont = QWidget()
@@ -3368,7 +3672,8 @@ class OptimizadorWidget(QWidget):
         sp.setToolTip(
             f"Mismo valor que «{etiqueta}» arriba: editarlo aquí lo cambia allí "
             f"y al revés.\nPara desactivar el mecanismo, ponlo a 0 en el campo "
-            f"de arriba (aquí el mínimo es {minimo:g}).")
+            f"de arriba (aquí el mínimo es {minimo:g}), o selecciona esta fila "
+            f"y pulsa «− Quitar».")
         sp.valueChanged.connect(lambda v, k=clave: self._on_valor_mecanismo(k, v))
         lay.addWidget(sp)
 
@@ -3748,6 +4053,13 @@ class OptimizadorWidget(QWidget):
             'tramos': copy.deepcopy(s.get('tramos', [])),
             'condiciones_entrada': copy.deepcopy(
                 (s.get('filtros') or {}).get('condiciones_entrada', [])),
+            'stop_atr': s.get('stop_atr'),
+            'tp_r': s.get('tp_r'),
+            'salida_n_velas': s.get('salida_n_velas'),
+            'be_atr': s.get('be_atr'),
+            'be_unidad': s.get('be_unidad'),
+            'trailing_atr': s.get('trailing_atr'),
+            'direccion_param': (s.get('params') or {}).get('direccion'),
         }
         s['nombre'] = self.txt_nombre.text().strip() or s['nombre']
         s['plantilla'] = self._plantilla_actual
@@ -3759,6 +4071,14 @@ class OptimizadorWidget(QWidget):
         s['be_atr'] = self.sp_be.value()
         s['be_unidad'] = _MAPA_BE_UNIDAD[self.cmb_be_unidad.currentText()]
         s['trailing_atr'] = self.sp_trailing.value()
+        s['entrada'] = {
+            'tipo': _MAPA_TIPO_ENTRADA[self.cmb_tipo_entrada.currentText()],
+            'nivel_fib': float(self.cmb_nivel_fib.currentText()),
+            'zigzag_desviacion': self.sp_zz_desviacion.value(),
+            'zigzag_piernas': self.sp_zz_piernas.value(),
+        }
+        s['limite_vigencia_velas'] = self.sp_vigencia_limite.value()
+        s['limite_cancelar_avance_r'] = self.sp_cancelar_avance_r.value()
         s['parciales'] = self._leer_parciales_tabla()
         self._validar_pct_parciales()
         s['tramos'] = self._leer_tramos_tabla()
@@ -3771,6 +4091,11 @@ class OptimizadorWidget(QWidget):
             'regimen': {
                 'metodo': _MAPA_REGIMEN[self.cmb_regimen.currentText()],
                 'periodo': self.sp_regimen_periodo.value(),
+            },
+            'volatilidad': {
+                'metodo': _MAPA_VOLATILIDAD[self.cmb_volatilidad.currentText()],
+                'periodo': self.sp_volatilidad_periodo.value(),
+                'percentil': self.sp_volatilidad_percentil.value(),
             },
             'sesion': {
                 'tipo': _MAPA_SESION[self.cmb_sesion.currentText()],
@@ -3793,6 +4118,13 @@ class OptimizadorWidget(QWidget):
         despues_deshacer = {
             'parciales': s['parciales'], 'tramos': s['tramos'],
             'condiciones_entrada': s['filtros']['condiciones_entrada'],
+            'stop_atr': s.get('stop_atr'),
+            'tp_r': s.get('tp_r'),
+            'salida_n_velas': s.get('salida_n_velas'),
+            'be_atr': s.get('be_atr'),
+            'be_unidad': s.get('be_unidad'),
+            'trailing_atr': s.get('trailing_atr'),
+            'direccion_param': (s.get('params') or {}).get('direccion'),
         }
         for clave, valor_antes in antes_deshacer.items():
             if valor_antes != despues_deshacer[clave]:
@@ -3834,11 +4166,24 @@ class OptimizadorWidget(QWidget):
             elif clave == 'tramos':
                 s['tramos'] = valor
                 self._cargar_tramos_tabla(valor)
-            else:   # 'condiciones_entrada'
+            elif clave == 'condiciones_entrada':
                 s.setdefault('filtros', {})['condiciones_entrada'] = valor
                 self.editor_cond_entrada.cargar_condiciones(valor)
+            elif clave == 'be_unidad':
+                s['be_unidad'] = valor
+                self.cmb_be_unidad.setCurrentText(_MAPA_BE_UNIDAD_INV.get(valor, '× ATR'))
+            elif clave == 'direccion_param':
+                s.setdefault('params', {})['direccion'] = valor
+                tipo_w = self._param_widgets.get('direccion')
+                if tipo_w is not None:
+                    tipo_w[1].setCurrentText(str(valor))
+                self._sincronizar_filas_plantilla(s)
+            elif clave in _ATTR_ESCALAR_MECANISMO:
+                s[clave] = valor
+                getattr(self, _ATTR_ESCALAR_MECANISMO[clave]).setValue(valor)
         finally:
             self._cargando = False
+        self._sincronizar_filas_mecanismo()
         self._actualizar_boton_deshacer()
         self._refresh_item_actual()
         self._refresh_definicion()
@@ -5035,6 +5380,169 @@ def render_mfe_mae(dst, payload):
     dst.canvas_mfe_mae.draw_idle()
 
 
+# Capas que nacen APAGADAS. El ZigZag es una polilínea que recorre todo el
+# histórico por encima del precio: al abrir el gráfico tapa lo que se va a
+# mirar, y solo hace falta cuando se están programando entradas por orden
+# límite. Sigue en el panel, listo para encenderse a mano.
+PREFIJOS_CAPA_OCULTA = ('zigzag:',)
+
+
+def capa_visible_por_defecto(clave):
+    """Estado del ojo de una capa que el usuario todavía no ha tocado."""
+    return not clave.startswith(PREFIJOS_CAPA_OCULTA)
+
+
+class _FilaCapa(QFrame):
+    """Una línea de la leyenda: cuadradito de color, nombre y ojo.
+
+    El ojo solo aparece al pasar el ratón por encima de la fila (como en la
+    leyenda de TradingView), salvo cuando la capa está apagada: entonces se
+    queda visible y tachado, o no habría forma de encontrarla para volver a
+    encenderla."""
+
+    def __init__(self, capa, visible, al_conmutar, parent=None):
+        super().__init__(parent)
+        self.clave = capa['clave']
+        self._al_conmutar = al_conmutar
+        self.setObjectName('filaCapa')
+        self.setToolTip(capa.get('ayuda', ''))
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(5, 1, 4, 1)
+        lay.setSpacing(5)
+
+        muestra = QLabel(self)
+        muestra.setFixedSize(8, 8)
+        muestra.setStyleSheet(
+            f"background:{capa['color']}; border-radius:2px;")
+        lay.addWidget(muestra)
+
+        etiqueta = QLabel(capa['etiqueta'], self)
+        etiqueta.setStyleSheet(f"color:{AX_FG}; font-size:10px;")
+        lay.addWidget(etiqueta)
+
+        self.ojo = QToolButton(self)
+        self.ojo.setCheckable(True)
+        self.ojo.setChecked(visible)
+        self.ojo.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.ojo.setStyleSheet(
+            "QToolButton{border:none; background:transparent; font-size:10px;}")
+        self.ojo.toggled.connect(self._conmutar)
+        lay.addWidget(self.ojo)
+        self._pintar_ojo()
+
+    def _conmutar(self, activo):
+        self._pintar_ojo()
+        self._al_conmutar(self.clave, activo)
+
+    def _pintar_ojo(self):
+        activo = self.ojo.isChecked()
+        self.ojo.setText('👁' if activo else '🚫')
+        self.ojo.setToolTip("Ocultar del gráfico" if activo
+                            else "Mostrar en el gráfico")
+        # apagada -> siempre visible, o quedaría irrecuperable
+        self.ojo.setVisible(not activo or self.underMouse())
+
+    def enterEvent(self, evento):
+        self.setProperty('hover', True)
+        self._repolir()
+        self.ojo.setVisible(True)
+        super().enterEvent(evento)
+
+    def leaveEvent(self, evento):
+        self.setProperty('hover', False)
+        self._repolir()
+        self.ojo.setVisible(not self.ojo.isChecked())
+        super().leaveEvent(evento)
+
+    def _repolir(self):
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+
+class PanelCapas(QWidget):
+    """Leyenda interactiva flotando sobre el gráfico, al estilo TradingView:
+    una fila por indicador activo, arriba a la izquierda, tenue mientras el
+    ratón está fuera y legible al entrar.
+
+    Va como hijo del canvas en vez de en la barra de herramientas para no robar
+    sitio permanente a la interfaz por unas capas que dependen del sistema que
+    se haya simulado. La contrapartida es que intercepta el ratón donde ocupa
+    (arrastrar el gráfico justo debajo del panel no funciona), y de ahí que se
+    pueda plegar."""
+
+    OPACIDAD_REPOSO = 0.35
+
+    def __init__(self, canvas, al_conmutar):
+        super().__init__(canvas)
+        self._al_conmutar = al_conmutar
+        self._filas = []
+        self._plegado = False
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setStyleSheet(
+            "#filaCapa{background:transparent; border-radius:3px;}"
+            "#filaCapa[hover=\"true\"]{background:rgba(20,32,56,190);}")
+        self._efecto = QGraphicsOpacityEffect(self)
+        self._efecto.setOpacity(self.OPACIDAD_REPOSO)
+        self.setGraphicsEffect(self._efecto)
+
+        self._lay = QVBoxLayout(self)
+        self._lay.setContentsMargins(0, 0, 0, 0)
+        self._lay.setSpacing(0)
+        self._btn_plegar = QToolButton(self)
+        self._btn_plegar.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_plegar.setStyleSheet(
+            f"QToolButton{{border:none; background:transparent; color:{AX_FG};"
+            " font-size:10px; padding:1px 5px;}}")
+        self._btn_plegar.clicked.connect(self._alternar_plegado)
+        self._lay.addWidget(self._btn_plegar,
+                            alignment=Qt.AlignmentFlag.AlignLeft)
+
+    def poblar(self, capas, estado):
+        """Rehace las filas. Se llama en cada redibujado: el sistema simulado
+        puede haber cambiado y con él la lista de indicadores."""
+        for fila in self._filas:
+            self._lay.removeWidget(fila)
+            fila.deleteLater()
+        self._filas = []
+        for capa in capas:
+            fila = _FilaCapa(capa,
+                             estado.get(capa['clave'],
+                                        capa_visible_por_defecto(capa['clave'])),
+                             self._al_conmutar, self)
+            self._lay.insertWidget(len(self._filas), fila)
+            self._filas.append(fila)
+        self.setVisible(bool(capas))
+        self._aplicar_plegado()
+
+    def _alternar_plegado(self):
+        self._plegado = not self._plegado
+        self._aplicar_plegado()
+
+    def _aplicar_plegado(self):
+        n = len(self._filas)
+        for fila in self._filas:
+            fila.setVisible(not self._plegado)
+        self._btn_plegar.setText(f"▸ {n} indicadores" if self._plegado else "▾")
+        self._btn_plegar.setToolTip("Desplegar la lista de capas" if self._plegado
+                                    else "Plegar la lista de capas")
+        self.adjustSize()
+
+    def enterEvent(self, evento):
+        self._efecto.setOpacity(1.0)
+        super().enterEvent(evento)
+
+    def leaveEvent(self, evento):
+        self._efecto.setOpacity(self.OPACIDAD_REPOSO)
+        super().leaveEvent(evento)
+
+    def reposicionar(self):
+        """Arriba a la izquierda del canvas. El eje de precio va a la derecha
+        (yaxis.tick_right), así que ese lado está ocupado por las etiquetas."""
+        self.adjustSize()
+        self.move(8, 6)
+        self.raise_()
+
+
 class ResultadosWidget(QWidget):
     favorito_guardado = pyqtSignal()
 
@@ -5082,6 +5590,18 @@ class ResultadosWidget(QWidget):
         self._tramo_venta_idx_full = None
         self._scatter_tramo_compra = None
         self._scatter_tramo_venta = None
+        # marcas del precio REAL de ejecución (tick) y su conector con la
+        # flecha, que va desplazada fuera de la vela
+        self._offset_flecha = 0.0
+        self._orden_por_barra = {}
+        self._compra_precio_full = None
+        self._venta_precio_full = None
+        self._tramo_compra_precio_full = None
+        self._tramo_venta_precio_full = None
+        self._scatter_nivel_compra = None
+        self._scatter_nivel_venta = None
+        self._scatter_nivel_tramo_compra = None
+        self._scatter_nivel_tramo_venta = None
         self._art_trayecto = None
         self._art_salida_cuadros = None
         self._art_salida_segmentos = None
@@ -5099,6 +5619,14 @@ class ResultadosWidget(QWidget):
         self._paneles = []
         self._pesos_paneles = {}
         self._pesos_paneles_prev = {}
+
+        # capas del gráfico (ver _catalogo_capas): {clave: visible}. Persiste
+        # entre redibujados y entre backtests — una clave lleva sus parámetros
+        # dentro, así que apagar la EMA(20) no afecta a la EMA(50) ni se
+        # arrastra a un sistema que use otras medias.
+        self._capas_estado = {}
+        self._capas_catalogo = []
+        self._colores_capas = {}
 
         # estado de blitting (pan/zoom fluido) — ver _iniciar_sesion_blit
         self._blit_bg = None
@@ -5228,6 +5756,12 @@ class ResultadosWidget(QWidget):
         self.canvas.mpl_connect('button_release_event', self._on_release_ejes)
         self.canvas.mpl_connect('scroll_event', self._on_scroll)
         self.canvas.mpl_connect('resize_event', self._on_resize_canvas)
+
+        # leyenda interactiva flotando sobre el gráfico (ver PanelCapas): hija
+        # del canvas, así que se reposiciona con el eventFilter de abajo
+        self.panel_capas = PanelCapas(self.canvas, self._conmutar_capa)
+        self.panel_capas.hide()
+        self.canvas.installEventFilter(self)
 
         # curva de equity (IS vs OOS)
         self.grp_equity = QGroupBox()
@@ -5508,6 +6042,10 @@ class ResultadosWidget(QWidget):
             sb = self._scroll.verticalScrollBar()
             sb.setValue(sb.value() - event.angleDelta().y())
             return True
+        # el panel de capas flota sobre el canvas del gráfico principal, así
+        # que hay que recolocarlo cuando ese canvas cambia de tamaño
+        if event.type() == QEvent.Type.Resize and obj is self.canvas:
+            self.panel_capas.reposicionar()
         return super().eventFilter(obj, event)
 
     # ── selector de dirección ──
@@ -5688,13 +6226,22 @@ class ResultadosWidget(QWidget):
         self.lbl_titulo.setTextFormat(Qt.TextFormat.RichText)
         max_estr = 80
         estr_visible = estrategia if len(estrategia) <= max_estr else estrategia[:max_estr - 1] + '…'
+        # el periodo cubierto va antes de las cifras: da la escala con la que
+        # hay que leerlas (214 trades en 5 años no son 214 trades en 5 meses)
+        periodo = _texto_periodo(ts)
         self.lbl_titulo.setText(
             f"{badge} — {estr_visible} — "
-            f"{payload['n_velas']:,} velas · {payload['resultado']['n_trades']} trades · "
+            + (f"{periodo} · " if periodo else "")
+            + f"{payload['n_velas']:,} velas · {payload['resultado']['n_trades']} trades · "
             f"capital final {payload['resultado']['capital_final']:,.0f}")
+        # el tooltip repite las fechas CON hora: en intradía el día suelto del
+        # título no dice dónde empieza ni acaba realmente la serie
+        detalle_periodo = (
+            f"\n{ts[0].strftime('%d/%m/%Y %H:%M')} → "
+            f"{ts[-1].strftime('%d/%m/%Y %H:%M')}" if len(ts) else "")
         self.lbl_titulo.setToolTip(
             f"{_nombre_activo_limpio(payload['csv'])} · {payload.get('tf', '')} — "
-            f"{estrategia}")
+            f"{estrategia}{detalle_periodo}")
         self.btn_favorito.setEnabled(True)
         self.btn_favorito.setText("⭐ Guardar como favorito")
 
@@ -5759,9 +6306,10 @@ class ResultadosWidget(QWidget):
 
     def _mostrar_lwc(self, payload):
         """Repinta la vista LWC reflejando los mismos checkboxes (trayecto/
-        stop-loss/noticias) y los mismos indicadores (medias/Bollinger/KAMA/
-        patrones/osciladores) que la vista clásica, para que ambas se vean
-        coherentes al conmutar entre ellas."""
+        stop-loss/noticias), las mismas capas (ZigZag/Fibonacci/órdenes) y los
+        mismos indicadores (medias/Bollinger/KAMA/patrones/osciladores) que la
+        vista clásica, para que ambas se vean coherentes al conmutar entre
+        ellas."""
         self.lwc.mostrar(
             payload,
             mostrar_trayecto=getattr(self, 'chk_trayecto', None) is not None
@@ -5771,17 +6319,157 @@ class ResultadosWidget(QWidget):
             mostrar_noticias=getattr(self, 'chk_noticias', None) is not None
                              and self.chk_noticias.isChecked(),
             eventos_noticias=payload.get('eventos_noticias'),
+            # la vista Moderna dibuja el ZigZag como una sola capa, mientras que
+            # el panel tiene un ojo por juego de parámetros: basta con que uno
+            # esté encendido para que allí se pinte
+            capas={'zigzag': any(
+                       self._capa_activa(c['clave'])
+                       for c in self._capas_catalogo
+                       if c['clave'].startswith('zigzag:')),
+                   'fib': self._capa_activa('fib'),
+                   'ordenes': self._capa_activa('ordenes')},
             indicadores=self._recolectar_indicadores(payload))
 
+    def _catalogo_capas(self, ind, payload):
+        """Lista ordenada de capas dibujables de este backtest, como dicts
+        {clave, etiqueta, color, grupo, ayuda}.
+
+        Es la ÚNICA fuente de la que salen tanto las filas del panel de capas
+        como los colores con que se pintan los indicadores. Si el panel derivara
+        su lista por su cuenta acabaría ofreciendo un ojo para algo que no se
+        pinta (o al revés), y bastaría con tocar un color en un sitio para que
+        el cuadradito del panel dejara de corresponderse con su línea.
+
+        La clave identifica la capa entre redibujados: incluye los parámetros,
+        así que dos medias distintas son dos capas distintas y apagar la EMA(20)
+        no apaga la EMA(50). `ind` es lo que devuelve _recolectar_indicadores.
+        """
+        capas = []
+        idx_paleta = 0
+        for tipo, per in sorted(ind['mas'], key=lambda x: x[1]):
+            color = COLOR_MEDIA_FIJO.get(per)
+            if color is None:
+                color = PALETA_MEDIA[idx_paleta % len(PALETA_MEDIA)]
+                idx_paleta += 1
+            capas.append({'clave': f'ma:{tipo}:{per}', 'etiqueta': f'{tipo}({per})',
+                          'color': color, 'grupo': 'ind',
+                          'ayuda': f'Media {"exponencial" if tipo == "EMA" else "simple"} '
+                                   f'de {per} periodos.'})
+        for per, desv in sorted(ind['bbs']):
+            capas.append({'clave': f'bb:{per}:{desv:g}',
+                          'etiqueta': f'BB({per}, {desv:g})',
+                          'color': COLOR_BOLLINGER, 'grupo': 'ind',
+                          'ayuda': 'Bandas de Bollinger: media y desviación típica.'})
+        for per_er, rapido, lento in sorted(ind['kamas']):
+            capas.append({'clave': f'kama:{per_er}:{rapido}:{lento}',
+                          'etiqueta': f'KAMA({per_er},{rapido},{lento})',
+                          'color': COLOR_KAMA, 'grupo': 'ind',
+                          'ayuda': 'Media adaptativa de Kaufman.'})
+        for per in sorted(ind['donchianes']):
+            capas.append({'clave': f'donchian:{per}', 'etiqueta': f'Donchian({per})',
+                          'color': COLOR_DONCHIAN, 'grupo': 'ind',
+                          'ayuda': f'Canal de máximos y mínimos de {per} velas.'})
+        for desviacion, piernas in sorted(ind['zigzags']):
+            capas.append({'clave': f'zigzag:{desviacion:g}:{piernas}',
+                          'etiqueta': f'ZigZag({desviacion:g}%, {piernas})',
+                          'color': AZUL_ZIGZAG, 'grupo': 'ind',
+                          'ayuda': 'Polilínea que une los pivotes de swing '
+                                   'confirmados, con los parámetros del setup.'})
+        for af_i, af_p, af_m in sorted(ind['sars']):
+            capas.append({'clave': f'sar:{af_i:g}:{af_p:g}:{af_m:g}',
+                          'etiqueta': f'SAR({af_i:g},{af_p:g},{af_m:g})',
+                          'color': COLOR_SAR, 'grupo': 'ind',
+                          'ayuda': 'Parabolic SAR: puntos de stop and reverse.'})
+        if ind['patrones']:
+            capas.append({'clave': 'patrones', 'etiqueta': 'Patrones de velas',
+                          'color': COLOR_PATRONES, 'grupo': 'ind',
+                          'ayuda': 'Marca cada patrón de velas detectado.'})
+
+        # capas de la entrada por orden límite: solo aparecen si este backtest
+        # llegó a colocar órdenes, o serían filas que no pintan nada
+        ol_cat = payload.get('resultado', {}).get('ordenes_limite') or {}
+        n_ordenes = len(ol_cat.get('idx_alta', ()))
+        # los tramos solo se pintan sobre órdenes rellenadas, así que sin
+        # ninguna el ojo sería una fila que no apaga ni enciende nada
+        n_rellenadas = int(np.sum(np.asarray(ol_cat.get('resultado', ()),
+                                             dtype=np.int64) == ORDEN_RELLENADA)) \
+            if n_ordenes else 0
+        if ind['fibs'] and n_rellenadas:
+            capas.append({'clave': 'fib', 'etiqueta': 'Tramos Fibonacci',
+                          'color': AMARILLO_FIB, 'grupo': 'ind',
+                          'ayuda': 'El swing del que se midió el retroceso de cada '
+                                   'orden ejecutada: sus dos extremos y la zona '
+                                   'entre ellos. Las órdenes que se cancelaron sin '
+                                   'llegar al nivel no dibujan tramo.'})
+        if n_ordenes:
+            capas.append({'clave': 'ordenes', 'etiqueta': 'Órdenes límite',
+                          'color': VERDE, 'grupo': 'ind',
+                          'ayuda': 'Cada orden como un segmento a su precio, desde '
+                                   'que se coloca hasta que se resuelve: verde '
+                                   'rellenada, gris cancelada, ámbar expirada.'})
+
+        # osciladores: cada uno vive en su propio panel bajo el precio, así que
+        # apagarlo no quita una línea sino el panel entero
+        for kind, clave_ind in (('rsi', 'rsis'), ('atr', 'atrs'), ('stoch', 'stochs'),
+                                ('williams', 'williams'), ('cci', 'ccis')):
+            if ind[clave_ind]:
+                capas.append({'clave': f'panel:{kind}',
+                              'etiqueta': ETIQUETA_PANEL[kind],
+                              'color': COLOR_PANEL_OSC[kind], 'grupo': 'panel',
+                              'ayuda': 'Se dibuja en su propio panel bajo el '
+                                       'precio; al apagarlo el panel desaparece.'})
+        return capas
+
+    def _capa_activa(self, clave):
+        """True si el ojo de esa capa está encendido. Una clave que aún no está
+        en el dict es una capa que el usuario no ha tocado nunca: casi todas
+        nacen visibles, salvo las de PREFIJOS_CAPA_OCULTA."""
+        return self._capas_estado.get(clave, capa_visible_por_defecto(clave))
+
+    def _color_capa(self, clave, defecto=GRIS):
+        """Color con que se pinta esa capa, según el catálogo del último
+        dibujo. Lo consultan los bucles de dibujo para no repetir la asignación
+        de la paleta (que depende del orden) por su cuenta."""
+        return self._colores_capas.get(clave, defecto)
+
+    def _conmutar_capa(self, clave, visible):
+        """Un ojo del panel. Las capas apagadas no se ocultan: se dejan de
+        crear, y por eso hay que redibujar. Ocultarlas con set_visible no
+        valdría — _iniciar_sesion_blit devuelve a visibles todos los artistas
+        dinámicos en cuanto el usuario arrastra el gráfico."""
+        self._capas_estado[clave] = bool(visible)
+        self._redibujar_principal_conservando_zoom()
+
+    def _actualizar_panel_capas(self, ind, payload):
+        """Recalcula el catálogo y repuebla el panel. Se llama en cada dibujo
+        completo: al cambiar de sistema cambian los indicadores."""
+        self._capas_catalogo = self._catalogo_capas(ind, payload)
+        self._colores_capas = {c['clave']: c['color'] for c in self._capas_catalogo}
+        # el catálogo y los colores se dejan puestos aunque el panel aún no
+        # exista: _dibujar_principal puede correr durante la construcción del
+        # widget, antes de que el canvas tenga su leyenda montada
+        panel = getattr(self, 'panel_capas', None)
+        if panel is not None:
+            panel.poblar(self._capas_catalogo, self._capas_estado)
+            panel.reposicionar()
+
     def _redibujar_principal_conservando_zoom(self):
-        """Redibuja el gráfico principal preservando el rango temporal (zoom)
-        actual — compartido por los toggles de modo velas/línea, stop-loss y
-        trayecto. Si la vista moderna (LWC) está activa, también la refresca."""
-        xlim = None
+        """Redibuja el gráfico principal preservando el encuadre actual —
+        compartido por los ojos del panel de capas y por los toggles de modo
+        velas/línea, stop-loss y trayecto. Si la vista moderna (LWC) está
+        activa, también la refresca.
+
+        La escala de precio solo se conserva si el usuario la había ajustado a
+        mano: si está en automático se recalcula sola sobre la ventana visible
+        (y debe hacerlo, porque el modo velas y el de línea no encuadran igual).
+        """
+        xlim = ylim = None
         if getattr(self, '_ax_principal', None) is not None:
             a, b = self._ax_principal.get_xlim()
             xlim = (pd.Timestamp(num2date(a)), pd.Timestamp(num2date(b)))
-        self._dibujar_principal(xlim=xlim)
+            if self._y_manual:
+                ylim = self._ax_principal.get_ylim()
+        self._dibujar_principal(xlim=xlim, ylim=ylim)
         if getattr(self, 'btn_vista', None) is not None and self.btn_vista.isChecked() \
                 and getattr(self, '_payload', None) is not None:
             self._mostrar_lwc(self._payload)
@@ -6018,6 +6706,33 @@ class ResultadosWidget(QWidget):
         else:
             self._drag_lim0 = ax.get_xlim()
 
+    def _lineas_ejecucion(self, fila, es_salida, precio):
+        """Líneas del tooltip que permiten auditar la ejecución: a qué precio
+        ejecutó el motor y cuánto se separó de la referencia.
+
+        En una entrada a mercado la referencia es el open de esa vela, así que
+        la diferencia ES el slippage aplicado. En una entrada por orden límite
+        la referencia es el precio pedido, y la diferencia debería ser cero
+        salvo que un hueco de apertura la llenara mejor."""
+        lineas = [f"Ejecución: {precio:,.5g}"]
+        tr = self._tr
+        if not tr or es_salida:
+            return lineas
+        barra = int(tr['idx_entrada'][fila])
+        pedido = (self._orden_por_barra or {}).get(barra)
+        if pedido is not None:
+            lineas.append(f"Pedido (límite): {pedido:,.5g}")
+            referencia, etiqueta = pedido, "Diferencia"
+        elif self._o_full is not None and 0 <= barra < len(self._o_full):
+            referencia, etiqueta = float(self._o_full[barra]), "Slippage"
+            lineas.append(f"Open de la vela: {referencia:,.5g}")
+        else:
+            return lineas
+        dif = precio - referencia
+        pct = (dif / referencia * 100.0) if referencia else 0.0
+        lineas.append(f"{etiqueta}: {dif:+,.5g} ({pct:+.3f} %)")
+        return lineas
+
     def _actualizar_tooltip_trade(self, event, ax, zona):
         """Muestra/oculta self._annot_trade con el lotaje (y el RR, si es la
         flecha de SALIDA) del marcador de compra/venta más cercano al
@@ -6033,13 +6748,12 @@ class ResultadosWidget(QWidget):
                 and len(self._compra_idx_full):
             mask = self._trades_visibles(*ax.get_xlim())
             filas = np.where(mask)[0]
-            for idx_full, lado in ((self._compra_idx_full, 'compra'),
-                                    (self._venta_idx_full, 'venta')):
-                idx = idx_full[mask]
-                if not len(idx):
+            for lado in ('compra', 'venta'):
+                # mismas alturas que el dibujo: el ratón apunta a la FLECHA
+                x, y_flecha, y_nivel = self._alturas_marcadores(lado, mask)
+                if not len(x):
                     continue
-                pts = ax.transData.transform(
-                    np.column_stack([self._x_full[idx], self._c_full[idx]]))
+                pts = ax.transData.transform(np.column_stack([x, y_flecha]))
                 d2 = (pts[:, 0] - event.x) ** 2 + (pts[:, 1] - event.y) ** 2
                 j = int(np.argmin(d2))
                 if mejor is None or d2[j] < mejor[0]:
@@ -6049,8 +6763,8 @@ class ResultadosWidget(QWidget):
                     lineas = [f"Lotaje: {self._lotaje_full[r]:.2f}"]
                     if es_salida:
                         lineas.append(f"RR: {self._rr_full[r]:+.2f}R")
-                    mejor = (d2[j], self._x_full[idx[j]], self._c_full[idx[j]],
-                              '\n'.join(lineas))
+                    lineas += self._lineas_ejecucion(r, es_salida, y_nivel[j])
+                    mejor = (d2[j], x[j], y_flecha[j], '\n'.join(lineas))
         if mejor is not None and mejor[0] <= UMBRAL_PX2:
             _, x_dato, y_dato, texto = mejor
             renderer = self.canvas.get_renderer()
@@ -6168,6 +6882,11 @@ class ResultadosWidget(QWidget):
             + self._art_overlays_extra + self._art_osciladores + [
             a for a in (self._scatter_compra, self._scatter_venta,
                         self._scatter_tramo_compra, self._scatter_tramo_venta,
+                        # marcas del precio de ejecución: se mueven con las
+                        # flechas, así que van en la misma capa
+                        self._scatter_nivel_compra, self._scatter_nivel_venta,
+                        self._scatter_nivel_tramo_compra,
+                        self._scatter_nivel_tramo_venta,
                         self._art_trayecto, self._art_salida_cuadros,
                         self._art_salida_segmentos, self._art_stop_track,
                         self._art_entrada_track, self._art_zona_riesgo)
@@ -6224,6 +6943,49 @@ class ResultadosWidget(QWidget):
         if self._drag_modo is not None and not self._drag_modo.startswith('resize_panel:'):
             self._iniciar_sesion_blit()
 
+    def _alturas_marcadores(self, lado, mask):
+        """(x, y_flecha, y_nivel) de los marcadores de un lado ('compra' o
+        'venta'), recortados por `mask`.
+
+        y_nivel es el precio REAL de ejecución; y_flecha va pegada al extremo
+        de la vela para que se lea sin taparse con el cuerpo. Este es el ÚNICO
+        sitio donde se decide dónde va cada marcador: lo consumen el dibujo, el
+        repintado por blitting y la detección del ratón. Si cada uno lo
+        calculara por su cuenta, bastaría con tocar dos para que las flechas
+        saltaran al hacer scroll o el tooltip dejara de encontrarlas.
+
+        Ojo con el indexado: los arrays de índice son por OPERACIÓN y apuntan a
+        una barra, así que las series por barra se leen con `idx` y los precios
+        de ejecución —que también son por operación— con la propia `mask`.
+        """
+        if lado == 'compra':
+            idx = self._compra_idx_full[mask]
+            y_nivel = self._compra_precio_full[mask]
+            y_flecha = self._l_full[idx] - self._offset_flecha
+        else:
+            idx = self._venta_idx_full[mask]
+            y_nivel = self._venta_precio_full[mask]
+            y_flecha = self._h_full[idx] + self._offset_flecha
+        return self._x_full[idx], y_flecha, y_nivel
+
+    def _alturas_tramos(self, lado, x0, x1):
+        """Equivalente de _alturas_marcadores para los tramos 2+ de entrada
+        escalonada, que viven en resultado['entradas'] y no en 'trades'."""
+        if lado == 'compra':
+            idx_full, precio_full = (self._tramo_compra_idx_full,
+                                     self._tramo_compra_precio_full)
+            signo = -1.0
+            serie = self._l_full
+        else:
+            idx_full, precio_full = (self._tramo_venta_idx_full,
+                                     self._tramo_venta_precio_full)
+            signo = 1.0
+            serie = self._h_full
+        visible = self._tramo_extra_visible(idx_full, x0, x1)
+        idx = idx_full[visible]
+        return (self._x_full[idx], serie[idx] + signo * self._offset_flecha,
+                precio_full[visible])
+
     def _actualizar_trades_dinamicos(self, x0, x1):
         """Muta in-place (set_offsets/set_segments/set_verts) los artistas
         persistentes de compra/venta/trayecto/stop-loss, recortados a la
@@ -6232,24 +6994,24 @@ class ResultadosWidget(QWidget):
         if not self._tr:
             return
         mask = self._trades_visibles(x0, x1)
-        if self._scatter_compra is not None:
-            idx = self._compra_idx_full[mask]
-            self._scatter_compra.set_offsets(
-                np.column_stack([self._x_full[idx], self._c_full[idx]]))
-        if self._scatter_venta is not None:
-            idx = self._venta_idx_full[mask]
-            self._scatter_venta.set_offsets(
-                np.column_stack([self._x_full[idx], self._c_full[idx]]))
-        if self._scatter_tramo_compra is not None:
-            idx = self._tramo_compra_idx_full[
-                self._tramo_extra_visible(self._tramo_compra_idx_full, x0, x1)]
-            self._scatter_tramo_compra.set_offsets(
-                np.column_stack([self._x_full[idx], self._c_full[idx]]))
-        if self._scatter_tramo_venta is not None:
-            idx = self._tramo_venta_idx_full[
-                self._tramo_extra_visible(self._tramo_venta_idx_full, x0, x1)]
-            self._scatter_tramo_venta.set_offsets(
-                np.column_stack([self._x_full[idx], self._c_full[idx]]))
+        # mismas alturas que al crear los artistas (_alturas_marcadores es el
+        # único sitio que las decide), o los marcadores saltarían al arrastrar
+        for lado in ('compra', 'venta'):
+            flecha = getattr(self, f'_scatter_{lado}')
+            if flecha is None:
+                continue
+            x, y_flecha, y_nivel = self._alturas_marcadores(lado, mask)
+            flecha.set_offsets(np.column_stack([x, y_flecha]))
+            getattr(self, f'_scatter_nivel_{lado}').set_offsets(
+                np.column_stack([x, y_nivel]))
+        for lado in ('compra', 'venta'):
+            circulo = getattr(self, f'_scatter_tramo_{lado}')
+            if circulo is None:
+                continue
+            x, y_flecha, y_nivel = self._alturas_tramos(lado, x0, x1)
+            circulo.set_offsets(np.column_stack([x, y_flecha]))
+            getattr(self, f'_scatter_nivel_tramo_{lado}').set_offsets(
+                np.column_stack([x, y_nivel]))
         if self._art_trayecto is not None:
             self._art_trayecto.set_segments(self._trayecto_segmentos_full[mask])
         if self._art_salida_cuadros is not None:
@@ -6292,7 +7054,7 @@ class ResultadosWidget(QWidget):
             (art.axes or ax).draw_artist(art)
         self.canvas.blit(self.fig.bbox)
 
-    def _dibujar_principal(self, xlim=None):
+    def _dibujar_principal(self, xlim=None, ylim=None):
         p = self._payload
         if p is None:
             return
@@ -6313,11 +7075,22 @@ class ResultadosWidget(QWidget):
         self._art_osciladores = []
 
         ind = self._recolectar_indicadores(p)
+        # el panel de capas se repuebla ANTES de dibujar: de él salen tanto los
+        # colores de cada overlay como qué capas están encendidas
+        self._actualizar_panel_capas(ind, p)
         paneles_spec = []
+        n_osc_disponibles = 0
         for kind, clave in (('rsi', 'rsis'), ('atr', 'atrs'), ('stoch', 'stochs'),
                             ('williams', 'williams'), ('cci', 'ccis')):
             datos = ind[clave]
-            if datos:
+            if not datos:
+                continue
+            n_osc_disponibles += 1
+            # apagar un oscilador quita su panel entero, no solo sus líneas: el
+            # precio se queda ese espacio. _pesos_paneles va indexado por kind,
+            # así que la altura que el usuario le hubiera dado a mano se
+            # conserva y vuelve intacta al reencenderlo.
+            if self._capa_activa(f'panel:{kind}'):
                 paneles_spec.append((kind, datos))
 
         self.fig.clear()
@@ -6343,7 +7116,11 @@ class ResultadosWidget(QWidget):
             self._art_osciladores += self._dibujar_panel_oscilador(
                 ax_osc, kind, datos, ts, y, self._h_full, self._l_full)
         self._aplicar_pesos_paneles()
-        self.canvas.setMinimumHeight(int(480 + 90 * n_osc))
+        # la altura se reserva por los osciladores que el sistema TIENE, no por
+        # los que estén encendidos: si encogiera al apagar uno, el canvas se
+        # haría más bajo y toda la pestaña se recolocaría bajo el ratón. Así el
+        # hueco liberado se lo queda el panel de precio y nada más se mueve.
+        self.canvas.setMinimumHeight(int(480 + 90 * n_osc_disponibles))
 
         # sombreado IS / OOS — artistas "dinámicos baratos": se repintan en
         # cada frame de blit junto con las velas (ver _pintar_frame_blit)
@@ -6360,6 +7137,12 @@ class ResultadosWidget(QWidget):
         else:
             ax.set_xlim(self._x_full[0], self._x_full[-1])
         self._redibujar_datos(ax)
+        if ylim is not None:
+            # escala de precio que el usuario ajustó a mano. _redibujar_datos
+            # no la recalcula en ese caso (self._y_manual), y este Axes se acaba
+            # de crear: sin fijarla aquí, matplotlib la autoescalaría a TODA la
+            # serie y el gráfico daría un salto al encender o apagar una capa.
+            ax.set_ylim(*ylim)
 
         n_tr = len(tr['pnl'])
         mask_vis = self._trades_visibles(*ax.get_xlim())
@@ -6369,29 +7152,69 @@ class ResultadosWidget(QWidget):
         # Vectorizado (sin bucle Python) y recortado al rango visible; los
         # arrays _full se guardan para poder volver a recortar en cada
         # frame de pan/zoom sin reconstruir nada (_actualizar_trades_dinamicos).
+        #
+        # La flecha se pega al extremo de su vela (sin taparse con el cuerpo) y
+        # el precio real de ejecución se marca aparte con un tick horizontal,
+        # que permite comprobar a qué precio ejecutó de verdad el motor: el
+        # nivel pactado en una orden límite, o el open más el slippage en una
+        # entrada a mercado.
+        #
+        # La separación se mide contra la vela TÍPICA, no contra el rango total
+        # del gráfico: con el rango total, en un activo que ha recorrido mucho
+        # una vela es una fracción ínfima de ese rango y la flecha acababa
+        # flotando a varias velas de distancia de la suya. El fallback cubre
+        # series planas (mediana de rango = 0).
+        rango_vela = float(np.nanmedian(self._h_full - self._l_full))
+        self._offset_flecha = (
+            rango_vela * 0.25 if rango_vela > 0
+            else max(float(np.nanmax(self._h_full)
+                           - np.nanmin(self._l_full)) * 0.001, 1e-9))
+        # {barra de relleno: precio pedido} de las órdenes límite que llegaron a
+        # ejecutarse. Una orden rellenada se resuelve (idx_fin) en la misma vela
+        # en que el motor abre la posición, así que basta con esa barra para
+        # saber si una entrada vino de un límite y a qué nivel se pidió. Se
+        # calcula aquí y no en cada evento de ratón.
+        ol_tt = p['resultado'].get('ordenes_limite') or {}
+        self._orden_por_barra = {
+            int(ol_tt['idx_fin'][k]): float(ol_tt['precio'][k])
+            for k in range(len(ol_tt.get('idx_alta', ())))
+            if int(ol_tt['resultado'][k]) == 0}
         self._scatter_compra = None
         self._scatter_venta = None
+        self._scatter_nivel_compra = None
+        self._scatter_nivel_venta = None
         if n_tr:
             es_long = tr['dir'] > 0
             self._compra_idx_full = np.where(es_long, tr['idx_entrada'], tr['idx_salida'])
             self._venta_idx_full = np.where(es_long, tr['idx_salida'], tr['idx_entrada'])
+            # precios de EJECUCIÓN, por operación (no por vela): la compra es
+            # la entrada de un largo o la salida de un corto, y al revés
+            self._compra_precio_full = np.where(
+                es_long, tr['precio_entrada'], tr['precio_salida'])
+            self._venta_precio_full = np.where(
+                es_long, tr['precio_salida'], tr['precio_entrada'])
             # para el hover de lotaje/RR (_on_motion_ejes): compra_idx_full[r]/
             # venta_idx_full[r] siguen siendo la fila r de `tr` sin reordenar,
             # así que unidades/r_multiple/es_long se leen con el mismo índice.
             self._es_long_full = es_long
             self._lotaje_full = tr['unidades']
             self._rr_full = tr['r_multiple']
-            idx_c = self._compra_idx_full[mask_vis]
-            idx_v = self._venta_idx_full[mask_vis]
-            self._scatter_compra = ax.scatter(
-                self._x_full[idx_c], self._c_full[idx_c], marker='^', s=28,
-                color=VERDE_FLECHA, zorder=3, label='Compra')
-            self._scatter_venta = ax.scatter(
-                self._x_full[idx_v], self._c_full[idx_v], marker='v', s=28,
-                color=ROJO_FLECHA, zorder=3, label='Venta')
+            for lado, marca, color, etiqueta in (
+                ('compra', '^', VERDE_FLECHA, 'Compra'),
+                ('venta', 'v', ROJO_FLECHA, 'Venta'),
+            ):
+                x, y_flecha, y_nivel = self._alturas_marcadores(lado, mask_vis)
+                flecha = ax.scatter(x, y_flecha, marker=marca, s=28,
+                                    color=color, zorder=3, label=etiqueta)
+                nivel = ax.scatter(x, y_nivel, marker='_', s=42, color=color,
+                                   linewidths=1.2, alpha=0.9, zorder=3)
+                setattr(self, f'_scatter_{lado}', flecha)
+                setattr(self, f'_scatter_nivel_{lado}', nivel)
         else:
             self._compra_idx_full = np.array([], dtype=np.int64)
             self._venta_idx_full = np.array([], dtype=np.int64)
+            self._compra_precio_full = np.array([], dtype=float)
+            self._venta_precio_full = np.array([], dtype=float)
             self._es_long_full = np.array([], dtype=bool)
             self._lotaje_full = np.array([], dtype=float)
             self._rr_full = np.array([], dtype=float)
@@ -6402,25 +7225,35 @@ class ResultadosWidget(QWidget):
         # resultado['entradas'], no en 'trades' (no son un cierre).
         self._scatter_tramo_compra = None
         self._scatter_tramo_venta = None
+        self._scatter_nivel_tramo_compra = None
+        self._scatter_nivel_tramo_venta = None
         self._tramo_compra_idx_full = np.array([], dtype=np.int64)
         self._tramo_venta_idx_full = np.array([], dtype=np.int64)
+        self._tramo_compra_precio_full = np.array([], dtype=float)
+        self._tramo_venta_precio_full = np.array([], dtype=float)
         entr = self._entr
         if entr is not None and len(entr.get('idx', [])):
             extra = entr['tramo'] > 0
             if extra.any():
-                self._tramo_compra_idx_full = entr['idx'][extra & (entr['dir'] > 0)]
-                self._tramo_venta_idx_full = entr['idx'][extra & (entr['dir'] < 0)]
-                idx_tc = self._tramo_compra_idx_full[
-                    self._tramo_extra_visible(self._tramo_compra_idx_full, *ax.get_xlim())]
-                idx_tv = self._tramo_venta_idx_full[
-                    self._tramo_extra_visible(self._tramo_venta_idx_full, *ax.get_xlim())]
-                self._scatter_tramo_compra = ax.scatter(
-                    self._x_full[idx_tc], self._c_full[idx_tc], marker='o', s=24,
-                    facecolors='none', edgecolors=VERDE_FLECHA, linewidths=1.3,
-                    zorder=3, label='Tramo (promediar/piramidar)')
-                self._scatter_tramo_venta = ax.scatter(
-                    self._x_full[idx_tv], self._c_full[idx_tv], marker='o', s=24,
-                    facecolors='none', edgecolors=ROJO_FLECHA, linewidths=1.3, zorder=3)
+                es_compra = extra & (entr['dir'] > 0)
+                es_venta = extra & (entr['dir'] < 0)
+                self._tramo_compra_idx_full = entr['idx'][es_compra]
+                self._tramo_venta_idx_full = entr['idx'][es_venta]
+                # entradas['precio'] ya es el precio de fill de ESE tramo
+                self._tramo_compra_precio_full = entr['precio'][es_compra]
+                self._tramo_venta_precio_full = entr['precio'][es_venta]
+                for lado, color, etiqueta in (
+                    ('compra', VERDE_FLECHA, 'Tramo (promediar/piramidar)'),
+                    ('venta', ROJO_FLECHA, None),
+                ):
+                    x, y_flecha, y_nivel = self._alturas_tramos(lado, *ax.get_xlim())
+                    circulo = ax.scatter(
+                        x, y_flecha, marker='o', s=24, facecolors='none',
+                        edgecolors=color, linewidths=1.3, zorder=3, label=etiqueta)
+                    nivel = ax.scatter(x, y_nivel, marker='_', s=36, color=color,
+                                       linewidths=1.0, alpha=0.9, zorder=3)
+                    setattr(self, f'_scatter_tramo_{lado}', circulo)
+                    setattr(self, f'_scatter_nivel_tramo_{lado}', nivel)
 
         # trayecto de cada operación (entrada→salida, precio real de fill),
         # opcional vía checkbox: la pendiente ya muestra de un vistazo si el
@@ -6531,35 +7364,70 @@ class ResultadosWidget(QWidget):
 
         # ── indicadores overlays (medias, Bollinger, KAMA, patrones) ──
         # (ind ya se calculó arriba, antes de construir los paneles)
-        mas, bbs, patrones_set, kamas = (ind['mas'], ind['bbs'],
-                                          ind['patrones'], ind['kamas'])
-        paletas_ma = [AZUL, AMBAR, '#2ecc71', '#9b59b6', '#e67e22']
-        idx_paleta = 0
+        #
+        # Cada familia se salta las capas que el usuario tenga apagadas en el
+        # panel, y saca su color de _color_capa en vez de asignarlo aquí: el
+        # cuadradito del panel y la línea del gráfico salen así del mismo sitio.
+        # Apagar NO es ocultar el artista — _iniciar_sesion_blit devuelve a
+        # visibles todos los dinámicos en cuanto se arrastra el gráfico, así que
+        # la única forma de que una capa se quede apagada es no crearla.
+        mas, bbs, patrones_set, kamas, sars, donchianes, zigzags = (
+            ind['mas'], ind['bbs'], ind['patrones'], ind['kamas'], ind['sars'],
+            ind['donchianes'], ind['zigzags'])
         for tipo, per in sorted(mas, key=lambda x: x[1]):
-            color = COLOR_MEDIA_FIJO.get(per)
-            if color is None:
-                color = paletas_ma[idx_paleta % len(paletas_ma)]
-                idx_paleta += 1
+            clave = f'ma:{tipo}:{per}'
+            if not self._capa_activa(clave):
+                continue
             f = ema if tipo == 'EMA' else sma
-            val = f(y, per)
-            line, = ax.plot(ts, val, color=color, linewidth=1.0, alpha=0.75,
-                            label=f'{tipo}({per})')
+            line, = ax.plot(ts, f(y, per), color=self._color_capa(clave),
+                            linewidth=1.0, alpha=0.75)
             self._art_overlays_extra.append(line)
-        for per, desv in bbs:
+        for per, desv in sorted(bbs):
+            if not self._capa_activa(f'bb:{per}:{desv:g}'):
+                continue
             media, sup, inf = bollinger(y, per, desv)
-            bb_col = '#9b59b6'
-            sup_line, = ax.plot(ts, sup, color=bb_col, linewidth=0.5, alpha=0.4)
-            inf_line, = ax.plot(ts, inf, color=bb_col, linewidth=0.5, alpha=0.4)
-            fill = ax.fill_between(ts, inf, sup, color=bb_col, alpha=0.05)
-            ax.plot([], [], color=bb_col, linewidth=1.2,
-                    label=f'BB({per}, {desv:g})')
+            sup_line, = ax.plot(ts, sup, color=COLOR_BOLLINGER, linewidth=0.5, alpha=0.4)
+            inf_line, = ax.plot(ts, inf, color=COLOR_BOLLINGER, linewidth=0.5, alpha=0.4)
+            fill = ax.fill_between(ts, inf, sup, color=COLOR_BOLLINGER, alpha=0.05)
             self._art_overlays_extra += [sup_line, inf_line, fill]
-        for per_er, rapido, lento in kamas:
+        for per_er, rapido, lento in sorted(kamas):
+            if not self._capa_activa(f'kama:{per_er}:{rapido}:{lento}'):
+                continue
             val = _kama_serie(y, per_er, rapido, lento)
-            line, = ax.plot(ts, val, color='#ab47bc', linewidth=1.1, alpha=0.8,
-                            label=f'KAMA({per_er},{rapido},{lento})')
+            line, = ax.plot(ts, val, color=COLOR_KAMA, linewidth=1.1, alpha=0.8)
             self._art_overlays_extra.append(line)
-        if patrones_set:
+        for per in sorted(donchianes):
+            if not self._capa_activa(f'donchian:{per}'):
+                continue
+            sup, inf = donchian(p.get('high', y), p.get('low', y), per)
+            sup_line, = ax.plot(ts, sup, color=COLOR_DONCHIAN, linewidth=0.6, alpha=0.5)
+            inf_line, = ax.plot(ts, inf, color=COLOR_DONCHIAN, linewidth=0.6, alpha=0.5)
+            fill = ax.fill_between(ts, inf, sup, color=COLOR_DONCHIAN, alpha=0.04)
+            self._art_overlays_extra += [sup_line, inf_line, fill]
+        if zigzags:
+            df_zz = pd.DataFrame({'high': p.get('high', y), 'low': p.get('low', y)})
+            for desviacion, piernas in sorted(zigzags):
+                if not self._capa_activa(f'zigzag:{desviacion:g}:{piernas}'):
+                    continue
+                pivotes = _zigzag_pivotes(df_zz, desviacion, piernas)
+                # se dibuja en la vela en que OCURRIÓ el pivote, no en la de
+                # confirmación: es donde el usuario lo ve en el gráfico, aunque
+                # la estrategia solo pudiera reaccionar unas velas después
+                xs = [ts[i] for i, _conf, _pr, _tp in pivotes if i < len(ts)]
+                ys = [pr for i, _conf, pr, _tp in pivotes if i < len(ts)]
+                if not xs:
+                    continue
+                line, = ax.plot(xs, ys, color=AZUL_ZIGZAG, linewidth=1.0, alpha=0.9,
+                                marker='o', markersize=3)
+                self._art_overlays_extra.append(line)
+        for af_i, af_p, af_m in sorted(sars):
+            if not self._capa_activa(f'sar:{af_i:g}:{af_p:g}:{af_m:g}'):
+                continue
+            sar_val, _tend = _sar_serie(p.get('high', y), p.get('low', y),
+                                        af_i, af_p, af_m)
+            sc = ax.scatter(ts, sar_val, s=3, color=COLOR_SAR, alpha=0.75)
+            self._art_overlays_extra.append(sc)
+        if patrones_set and self._capa_activa('patrones'):
             o_all, h_all, l_all = (p.get('open', y), p.get('high', y),
                                    p.get('low', y))
             detectados = detectar_patrones(o_all, h_all, l_all, y)
@@ -6574,12 +7442,83 @@ class ResultadosWidget(QWidget):
                 dirs = dirs[filtro]
                 if len(idx) == 0:
                     continue
-                color_pat = '#2ecc71' if np.mean(dirs) > 0 else '#e74c3c'
+                color_pat = COLOR_PATRONES if np.mean(dirs) > 0 else ROJO
                 sc = ax.scatter(ts[idx], l_all[idx] - offset_pat,
                                 marker='^' if np.mean(dirs) > 0 else 'v',
                                 color=color_pat, s=8, alpha=0.7, zorder=5)
                 self._art_overlays_extra.append(sc)
 
+        # ── tramos de Fibonacci: por cada orden límite EJECUTADA, el swing del
+        # que se midió su retroceso. El precio del nivel NO se redibuja aquí
+        # porque es exactamente el segmento de la orden (abajo); lo que aporta
+        # esta capa es de dónde sale ese precio.
+        #
+        # Solo las rellenadas: una orden se coloca en cuanto confirma la señal
+        # primaria, y la mayoría se cancelan sin que el precio llegue a
+        # retroceder al nivel. Dibujar también esas llenaba el gráfico del
+        # swing de retrocesos que nunca ocurrieron. Las canceladas y expiradas
+        # siguen viéndose como segmento en la capa de órdenes, que es donde
+        # tienen sentido — ahí lo que se cuenta son las oportunidades perdidas.
+        ol_fib = p['resultado'].get('ordenes_limite') or {}
+        if (ind['fibs'] and len(ol_fib.get('idx_alta', ()))
+                and self._capa_activa('fib')):
+            df_fib = pd.DataFrame({'high': p.get('high', y), 'low': p.get('low', y)})
+            cache_tramos = {}
+            for k in range(len(ol_fib['idx_alta'])):
+                if int(ol_fib['resultado'][k]) != ORDEN_RELLENADA:
+                    continue
+                sid = int(ol_fib['setup'][k])
+                if sid not in ind['fibs']:
+                    continue
+                desv, piernas, nivel = ind['fibs'][sid]
+                if (desv, piernas) not in cache_tramos:
+                    cache_tramos[(desv, piernas)] = tramos_zigzag_vigentes(
+                        df_fib, desv, piernas)
+                tramos = cache_tramos[(desv, piernas)]
+                i0, i1 = int(ol_fib['idx_alta'][k]), int(ol_fib['idx_fin'][k])
+                if i0 >= len(ts) or i1 >= len(ts):
+                    continue
+                origen, extremo = tramos['anterior'][i0], tramos['ultimo'][i0]
+                if not np.isfinite(origen) or not np.isfinite(extremo):
+                    continue
+                x0, x1 = ts[i0], ts[i1]
+                banda = ax.fill_between([x0, x1], origen, extremo,
+                                        color=AMARILLO_FIB, alpha=0.05, zorder=1)
+                self._art_overlays_extra.append(banda)
+                for precio_ancla in (origen, extremo):
+                    borde, = ax.plot([x0, x1], [precio_ancla] * 2,
+                                     color=AMARILLO_FIB, linewidth=0.7, alpha=0.55,
+                                     zorder=4)
+                    self._art_overlays_extra.append(borde)
+
+        # ── órdenes límite: un segmento horizontal de la vela en que se
+        # colocan a la vela en que se resuelven, al precio pedido. Deja ver de
+        # un vistazo cuántas oportunidades se escaparon sin rellenarse.
+        ordenes = (p['resultado'].get('ordenes_limite') or {}).get('idx_alta')
+        if ordenes is not None and len(ordenes) and self._capa_activa('ordenes'):
+            ol = p['resultado']['ordenes_limite']
+            colores_orden = {0: VERDE, 1: GRIS, 2: AMBAR}
+            vistos = set()
+            for k in range(len(ol['idx_alta'])):
+                i0, i1 = int(ol['idx_alta'][k]), int(ol['idx_fin'][k])
+                if i0 >= len(ts) or i1 >= len(ts):
+                    continue
+                res = int(ol['resultado'][k])
+                color_o = colores_orden.get(res, GRIS)
+                linea, = ax.plot([ts[i0], ts[i1]],
+                                 [ol['precio'][k], ol['precio'][k]],
+                                 color=color_o, linewidth=1.0, linestyle=':',
+                                 alpha=0.8, zorder=4,
+                                 label=(f'Orden {RESULTADOS_ORDEN[res].lower()}'
+                                        if res not in vistos else None))
+                vistos.add(res)
+                self._art_overlays_extra.append(linea)
+
+        # leyenda de OPERACIONES (compra/venta/stop/salida/órdenes). Los
+        # indicadores ya no ponen `label=`: los lista el panel de capas, que
+        # además deja apagarlos. Aquí se quedan los elementos que el panel no
+        # cubre — los tres colores según cómo se resolvió cada orden límite, o
+        # los marcadores de operación, cuyas casillas siguen en la barra.
         ax.legend(loc='lower right', fontsize=7, facecolor=FIG_BG,
                   edgecolor=GRID_C, labelcolor=AX_FG, framealpha=0.6)
 
@@ -6719,8 +7658,15 @@ class ResultadosWidget(QWidget):
         williams = set()
         ccis = set()
         kamas = set()
+        sars = set()
+        donchianes = set()
+        zigzags = set()
+        # {indice_setup: (desviacion, piernas, nivel_fib)} — indexado POR SETUP
+        # porque ordenes_limite['setup'] dice quién colocó cada orden y cada
+        # setup puede medir su retroceso con un nivel distinto
+        fibs = {}
         setups = payload.get('setups', []) if payload else []
-        for setup in setups:
+        for indice_setup, setup in enumerate(setups):
             plantilla = setup.get('plantilla', '')
             p = params_por_defecto(plantilla) if plantilla in ESTRATEGIAS else {}
             p.update(setup.get('params', {}))
@@ -6745,6 +7691,14 @@ class ResultadosWidget(QWidget):
                           p.get('sobrecompra', 100.0)))
             elif plantilla == 'KAMA':
                 kamas.add((p.get('periodo_er', 10), p.get('rapido', 2), p.get('lento', 30)))
+            elif plantilla == 'Parabolic SAR':
+                sars.add((p.get('af_inicial', 0.02), p.get('af_paso', 0.02),
+                          p.get('af_max', 0.2)))
+            elif plantilla == 'Breakout de canal (Donchian)':
+                donchianes.add(p.get('periodo', 20))
+                per_salida = int(p.get('periodo_salida') or 0)
+                if per_salida > 0:
+                    donchianes.add(per_salida)
             elif plantilla == 'Patrones de velas':
                 patrones_set.update(p.get('patrones', []))
             elif plantilla == 'Custom (reglas)':
@@ -6753,20 +7707,33 @@ class ResultadosWidget(QWidget):
                     for grupo in p.get('reglas', {}).get(clave, []):
                         for cond in grupo.get('condiciones', []):
                             for lado in (cond.get('izq', {}), cond.get('der', {})):
-                                _acumular_indicador_spec(lado, mas, rsis, atrs, bbs)
+                                _acumular_indicador_spec(lado, mas, rsis, atrs, bbs,
+                                                         donchianes, zigzags)
 
             # filtros extra del setup (condiciones_entrada/condiciones_salida) —
             # aplicables a CUALQUIER plantilla, no solo Custom (reglas); por
             # eso van fuera del if/elif de arriba.
+            # el ZigZag de un setup con entrada límite en Fibonacci: se dibuja
+            # aunque su plantilla no tenga nada que ver con el ZigZag
+            entrada = setup.get('entrada') or {}
+            if entrada.get('tipo') == 'limite_fib':
+                desv = entrada.get('zigzag_desviacion', 5.0)
+                piernas = entrada.get('zigzag_piernas', 10)
+                zigzags.add((desv, piernas))
+                fibs[indice_setup] = (desv, piernas,
+                                      entrada.get('nivel_fib', 0.618))
+
             filtros = setup.get('filtros') or {}
             for clave in ('condiciones_entrada', 'condiciones_salida'):
                 for cond in filtros.get(clave, []):
                     for lado in (cond.get('izq', {}), cond.get('der', {})):
-                        _acumular_indicador_spec(lado, mas, rsis, atrs, bbs)
+                        _acumular_indicador_spec(lado, mas, rsis, atrs, bbs,
+                                                 donchianes, zigzags)
         return {
             'mas': mas, 'bbs': bbs, 'rsis': rsis, 'atrs': atrs,
             'patrones': patrones_set, 'stochs': stochs, 'williams': williams,
-            'ccis': ccis, 'kamas': kamas,
+            'ccis': ccis, 'kamas': kamas, 'sars': sars,
+            'donchianes': donchianes, 'zigzags': zigzags, 'fibs': fibs,
         }
 
     def _dibujar_panel_oscilador(self, ax, kind, datos, ts, c, h, l):

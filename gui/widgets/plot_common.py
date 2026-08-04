@@ -23,7 +23,7 @@ from PyQt6.QtWidgets import (QSizePolicy, QLabel, QDialog, QTabWidget,
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
-from matplotlib.dates import date2num
+from matplotlib.dates import date2num, AutoDateLocator, ConciseDateFormatter
 
 # ══════════════ paleta ══════════════
 # Misma que la del Backtester (gui/widgets/tab_backtest.py): el Analizador se
@@ -67,6 +67,26 @@ def style_ax(ax):
     for spine in ax.spines.values():
         spine.set_edgecolor(GRID_C)
     ax.grid(True, alpha=0.25, color=GRID_C, linewidth=0.5)
+
+
+def eje_fechas(ax, x=None):
+    """Etiquetas de fecha compactas y sin solapes.
+
+    Con el formateador por defecto, un panel estrecho (los cuadrantes del
+    dashboard NATR o el mini-histograma de una tarjeta de patrón, por ejemplo)
+    pinta fechas completas superpuestas. ConciseDateFormatter reparte el
+    año/mes/día entre el eje y el offset.
+
+    `x` es opcional: si se pasa un array, no se hace nada cuando no es de tipo
+    datetime64 (los ejes numéricos no llevan formateador de fechas). Si se
+    omite, se asume que el eje ya está en unidades de fecha (date2num).
+    """
+    if x is not None and not np.issubdtype(np.asarray(x).dtype, np.datetime64):
+        return
+    loc = AutoDateLocator(minticks=3, maxticks=7)
+    ax.xaxis.set_major_locator(loc)
+    ax.xaxis.set_major_formatter(ConciseDateFormatter(loc))
+    ax.xaxis.get_offset_text().set_color(AX_FG)
 
 
 def ax_placeholder(ax, texto):

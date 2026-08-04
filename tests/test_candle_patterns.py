@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from core.candle_patterns import (
     detectar_patrones, agregar_por_periodo, preparar_contexto, preparar_base_filtro,
@@ -231,6 +232,57 @@ def test_agregar_por_periodo_agrupa_por_mes_y_filtra_bloques_pequenos():
     assert res['n'][0] == 10
     assert res['hit_rate'][0] == 1.0
     assert res['edge_pb'][0] > 0
+
+
+def _barras_horarias(regla, dias=180, min_ocurrencias=5):
+    """Una ocurrencia por hora durante `dias`: suficiente para que todos los
+    bloques (incluso los diarios) superen el mínimo de ocurrencias."""
+    fin = np.datetime64('2024-01-01') + np.timedelta64(dias, 'D')
+    ts = np.arange(np.datetime64('2024-01-01T00'), fin.astype('datetime64[h]'),
+                   dtype='datetime64[h]').astype('datetime64[ns]')
+    idx = np.arange(len(ts))
+    aciertos = np.tile([True, False, True, True, False], len(ts) // 5 + 1)[:len(ts)]
+    dir_arr = np.ones(len(ts))
+    signed_ret = np.where(aciertos, 0.001, -0.001)
+    return agregar_por_periodo(idx, dir_arr, aciertos, signed_ret, ts, regla,
+                               drift_base=0.0, min_ocurrencias=min_ocurrencias)
+
+
+@pytest.mark.parametrize('regla,dias_min,dias_max', [
+    ('1D', 1, 1), ('1W', 7, 7), ('1ME', 28, 31), ('1QE', 90, 92),
+])
+def test_agregar_por_periodo_bordes_duran_el_bloque_real(regla, dias_min, dias_max):
+    """Los bordes del bin permiten pintar una barra que ocupa exactamente el
+    bloque que representa, sin estimar el ancho desde la regla (los meses y
+    trimestres no duran todos lo mismo)."""
+    res = _barras_horarias(regla)
+
+    assert len(res['fecha_ini']) == len(res['fechas'])
+    assert len(res['fecha_fin']) == len(res['fechas'])
+    assert np.all(res['fecha_fin'] > res['fecha_ini'])
+
+    dias = (res['fecha_fin'] - res['fecha_ini']) / np.timedelta64(1, 'D')
+    assert dias.min() >= dias_min
+    assert dias.max() <= dias_max
+
+
+def test_agregar_por_periodo_bordes_contiguos():
+    """Sin bloques descartados, el fin de un bin es el inicio del siguiente:
+    las barras teselan el eje sin huecos ni solapes."""
+    res = _barras_horarias('1ME')
+
+    assert len(res['fechas']) > 1
+    assert np.array_equal(res['fecha_fin'][:-1], res['fecha_ini'][1:])
+
+
+def test_agregar_por_periodo_bordes_encierran_la_etiqueta():
+    """'fechas' es la etiqueta del bin (su extremo derecho en las reglas de fin
+    de periodo): debe caer dentro del bloque que delimitan ini/fin, que es lo
+    que hace que centrar una barra en ella la desalineara."""
+    res = _barras_horarias('1ME')
+
+    assert np.all(res['fecha_ini'] < res['fechas'])
+    assert np.all(res['fechas'] <= res['fecha_fin'])
 
 
 def test_agregar_por_periodo_sin_ocurrencias():

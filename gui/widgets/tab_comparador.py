@@ -1150,11 +1150,16 @@ class TabComparador(QWidget):
             # Composicion de la cartera tangente (pesos >3%): fuera del
             # grafico (QLabel bajo el canvas) en vez de anotacion junto a la
             # estrella, ya que esta puede caer en cualquier punto de la nube
-            # y solapar datos.
-            pesos_txt = "  ".join(
-                f"{lbl} {w_i:.0%}" for lbl, w_i in
-                sorted(zip(frontera['labels'], f_w[i_tan]), key=lambda t: -t[1])
-                if w_i >= 0.03)
+            # y solapar datos. Los pesos <3% se agregan en "+resto" para que
+            # el texto siempre sume 100% (si no, parece que falta reparto).
+            pesos_ordenados = sorted(zip(frontera['labels'], f_w[i_tan]),
+                                     key=lambda t: -t[1])
+            visibles = [(lbl, w_i) for lbl, w_i in pesos_ordenados if w_i >= 0.03]
+            resto = sum(w_i for _lbl, w_i in pesos_ordenados if w_i < 0.03)
+            partes = [f"{lbl} {w_i:.0%}" for lbl, w_i in visibles]
+            if resto >= 0.005:
+                partes.append(f"+resto {resto:.0%}")
+            pesos_txt = "  ".join(partes)
             self.tangente_label.setText(f"★ Cartera tangente (máx. Sharpe): {pesos_txt}")
             self.tangente_label.setVisible(True)
 

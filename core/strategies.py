@@ -30,7 +30,10 @@ import pandas as pd
 from core.candle_patterns import (
     PATRONES_INFO, detectar_patrones, preparar_contexto, _mascara_sesion,
 )
-from core.metrics import calcular_er_series, calcular_kama_numba, calcular_hurst_array
+from core.metrics import (
+    calcular_er_series, calcular_kama_numba, calcular_hurst_array,
+    calcular_percentil_rodante_numba, calcular_sar_numba,
+)
 from core.backtest import TRIGGERS_TRAMO_ENTRADA
 
 PERIODO_ATR_DEFECTO = 14
@@ -68,6 +71,22 @@ def bollinger(c, periodo=20, desv=2.0):
     media = s.rolling(int(periodo)).mean()
     std = s.rolling(int(periodo)).std()
     return media.values, (media + desv * std).values, (media - desv * std).values
+
+
+def donchian(h, l, periodo, incluir_actual=False):
+    """Canal de Donchian: máximo y mínimo rodantes de `periodo` velas.
+
+    incluir_actual=False (por defecto) desplaza el canal una vela, de modo
+    que NO contiene la vela que se compara contra él. Es la diferencia entre
+    una ruptura real y una tautología: si la vela actual formara parte del
+    canal, su propio máximo sería el máximo del canal y jamás podría
+    superarlo."""
+    hs, ls = pd.Series(h), pd.Series(l)
+    sup = hs.rolling(int(periodo)).max()
+    inf = ls.rolling(int(periodo)).min()
+    if not incluir_actual:
+        sup, inf = sup.shift(1), inf.shift(1)
+    return sup.values, inf.values
 
 
 def stochastic(h, l, c, periodo_k=14, suavizado_k=3, periodo_d=3):
@@ -121,6 +140,149 @@ def _kama_serie(close, periodo_er, rapido, lento):
     c = np.asarray(close, dtype=np.float64)
     er = _er_serie(c, periodo_er).values.astype(np.float64)
     return calcular_kama_numba(c, er, float(rapido), float(lento))
+
+
+def _sar_serie(h, l, af_inicial=0.02, af_paso=0.02, af_max=0.2):
+    """Parabolic SAR de `h`/`l` → (sar, tendencia ±1). Ver calcular_sar_numba."""
+    return calcular_sar_numba(
+        np.asarray(h, dtype=np.float64), np.asarray(l, dtype=np.float64),
+        float(af_inicial), float(af_paso), float(af_max))
+
+
+def _pivotes_candidatos(h, l, piernas):
+    """Candidatos a pivote alto/bajo al estilo ta.pivothigh/ta.pivotlow de Pine.
+
+    La vela i es candidata a pivote alto si su máximo es el mayor de la
+    ventana [i-izq, i+der], con izq = der = piernas // 2 (el contrato del
+    indicador ZigZag de TradingView: «piernas» es el total de velas que
+    confirman un pivote, la mitad a cada lado).
+
+    Devuelve (candidatos, der) donde cada candidato es
+    (idx_pivote, idx_confirmacion, precio, tipo ±1) e idx_confirmacion =
+    idx_pivote + der. Esa distinción es lo que hace el indicador NO
+    repintante: un pivote no puede conocerse hasta que han cerrado las `der`
+    velas siguientes, así que una estrategia solo puede reaccionar a él a
+    partir de esa vela, nunca en la del propio pivote.
+    """
+    der = max(1, int(piernas) // 2)
+    izq = der
+    n = len(h)
+    hs, ls = pd.Series(h), pd.Series(l)
+    ventana = izq + der + 1
+    # el rolling mira hacia atrás: en la vela j = i+der, la ventana cubre
+    # exactamente [i-izq, i+der], que es la ventana centrada en i
+    max_ventana = hs.rolling(ventana).max().values
+    min_ventana = ls.rolling(ventana).min().values
+
+    candidatos = []
+    for i in range(izq, n - der):
+        j = i + der
+        if h[i] >= max_ventana[j]:
+            candidatos.append((i, j, float(h[i]), 1))
+        if l[i] <= min_ventana[j]:
+            candidatos.append((i, j, float(l[i]), -1))
+    # orden de CONFIRMACIÓN, que es el orden en que el motor puede enterarse.
+    # Si un alto y un bajo confirman en la misma vela, se procesa primero el
+    # que ocurrió antes: desempate arbitrario pero determinista (la librería
+    # Pine de referencia no expone el suyo).
+    candidatos.sort(key=lambda t: (t[1], t[0]))
+    return candidatos, der
+
+
+def _zigzag_eventos(df, desviacion_pct, piernas):
+    """Registro cronológico de cambios del pivote vigente del ZigZag:
+    [(idx_pivote, idx_confirmacion, precio, tipo ±1, reemplaza), ...] en orden
+    de confirmación, donde `reemplaza` indica que este pivote sustituye al
+    anterior en vez de abrir un tramo nuevo.
+
+    Es el registro, y no la lista final de pivotes, la fuente de verdad para
+    cualquier uso en backtest: cuando un pivote es sustituido por otro más
+    extremo del mismo tipo, el sustituido SÍ estuvo vigente entre su
+    confirmación y la del sustituto, y una estrategia que corriera en vivo lo
+    habría visto. Reconstruir el pasado solo con la lista final sería
+    exactamente el repintado que este indicador evita.
+
+    Reimplementación fiel del algoritmo que implica el contrato de entradas
+    del indicador ZigZag de TradingView (desviación % + piernas), no un port
+    del código de su librería Pine, que no es público.
+    """
+    candidatos, _der = _pivotes_candidatos(
+        df['high'].values, df['low'].values, piernas)
+    umbral = float(desviacion_pct)
+    eventos = []
+    ult_precio = None
+    ult_tipo = 0
+    for idx_piv, idx_conf, precio, tipo in candidatos:
+        if ult_precio is None:
+            eventos.append((idx_piv, idx_conf, precio, tipo, False))
+            ult_precio, ult_tipo = precio, tipo
+            continue
+        if tipo == ult_tipo:
+            # dos pivotes del mismo tipo seguidos: el nuevo solo cuenta si
+            # supera al anterior, y entonces lo sustituye
+            mas_extremo = precio > ult_precio if tipo == 1 else precio < ult_precio
+            if mas_extremo:
+                eventos.append((idx_piv, idx_conf, precio, tipo, True))
+                ult_precio = precio
+            continue
+        if ult_precio == 0.0:
+            continue
+        variacion = abs(precio - ult_precio) / abs(ult_precio) * 100.0
+        if variacion < umbral:
+            continue   # retroceso insuficiente: no abre tramo, sigue vigente el previo
+        eventos.append((idx_piv, idx_conf, precio, tipo, False))
+        ult_precio, ult_tipo = precio, tipo
+    return eventos
+
+
+def _zigzag_pivotes(df, desviacion_pct, piernas):
+    """Polilínea final del ZigZag: [(idx_pivote, idx_confirmacion, precio,
+    tipo ±1), ...] tras aplicar las sustituciones. Es lo que se dibuja en el
+    gráfico; para lógica de backtest usar _zigzag_eventos/_zigzag_series, que
+    conservan lo que se sabía en cada momento."""
+    pivotes = []
+    for idx_piv, idx_conf, precio, tipo, reemplaza in _zigzag_eventos(
+            df, desviacion_pct, piernas):
+        if reemplaza and pivotes:
+            pivotes[-1] = (idx_piv, idx_conf, precio, tipo)
+        else:
+            pivotes.append((idx_piv, idx_conf, precio, tipo))
+    return pivotes
+
+
+def _zigzag_series(df, desviacion_pct, piernas):
+    """(precio, tipo, eventos): precio y tipo del pivote vigente en cada vela
+    según lo que se sabía en esa vela (NaN / 0 antes de la primera
+    confirmación). Pensado para condiciones del editor de reglas y como swing
+    de referencia de los niveles de Fibonacci."""
+    n = len(df)
+    precio = np.full(n, np.nan)
+    tipo = np.zeros(n, dtype=np.int8)
+    eventos = _zigzag_eventos(df, desviacion_pct, piernas)
+    for _idx_piv, idx_conf, prec, tp, _reemplaza in eventos:
+        if idx_conf < n:
+            precio[idx_conf:] = prec
+            tipo[idx_conf:] = tp
+    return precio, tipo, eventos
+
+
+def _volatilidad_serie(df, metodo, ventana):
+    """Percentil rodante de la volatilidad para el filtro homónimo: ATR si
+    `metodo` empieza por 'atr', desviación estándar de retornos log si no.
+
+    El indicador se calcula siempre con PERIODO_ATR_DEFECTO velas y `ventana`
+    es solo el histórico contra el que se compara. Son dos cosas distintas a
+    propósito: si coincidieran, un tramo de volatilidad estable saldría
+    siempre en el percentil medio por muy alta o baja que fuera, porque solo
+    se estaría comparando consigo mismo. Al comparar un ATR corto contra una
+    ventana larga, el filtro mide volatilidad RELATIVA al pasado reciente."""
+    if metodo.startswith('atr'):
+        base = atr(df['high'].values, df['low'].values, df['close'].values,
+                   PERIODO_ATR_DEFECTO)
+    else:
+        base = _retorno_log(df['close'].values).rolling(PERIODO_ATR_DEFECTO).std().values
+    return calcular_percentil_rodante_numba(
+        np.asarray(base, dtype=np.float64), int(ventana))
 
 
 def _lags_hurst_defecto(periodo):
@@ -306,6 +468,69 @@ def _gen_kama(df, p):
     return s
 
 
+def _gen_breakout(df, p):
+    """Ruptura del canal de Donchian: entra cuando el precio supera el máximo
+    (o pierde el mínimo) de las `periodo` velas anteriores.
+
+    `periodo_salida` = 0 significa "el mismo canal": la salida es entonces la
+    ruptura contraria. Con un valor propio y más corto se obtiene el esquema
+    clásico de las Tortugas — entrar con un canal largo y salir con uno más
+    reactivo."""
+    h, l, c = df['high'].values, df['low'].values, df['close'].values
+    n = len(c)
+    # la fuente define tanto qué forma el canal como qué lo rompe: con 'close'
+    # es una ruptura de CIERRES (ignora las mechas por los dos lados), no un
+    # cierre medido contra un canal de máximos
+    usa_extremos = p['fuente'] == 'high/low'
+    arriba_src = h if usa_extremos else c
+    abajo_src = l if usa_extremos else c
+    s = _base_senales(n, h, l, c)
+
+    sup, inf = donchian(arriba_src, abajo_src, p['periodo'])
+    rompe_arriba = _limpiar_nan(arriba_src > sup, sup)
+    rompe_abajo = _limpiar_nan(abajo_src < inf, inf)
+
+    per_salida = int(p.get('periodo_salida') or 0)
+    if per_salida > 0 and per_salida != int(p['periodo']):
+        sup_s, inf_s = donchian(arriba_src, abajo_src, per_salida)
+        salida_long = _limpiar_nan(abajo_src < inf_s, inf_s)
+        salida_short = _limpiar_nan(arriba_src > sup_s, sup_s)
+    else:
+        salida_long, salida_short = rompe_abajo, rompe_arriba
+
+    if p['direccion'] in ('Long', 'Ambas'):
+        s['entradas_long'] = rompe_arriba.copy()
+        s['salidas_long'] = salida_long.copy()
+    if p['direccion'] in ('Short', 'Ambas'):
+        s['entradas_short'] = rompe_abajo.copy()
+        s['salidas_short'] = salida_short.copy()
+    return s
+
+
+def _gen_sar(df, p):
+    """Parabolic SAR: entrada en el GIRO de la tendencia del SAR, y salida en
+    el giro contrario — mismo esquema que _gen_cruce_medias/_gen_kama, pero el
+    nivel de giro se acelera conforme la tendencia avanza en vez de depender
+    de un periodo fijo."""
+    h, l, c = df['high'].values, df['low'].values, df['close'].values
+    n = len(c)
+    sar, tendencia = _sar_serie(h, l, p['af_inicial'], p['af_paso'], p['af_max'])
+    s = _base_senales(n, h, l, c)
+    previa = np.roll(tendencia, 1)
+    giro_alcista = (tendencia == 1) & (previa == -1)
+    giro_bajista = (tendencia == -1) & (previa == 1)
+    giro_alcista[0] = giro_bajista[0] = False
+    giro_alcista = _limpiar_nan(giro_alcista, sar)
+    giro_bajista = _limpiar_nan(giro_bajista, sar)
+    if p['direccion'] in ('Long', 'Ambas'):
+        s['entradas_long'] = giro_alcista.copy()
+        s['salidas_long'] = giro_bajista.copy()
+    if p['direccion'] in ('Short', 'Ambas'):
+        s['entradas_short'] = giro_bajista.copy()
+        s['salidas_short'] = giro_alcista.copy()
+    return s
+
+
 def _gen_patrones(df, p):
     """Entradas en cada ocurrencia de los patrones elegidos (dir del patrón
     decide long/short); salida por tiempo la gestiona el motor con
@@ -331,7 +556,8 @@ def _gen_patrones(df, p):
 # ══════════════ estrategia custom (constructor de reglas) ══════════════
 
 _INDICADORES_REGLA = ['close', 'open', 'high', 'low', 'SMA', 'EMA', 'RSI',
-                      'ATR', 'BB_sup', 'BB_inf', 'BB_media', 'KAMA', 'ER']
+                      'ATR', 'BB_sup', 'BB_inf', 'BB_media', 'KAMA', 'ER', 'SAR',
+                      'DONCHIAN_SUP', 'DONCHIAN_INF', 'ZIGZAG']
 _OPERADORES_REGLA = ['>', '<', 'cruza arriba', 'cruza abajo']
 
 # defaults fijos de KAMA cuando se usa desde el constructor de reglas: la
@@ -340,6 +566,21 @@ _OPERADORES_REGLA = ['>', '<', 'cruza arriba', 'cruza abajo']
 # periodo_er). Para variar rápido/lento hace falta la plantilla KAMA dedicada.
 _KAMA_RAPIDO_REGLA = 2
 _KAMA_LENTO_REGLA = 30
+
+# misma limitación para el SAR, que necesita tres números y la fila solo
+# ofrece uno: los tres quedan fijos en los valores clásicos de Wilder. Para
+# tocarlos hace falta la plantilla Parabolic SAR dedicada. El «Periodo» de la
+# fila se ignora para este indicador.
+_SAR_AF_INICIAL_REGLA = 0.02
+_SAR_AF_PASO_REGLA = 0.02
+_SAR_AF_MAX_REGLA = 0.2
+
+# ZIGZAG necesita dos números y la fila solo ofrece uno: el «Periodo» de la
+# fila se interpreta como las PIERNAS del pivote (el parámetro más ligado a la
+# escala temporal) y la desviación mínima queda fija. La plantilla de entrada
+# límite en Fibonacci sí expone ambos.
+_ZIGZAG_DESVIACION_REGLA = 5.0
+_ZIGZAG_PIERNAS_REGLA = 10
 
 
 def _serie_indicador(df, spec):
@@ -367,6 +608,18 @@ def _serie_indicador(df, spec):
         return _kama_serie(c, periodo, _KAMA_RAPIDO_REGLA, _KAMA_LENTO_REGLA)
     if tipo == 'ER':
         return _er_serie(c, periodo).values.astype(np.float64)
+    if tipo == 'ZIGZAG':
+        precio_piv, _tp, _pivs = _zigzag_series(
+            df, _ZIGZAG_DESVIACION_REGLA, spec.get('periodo', _ZIGZAG_PIERNAS_REGLA))
+        return precio_piv
+    if tipo in ('DONCHIAN_SUP', 'DONCHIAN_INF'):
+        sup, inf = donchian(df['high'].values, df['low'].values, periodo)
+        return {'DONCHIAN_SUP': sup, 'DONCHIAN_INF': inf}[tipo]
+    if tipo == 'SAR':
+        sar, _tendencia = _sar_serie(
+            df['high'].values, df['low'].values,
+            _SAR_AF_INICIAL_REGLA, _SAR_AF_PASO_REGLA, _SAR_AF_MAX_REGLA)
+        return sar
     raise ValueError(f"Indicador desconocido: {tipo}")
 
 
@@ -456,6 +709,10 @@ def _desc_spec(spec):
         return tipo
     if tipo in ('BB_sup', 'BB_inf', 'BB_media'):
         return f"{tipo}({spec.get('periodo', 20)},{spec.get('desv', 2.0):g})"
+    if tipo == 'SAR':
+        return 'SAR'   # sus tres parámetros son fijos aquí, no hay periodo que mostrar
+    if tipo == 'ZIGZAG':
+        return f"ZIGZAG(piernas={spec.get('periodo', _ZIGZAG_PIERNAS_REGLA)})"
     return f"{tipo}({spec.get('periodo', 14)})"
 
 
@@ -559,6 +816,44 @@ def _desc_kama(p):
     partes.append("(KAMA se adapta: sigue de cerca en tendencia -ER alto- y "
                   "se aplana en rango -ER bajo-; sin stop ATR por defecto, "
                   "igual criterio que Cruce de medias)")
+    return "\n".join(partes)
+
+
+def _desc_breakout(p):
+    per = p['periodo']
+    src_alto = 'high' if p['fuente'] == 'high/low' else 'close'
+    src_bajo = 'low' if p['fuente'] == 'high/low' else 'close'
+    per_salida = int(p.get('periodo_salida') or 0)
+    usa_canal_propio = per_salida > 0 and per_salida != int(per)
+    partes = []
+    if p['direccion'] in ('Long', 'Ambas'):
+        salida = (f"{src_bajo} pierde el mínimo de {per_salida} velas"
+                  if usa_canal_propio else f"{src_bajo} pierde el mínimo de {per} velas")
+        partes.append(f"Entrada Long: {src_alto} supera el máximo de las {per} velas "
+                      f"anteriores · Salida Long: {salida}")
+    if p['direccion'] in ('Short', 'Ambas'):
+        salida = (f"{src_alto} supera el máximo de {per_salida} velas"
+                  if usa_canal_propio else f"{src_alto} supera el máximo de {per} velas")
+        partes.append(f"Entrada Short: {src_bajo} pierde el mínimo de las {per} velas "
+                      f"anteriores · Salida Short: {salida}")
+    partes.append("(el canal excluye la vela en curso: si se incluyera a sí "
+                  "misma nunca podría superarlo)")
+    return "\n".join(partes)
+
+
+def _desc_sar(p):
+    af_i, af_p, af_m = p['af_inicial'], p['af_paso'], p['af_max']
+    firma = f"SAR(AF {af_i:g} +{af_p:g} hasta {af_m:g})"
+    partes = []
+    if p['direccion'] in ('Long', 'Ambas'):
+        partes.append(f"Entrada Long: {firma} gira a alcista (el precio deja el SAR abajo) · "
+                      f"Salida Long: el SAR gira a bajista")
+    if p['direccion'] in ('Short', 'Ambas'):
+        partes.append(f"Entrada Short: {firma} gira a bajista (el precio deja el SAR arriba) · "
+                      f"Salida Short: el SAR gira a alcista")
+    partes.append("(el nivel de giro acelera cuanto más avanza la tendencia; "
+                  "sin stop ATR por defecto, igual criterio que Cruce de medias: "
+                  "el propio giro ya es la salida)")
     return "\n".join(partes)
 
 
@@ -716,6 +1011,42 @@ ESTRATEGIAS = {
              'opciones': _OPCIONES_DIRECCION, 'defecto': 'Ambas'},
         ],
     },
+    'Breakout de canal (Donchian)': {
+        'color': '#26a69a',
+        'categoria': 'Direccional',
+        'desc_corta': 'Ruptura de máximos / mínimos de N velas',
+        'generar': _gen_breakout,
+        'descripcion': _desc_breakout,
+        'params': [
+            {'clave': 'fuente', 'etiqueta': 'Precio que rompe', 'tipo': 'choice',
+             'opciones': ['high/low', 'close'], 'defecto': 'high/low'},
+            {'clave': 'periodo', 'etiqueta': 'Velas del canal (entrada)', 'tipo': 'int',
+             'defecto': 20, 'min': 2, 'max': 500},
+            {'clave': 'periodo_salida', 'etiqueta': 'Velas del canal de salida (0 = igual)',
+             'tipo': 'int', 'defecto': 0, 'min': 0, 'max': 500},
+            {'clave': 'direccion', 'etiqueta': 'Dirección', 'tipo': 'choice',
+             'opciones': _OPCIONES_DIRECCION, 'defecto': 'Ambas'},
+        ],
+    },
+    'Parabolic SAR': {
+        'color': '#8d6e63',
+        'categoria': 'Direccional',
+        'desc_corta': 'Tendencia con parada y giro (Wilder)',
+        'generar': _gen_sar,
+        'descripcion': _desc_sar,
+        # el giro del SAR ES la salida, igual razón que Cruce de medias/KAMA
+        'defaults_setup': {'stop_atr': 0.0},
+        'params': [
+            {'clave': 'af_inicial', 'etiqueta': 'AF inicial', 'tipo': 'float',
+             'defecto': 0.02, 'min': 0.001, 'max': 0.2},
+            {'clave': 'af_paso', 'etiqueta': 'AF incremento', 'tipo': 'float',
+             'defecto': 0.02, 'min': 0.001, 'max': 0.2},
+            {'clave': 'af_max', 'etiqueta': 'AF máximo', 'tipo': 'float',
+             'defecto': 0.2, 'min': 0.02, 'max': 1.0},
+            {'clave': 'direccion', 'etiqueta': 'Dirección', 'tipo': 'choice',
+             'opciones': _OPCIONES_DIRECCION, 'defecto': 'Ambas'},
+        ],
+    },
     'Patrones de velas': {
         'color': '#ef5350',
         'categoria': 'Rev. / Direcc.',
@@ -778,6 +1109,9 @@ def _filtros_por_defecto():
         'dias_semana': None,      # None = todos; si no, lista de ints 0=Lun..6=Dom
         'regimen': {'metodo': 'ninguno', 'periodo': 100},
         # metodo: 'ninguno'|'er_tendencia'|'er_rango'|'hurst_tendencia'|'hurst_reversion'
+        'volatilidad': {'metodo': 'ninguno', 'periodo': 100, 'percentil': 50.0},
+        # metodo: 'ninguno'|'atr_percentil_alto'|'atr_percentil_bajo'|
+        #         'stdev_percentil_alto'|'stdev_percentil_bajo'
         'sesion': {'tipo': 'ninguna', 'hora_inicio': 0, 'hora_fin': 0},
         # tipo: 'ninguna'|'overnight'|'londres'|'ny'|'personalizada' (horas UTC en 'personalizada')
         'condiciones_entrada': [],   # lista de {'izq':spec,'op':...,'der':spec}; AND; [] = sin restricción
@@ -881,6 +1215,19 @@ def _mascara_filtros_setup(df, filtros, eventos_noticias=None):
             if m_sesion is not None:
                 m &= m_sesion
 
+    vol = filtros.get('volatilidad') or {}
+    metodo_vol = vol.get('metodo', 'ninguno')
+    if metodo_vol != 'ninguno':
+        pct = _volatilidad_serie(df, metodo_vol, vol.get('periodo', 100))
+        # el warm-up (NaN) se mapea a -1 para que no pase ni el corte alto ni
+        # el bajo: sin ventana completa no hay percentil en el que confiar
+        pct = np.nan_to_num(pct, nan=-1.0)
+        umbral_vol = float(vol.get('percentil', 50.0))
+        if metodo_vol.endswith('alto'):
+            m &= (pct >= umbral_vol)
+        else:
+            m &= (pct >= 0.0) & (pct <= umbral_vol)
+
     if tipo_sesion == 'personalizada':
         horas = pd.DatetimeIndex(df['timestamp']).hour.values
         h_ini, h_fin = int(ses.get('hora_inicio', 0)), int(ses.get('hora_fin', 0))
@@ -911,6 +1258,118 @@ def _mascara_filtros_setup(df, filtros, eventos_noticias=None):
     return m & mc_long, m & mc_short, m_forzar_salida
 
 
+# ══════════════ tipo de entrada del setup (mercado / límite Fib) ══════════════
+
+NIVELES_FIB = [0.236, 0.382, 0.5, 0.618, 0.786]
+
+
+def _entrada_por_defecto():
+    """Cómo ejecuta un setup sus señales de entrada. 'mercado' (o la clave
+    ausente) es el comportamiento de siempre: entrar al open de la vela
+    siguiente. 'limite_fib' coloca en su lugar una orden límite en el
+    retroceso de Fibonacci del último tramo del ZigZag."""
+    return {
+        'tipo': 'mercado',            # 'mercado' | 'limite_fib'
+        'nivel_fib': 0.618,
+        'zigzag_desviacion': 5.0,
+        'zigzag_piernas': 10,
+    }
+
+
+def tramos_zigzag_vigentes(df, desviacion_pct, piernas):
+    """Tramo del ZigZag vigente en cada vela, según lo que se sabía en esa
+    vela. Devuelve un dict de arrays de longitud n:
+
+    - 'anterior' / 'ultimo': precio del pivote de inicio y de fin del tramo
+    - 'idx_anterior' / 'idx_ultimo': vela en que ocurrió cada pivote (-1 si
+      aún no hay tramo), para poder anclar el dibujo en el gráfico
+    - 'tipo': +1 tramo alcista (bajo → alto), -1 bajista, 0 sin tramo
+    - 'nuevo': True en la vela en que se confirma un tramo distinto
+
+    NaN / -1 / 0 mientras no haya dos pivotes de tipo distinto confirmados.
+    Es la geometría que usan tanto las órdenes límite de Fibonacci como su
+    representación en el gráfico, para que no puedan divergir."""
+    n = len(df)
+    tramos = {
+        'anterior': np.full(n, np.nan),
+        'ultimo': np.full(n, np.nan),
+        'idx_anterior': np.full(n, -1, dtype=np.int64),
+        'idx_ultimo': np.full(n, -1, dtype=np.int64),
+        'tipo': np.zeros(n, dtype=np.int8),
+        'nuevo': np.zeros(n, dtype=bool),
+    }
+    eventos = _zigzag_eventos(df, desviacion_pct, piernas)
+    for k in range(1, len(eventos)):
+        idx_piv, conf, precio, tipo, _reemplaza = eventos[k]
+        idx_prev, _conf_prev, precio_prev, tipo_prev, _r = eventos[k - 1]
+        if tipo_prev == tipo:
+            continue   # sustitución: no hay tramo entre dos pivotes del mismo tipo
+        if conf >= n:
+            continue
+        tramos['anterior'][conf:] = precio_prev
+        tramos['ultimo'][conf:] = precio
+        tramos['idx_anterior'][conf:] = idx_prev
+        tramos['idx_ultimo'][conf:] = idx_piv
+        tramos['tipo'][conf:] = tipo
+        tramos['nuevo'][conf] = True
+    return tramos
+
+
+def precio_nivel_fib(anterior, ultimo, tipo, nivel):
+    """Precio del retroceso `nivel` de un tramo que va de `anterior` a
+    `ultimo`. Misma fórmula con la que _ordenes_limite_fib coloca las órdenes:
+    se mide desde el extremo alcanzado (`ultimo` = 0 %) hacia el origen del
+    tramo (`anterior` = 100 %)."""
+    recorrido = abs(ultimo - anterior)
+    return ultimo - nivel * recorrido if tipo > 0 else ultimo + nivel * recorrido
+
+
+def _ordenes_limite_fib(df, entrada, ent_long, ent_short):
+    """Convierte las señales booleanas de un setup en órdenes límite al nivel
+    de Fibonacci del último tramo confirmado del ZigZag.
+
+    Devuelve (orden_long, orden_short, cancelar_long, cancelar_short): precios
+    (NaN = sin orden) y máscaras booleanas de cancelación.
+
+    El tramo de referencia son los dos últimos pivotes VIGENTES en la vela de
+    la señal, tomados del registro cronológico del ZigZag — nunca de la
+    polilínea final, que ya conoce el futuro. Una señal long solo coloca orden
+    si el tramo vigente es alcista (el retroceso es a favor de la tendencia
+    del tramo), y viceversa; si no lo es, no hay nivel que comprar y la señal
+    se descarta.
+    """
+    n = len(df)
+    orden_long = np.full(n, np.nan)
+    orden_short = np.full(n, np.nan)
+    cancelar_long = np.zeros(n, dtype=bool)
+    cancelar_short = np.zeros(n, dtype=bool)
+
+    nivel = float(entrada.get('nivel_fib', 0.618))
+    tramos = tramos_zigzag_vigentes(df, entrada.get('zigzag_desviacion', 5.0),
+                                    entrada.get('zigzag_piernas', 10))
+    anterior, ultimo, tipo_ultimo = (tramos['anterior'], tramos['ultimo'],
+                                     tramos['tipo'])
+    # cada tramo nuevo invalida cualquier orden que siguiera viva del anterior
+    cancelar_long |= tramos['nuevo']
+    cancelar_short |= tramos['nuevo']
+
+    hay_tramo = ~np.isnan(ultimo)
+    # tramo alcista (bajo -> alto): el retroceso se compra
+    tramo_alcista = hay_tramo & (tipo_ultimo == 1)
+    tramo_bajista = hay_tramo & (tipo_ultimo == -1)
+    recorrido = np.abs(ultimo - anterior)
+
+    coloca_long = ent_long & tramo_alcista
+    orden_long[coloca_long] = (ultimo - nivel * recorrido)[coloca_long]
+    coloca_short = ent_short & tramo_bajista
+    orden_short[coloca_short] = (ultimo + nivel * recorrido)[coloca_short]
+
+    # la señal contraria del propio setup también cancela
+    cancelar_long |= ent_short
+    cancelar_short |= ent_long
+    return orden_long, orden_short, cancelar_long, cancelar_short
+
+
 # ══════════════ sistemas multi-setup ══════════════
 
 def generar_senales_sistema(df, setups, eventos_noticias=None):
@@ -927,6 +1386,10 @@ def generar_senales_sistema(df, setups, eventos_noticias=None):
       salir. El motor solo cierra por señal si el bit del setup de la
       posición abierta está activo (la salida de un setup no toca la
       posición de otro).
+    - Un setup con setup['entrada']['tipo'] == 'limite_fib' no aporta
+      entradas a mercado: sus señales se traducen a órdenes límite en
+      orden_long_precio/orden_short_precio (ver _ordenes_limite_fib). Compite
+      por la vela con la misma prioridad que los demás.
 
     eventos_noticias: tupla (ts_epoch_s, pais, impacto_rank) de
     preparar_eventos_noticias(), o None si ningún setup usa el filtro de
@@ -941,6 +1404,12 @@ def generar_senales_sistema(df, setups, eventos_noticias=None):
            'salidas_long': np.zeros(n, dtype=np.int64),
            'salidas_short': np.zeros(n, dtype=np.int64),
            'setup_id': np.zeros(n, dtype=np.int64),
+           # órdenes límite: NaN = ninguna. Un sistema sin setups de entrada
+           # límite las deja intactas y el motor se comporta como siempre.
+           'orden_long_precio': np.full(n, np.nan),
+           'orden_short_precio': np.full(n, np.nan),
+           'cancelar_orden_long': np.zeros(n, dtype=np.int64),
+           'cancelar_orden_short': np.zeros(n, dtype=np.int64),
            'atr': None}
     reclamada = np.zeros(n, dtype=bool)   # vela ya reclamada por un setup previo
 
@@ -976,12 +1445,26 @@ def generar_senales_sistema(df, setups, eventos_noticias=None):
             if m_forzar_salida is not None:
                 sal_l = sal_l | m_forzar_salida
                 sal_s = sal_s | m_forzar_salida
-        nuevas = (ent_l | ent_s) & ~reclamada
-        out['entradas_long'] |= ent_l & nuevas
-        out['entradas_short'] |= ent_s & ~ent_l & nuevas
+        bit = np.int64(1) << np.int64(k)
+        entrada = setup.get('entrada') or {}
+        if entrada.get('tipo') == 'limite_fib':
+            # las señales de este setup no entran a mercado: dejan una orden
+            # límite en el retroceso de Fibonacci del tramo vigente
+            orden_l, orden_s, cancel_l, cancel_s = _ordenes_limite_fib(
+                df, entrada, ent_l, ent_s)
+            nuevas = (~np.isnan(orden_l) | ~np.isnan(orden_s)) & ~reclamada
+            pone_l = nuevas & ~np.isnan(orden_l)
+            pone_s = nuevas & ~pone_l & ~np.isnan(orden_s)
+            out['orden_long_precio'][pone_l] = orden_l[pone_l]
+            out['orden_short_precio'][pone_s] = orden_s[pone_s]
+            out['cancelar_orden_long'][cancel_l] |= bit
+            out['cancelar_orden_short'][cancel_s] |= bit
+        else:
+            nuevas = (ent_l | ent_s) & ~reclamada
+            out['entradas_long'] |= ent_l & nuevas
+            out['entradas_short'] |= ent_s & ~ent_l & nuevas
         out['setup_id'][nuevas] = k
         reclamada |= nuevas
-        bit = np.int64(1) << np.int64(k)
         out['salidas_long'][sal_l] |= bit
         out['salidas_short'][sal_s] |= bit
 
@@ -1037,6 +1520,13 @@ _NOTA_KAMA = ("la fila usa el KAMA del editor de reglas (rápido="
               f"{_KAMA_RAPIDO_REGLA}, lento={_KAMA_LENTO_REGLA}); si cambias "
               "«SC rápido»/«SC lento» la plantilla seguirá usando los tuyos, "
               "pero esta fila no puede reflejarlo")
+
+# el DONCHIAN del editor de reglas siempre se forma con máximos/mínimos; con
+# fuente='close' la plantilla usa un canal de cierres, que la fila no sabe
+# representar.
+_NOTA_DONCHIAN = ("con «Precio que rompe» = close la plantilla forma el canal "
+                  "con cierres, pero el DONCHIAN de esta fila siempre usa "
+                  "máximos/mínimos")
 
 
 def filas_plantilla(plantilla, params=None, salida=False):
@@ -1145,6 +1635,46 @@ def filas_plantilla(plantilla, params=None, salida=False):
             filas.append(_fila_texto(
                 f"CCI({per}) < 0" if salida else
                 f"CCI({per}) > {p['sobrecompra']:g}", 'short'))
+
+    elif plantilla == 'Breakout de canal (Donchian)':
+        per = p['periodo']
+        per_salida = int(p.get('periodo_salida') or 0)
+        usa_canal_propio = per_salida > 0 and per_salida != int(per)
+        per_sal = per_salida if usa_canal_propio else per
+        alto = 'high' if p['fuente'] == 'high/low' else 'close'
+        bajo = 'low' if p['fuente'] == 'high/low' else 'close'
+        # la celda izquierda queda bloqueada: sus valores ('high'/'low') no
+        # coinciden con los del parámetro 'fuente' ('high/low'/'close'), así
+        # que no se puede escribir de vuelta desde la fila
+        mapeo_ent = {'der.periodo': 'periodo'}
+        mapeo_sal = {'der.periodo': 'periodo_salida' if usa_canal_propio else 'periodo'}
+        nota = _NOTA_DONCHIAN if p['fuente'] == 'close' else ''
+        if hace_long:
+            filas.append(_fila(
+                {'tipo': bajo if salida else alto}, '<' if salida else '>',
+                {'tipo': 'DONCHIAN_INF' if salida else 'DONCHIAN_SUP',
+                 'periodo': per_sal if salida else per},
+                'long', mapeo_sal if salida else mapeo_ent, nota))
+        if hace_short:
+            filas.append(_fila(
+                {'tipo': alto if salida else bajo}, '>' if salida else '<',
+                {'tipo': 'DONCHIAN_SUP' if salida else 'DONCHIAN_INF',
+                 'periodo': per_sal if salida else per},
+                'short', mapeo_sal if salida else mapeo_ent, nota))
+
+    elif plantilla == 'Parabolic SAR':
+        # el giro del SAR no es una comparación entre dos series (depende del
+        # estado acumulado del AF y del extremo de la tendencia viva), así que
+        # la tabla no puede ofrecer celdas editables: solo texto
+        firma = f"SAR(AF {p['af_inicial']:g} +{p['af_paso']:g} hasta {p['af_max']:g})"
+        if hace_long:
+            filas.append(_fila_texto(
+                f"{firma} gira a bajista" if salida else
+                f"{firma} gira a alcista", 'long'))
+        if hace_short:
+            filas.append(_fila_texto(
+                f"{firma} gira a alcista" if salida else
+                f"{firma} gira a bajista", 'short'))
 
     elif plantilla == 'Patrones de velas':
         if salida:
@@ -1416,6 +1946,16 @@ def _desc_filtros(filtros):
             'hurst_reversion': f"Hurst({per}) < 0.52 (reversión a la media)",
         }
         lineas.append(f"Régimen: solo entra si {etiquetas[metodo]}")
+    vol = filtros.get('volatilidad') or {}
+    metodo_vol = vol.get('metodo', 'ninguno')
+    if metodo_vol != 'ninguno':
+        per_vol = vol.get('periodo', 100)
+        pct_vol = vol.get('percentil', 50.0)
+        indicador = 'ATR' if metodo_vol.startswith('atr') else 'Desv. estándar'
+        comp = '≥' if metodo_vol.endswith('alto') else '≤'
+        lineas.append(
+            f"Volatilidad: solo entra si {indicador}({PERIODO_ATR_DEFECTO}) está en el "
+            f"percentil {comp} {pct_vol:g} de las últimas {per_vol} velas")
     ses = filtros.get('sesion') or {}
     tipo_sesion = ses.get('tipo', 'ninguna')
     if tipo_sesion != 'ninguna':
@@ -1439,6 +1979,33 @@ def _desc_filtros(filtros):
             f"{noticias.get('minutos_despues', 30)} min después de un evento de impacto "
             f"{noticias.get('impacto_minimo', 'alto')}"
             + (f" ({'/'.join(monedas)})" if monedas else ""))
+    return lineas
+
+
+def _desc_entrada_limite(setup):
+    """Líneas que matizan la ENTRADA cuando el setup no entra a mercado. Vacío
+    con entrada a mercado, que es lo que ya describe el pseudocódigo base
+    («→ comprar al open siguiente»)."""
+    entrada = setup.get('entrada') or {}
+    if entrada.get('tipo') != 'limite_fib':
+        return []
+    nivel = float(entrada.get('nivel_fib', 0.618))
+    desv = float(entrada.get('zigzag_desviacion', 5.0))
+    piernas = int(entrada.get('zigzag_piernas', 10))
+    lineas = [
+        f"OJO: no entra al open. La señal COLOCA una orden límite en el "
+        f"retroceso {nivel:g} del último tramo del ZigZag({desv:g}%, {piernas} "
+        f"piernas), y solo se opera si el precio vuelve a ese nivel.",
+        "La orden se cancela si el ZigZag confirma un tramo nuevo o si el "
+        "propio setup señala en dirección contraria.",
+    ]
+    vigencia = int(setup.get('limite_vigencia_velas', 0))
+    if vigencia:
+        lineas.append(f"También caduca a las {vigencia} velas sin rellenarse.")
+    avance = float(setup.get('limite_cancelar_avance_r', 0.0))
+    if avance:
+        lineas.append(f"También se cancela si el precio avanza {avance:g}R a favor "
+                      f"sin haberla tocado (el movimiento se fue sin nosotros).")
     return lineas
 
 
@@ -1523,6 +2090,8 @@ def codigo_setup(setup, indice=0):
     lineas.append("  ENTRADA:")
     for e in ent:
         lineas.append(f"    {e}")
+    for linea_orden in _desc_entrada_limite(setup):
+        lineas.append(f"    {linea_orden}")
     lineas.append("  SALIDA:")
     for s_l in sal:
         lineas.append(f"    {s_l}")
@@ -1596,6 +2165,8 @@ def describir_setup(setup):
         if pats:
             plantilla_txt = f"{plantilla_txt}: {' + '.join(pats)}"
     partes = [nombre, plantilla_txt]
+    if (setup.get('entrada') or {}).get('tipo') == 'limite_fib':
+        partes.append(f"entrada límite Fib {setup['entrada'].get('nivel_fib', 0.618):g}")
     if riesgo is not None:
         partes.append(f"riesgo {riesgo * 100:g}%")
     if stop:
@@ -1610,6 +2181,8 @@ def describir_setup(setup):
         activos.append('día')
     if (filtros.get('regimen') or {}).get('metodo', 'ninguno') != 'ninguno':
         activos.append('régimen')
+    if (filtros.get('volatilidad') or {}).get('metodo', 'ninguno') != 'ninguno':
+        activos.append('volatilidad')
     if (filtros.get('sesion') or {}).get('tipo', 'ninguna') != 'ninguna':
         activos.append('sesión')
     if filtros.get('condiciones_entrada') or filtros.get('condiciones_salida'):

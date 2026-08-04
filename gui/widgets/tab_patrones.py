@@ -24,6 +24,12 @@ from PyQt6.QtWidgets import (
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.patches import Rectangle
+from matplotlib.dates import date2num
+from matplotlib.colors import to_rgba
+
+from gui.widgets.plot_common import (
+    style_ax, eje_fechas, no_crash as _no_crash,
+    FIG_BG, AX_FG, GRID_C, VERDE, ROJO, GRIS, AMBAR)
 
 from core.candle_patterns import (
     LAGS, MIN_OCURRENCIAS, MIN_OCURRENCIAS_BARRA, PATRONES_INFO,
@@ -60,13 +66,29 @@ PERIODOS_BARRAS = [
     ('Trimestre', '1QE', 129600), ('Año', '1YE', 525600),
 ]
 
-FIG_BG = '#0d1424'
-AX_FG = '#c8d6e5'
-GRID_C = '#253a60'
-VERDE = '#2ecc71'
-ROJO = '#e74c3c'
-GRIS = '#5a7a9a'
-AMBAR = '#f1c40f'
+# Suelos de la escala Y del mini-histograma, uno por unidad: la vista "hit
+# rate" mide puntos porcentuales (desviación vs 50%) y la vista "retorno" mide
+# puntos básicos. Compartir un único suelo entre ambas aplastaba los edges de
+# las TFs finas (en 1m son de pocos pb) contra el cero.
+PISO_Y_HITRATE = 10.0   # pp — por debajo, un gráfico plano se vería amplificado
+PISO_Y_EDGE = 1.0       # pb — evita un ylim degenerado si todo el edge es ~0
+
+# Percentil que fija el tope de la escala compartida: con p100 basta un único
+# bloque extremo (típicamente de pocas ocurrencias) para aplastar a los demás.
+PCTL_ESCALA_Y = 98
+
+# Fracción del ancho del canvas que ocupa realmente el eje tras tight_layout
+# (el resto se lo comen la etiqueta y los ticks del eje Y). Solo se usa para
+# traducir el ancho mínimo de barra de píxeles a unidades de datos, así que una
+# aproximación basta: sobra con que la barra más fina siga siendo visible.
+_FRAC_EJE = 0.78
+
+# Rango de opacidad de las barras según las ocurrencias del bloque.
+_ALPHA_MIN, _ALPHA_MAX = 0.35, 0.95
+
+# Semi-altura (como fracción del tope del eje) de la marca que señala un bloque
+# de desviación ~0, cuya barra sería de altura cero y por tanto invisible.
+_FRAC_PLANA = 0.015
 
 STYLE_PATRONES = """
 QComboBox {
@@ -119,11 +141,10 @@ QPushButton#vista:checked {
 
 
 def _style_ax(ax):
-    ax.set_facecolor(FIG_BG)
-    ax.tick_params(colors=AX_FG, labelsize=6)
-    for spine in ax.spines.values():
-        spine.set_edgecolor(GRID_C)
-    ax.grid(True, alpha=0.25, color=GRID_C, linewidth=0.5)
+    """Tema de la app + el tamaño de fuente reducido que pide el panel de una
+    tarjeta (1.4 pulgadas de alto, mucho más pequeño que un canvas normal)."""
+    style_ax(ax)
+    ax.tick_params(labelsize=6)
 
 
 def _fmt_pvalue(p):
@@ -147,16 +168,66 @@ def _fmt_pvalue_exacto(p):
     return f"p exacto = {p:.2e}"
 
 
-def _no_crash(fn):
-    """En PyQt6 una excepcion no capturada dentro de un slot ABORTA el proceso
-    entero (qFatal): todo slot conectado a señales debe capturarlas."""
-    def wrapper(self, *a, **kw):
-        try:
-            return fn(self, *a, **kw)
-        except Exception as e:
-            print(f"[Patrones] Error en {fn.__name__}: {e}")
-    wrapper.__name__ = fn.__name__
-    return wrapper
+def escala_y_compartida(arrays_y, vista):
+    """Tope (en valor absoluto) del eje Y común a todas las tarjetas.
+
+    Que cada tarjeta autoescalara a sus propios datos hacía que la altura de
+    una barra significase algo distinto en cada patrón: al hacer scroll, dos
+    histogramas de aspecto idéntico podían valer 3 pb y 95 pb. Aquí se calcula
+    UN tope para todos los patrones visibles, así que la altura ya es
+    comparable a ojo entre tarjetas.
+
+    Se usa un percentil en vez del máximo porque los bloques con pocas
+    ocurrencias producen valores extremos (con 5 ocurrencias el hit rate solo
+    puede ser 0/20/40/60/80/100%): con el máximo, un único bloque de ruido
+    dejaría todo lo demás pegado al cero.
+    """
+    piso = PISO_Y_HITRATE if vista == 'hitrate' else PISO_Y_EDGE
+    finitos = [np.abs(np.asarray(y, dtype=np.float64)) for y in arrays_y
+               if y is not None and len(y)]
+    if not finitos:
+        return piso
+    todos = np.concatenate(finitos)
+    todos = todos[np.isfinite(todos)]
+    if not todos.size:
+        return piso
+    return max(float(np.percentile(todos, PCTL_ESCALA_Y)), piso)
+
+
+def _alpha_por_n(n, n_max):
+    """Opacidad de cada barra según las ocurrencias de su bloque.
+
+    Escala logarítmica porque el reparto de ocurrencias por bloque es de cola
+    larga: en lineal, con un solo bloque muy poblado el resto quedaría
+    indistinguible en el mínimo. `n_max` es global a todas las tarjetas para
+    que la opacidad signifique lo mismo en todas.
+    """
+    n = np.asarray(n, dtype=np.float64)
+    if n_max is None or n_max <= MIN_OCURRENCIAS_BARRA or not n.size:
+        return np.full(n.shape, _ALPHA_MAX)
+    lo = np.log10(MIN_OCURRENCIAS_BARRA)
+    frac = (np.log10(np.maximum(n, MIN_OCURRENCIAS_BARRA)) - lo) / \
+           (np.log10(n_max) - lo)
+    return _ALPHA_MIN + np.clip(frac, 0.0, 1.0) * (_ALPHA_MAX - _ALPHA_MIN)
+
+
+def ancho_barras(ini_num, fin_num, xlim, ancho_px, min_px=1.5):
+    """Ancho de cada barra en unidades del eje (días de date2num).
+
+    Por defecto es la duración REAL del bloque de calendario (`fin - ini`), de
+    modo que las barras teselan el eje sin huecos ni solapes. Pero con un eje
+    fijo de años, un bloque diario mide ~0.03% del ancho y no llega ni a un
+    píxel: por eso se aplica un mínimo expresado en píxeles y traducido a
+    unidades de datos con la escala del eje.
+    """
+    ini_num = np.asarray(ini_num, dtype=np.float64)
+    fin_num = np.asarray(fin_num, dtype=np.float64)
+    reales = fin_num - ini_num
+    span = float(xlim[1]) - float(xlim[0])
+    if span <= 0 or ancho_px <= 0:
+        return np.maximum(reales, 1e-9)
+    minimo = (span / float(ancho_px)) * float(min_px)
+    return np.maximum(reales, minimo)
 
 
 # ══════════════ iconos de patrón (velas hardcodeadas) ══════════════
@@ -515,7 +586,7 @@ class PatternCard(QFrame):
         self.canvas.draw_idle()
 
     def update_stats(self, stats, timestamps, vista='hitrate', lag_sel=LAGS[0],
-                     barras=None, ancho_dias=1.0):
+                     barras=None, xlim=None, ylim_abs=None, n_max=0):
         n_total = stats['n_total']
         self.lbl_n.setText(f"Ocurrencias: {n_total}")
 
@@ -600,22 +671,65 @@ class PatternCard(QFrame):
         ax = self.fig.add_subplot(111)
         _style_ax(ax)
         hay_datos = bool(barras) and len(barras['fechas']) >= 1
-        max_abs = 15.0  # mínimo de escala para que un gráfico plano no se vea amplificado
         if hay_datos:
             y = (barras['hit_rate'] - 0.5) * 100 if vista == 'hitrate' else barras['edge_pb']
-            max_abs = max(max_abs, float(np.abs(y).max()))
-            colores = [VERDE if v > 0 else ROJO for v in y]
-            fechas = barras['fechas']
-            # ancho fijo según el periodo elegido (no según el espaciado real
-            # entre los bloques que sobrevivieron al mínimo de ocurrencias:
-            # si se descarta un bloque intermedio, ese hueco se agranda y un
-            # ancho "medio" quedaría sobredimensionado, solapando las barras
-            # que sí están espaciadas con normalidad)
-            ax.bar(fechas, y, width=ancho_dias, color=colores, alpha=0.85)
+            tope = float(ylim_abs) if ylim_abs else max(
+                float(np.abs(y).max()), PISO_Y_HITRATE)
+
+            # Cada barra ocupa la duración real de su bloque de calendario
+            # (align='edge' desde el inicio del bin), no un ancho constante
+            # derivado del periodo elegido: los meses/trimestres no duran todos
+            # lo mismo y 'fechas' es la ETIQUETA del bin, que en las reglas de
+            # fin de periodo cae en su extremo derecho — centrar ahí una barra
+            # la pintaba a caballo entre el bloque y el siguiente.
+            x = date2num(barras['fecha_ini'])
+            x_fin = date2num(barras['fecha_fin'])
+            lim = xlim if xlim else (float(x.min()), float(x_fin.max()))
+            w = ancho_barras(x, x_fin, lim, self.canvas.width() * _FRAC_EJE)
+
+            # Recorte al tope compartido: un bloque fuera de escala se marca
+            # con una punta de flecha en el borde en vez de reventar el eje
+            # (o de mentir sobre su altura quedando indistinguible del resto).
+            y_dib = np.clip(y, -tope, tope)
+            # opacidad por nº de ocurrencias del bloque: un bloque de 5
+            # ocurrencias es ruido y no debe verse tan sólido como uno de 500,
+            # que es justo de donde salen la mayoría de las barras extremas
+            alphas = _alpha_por_n(barras['n'], n_max)
+            colores = [to_rgba(VERDE if v > 0 else ROJO, a)
+                       for v, a in zip(y, alphas)]
+            ax.bar(x, y_dib, width=w, color=colores, align='edge', linewidth=0)
+
+            # Un bloque cuya desviación es ~0 dibuja una barra de altura cero:
+            # invisible, y por tanto indistinguible de "aquí no hubo bloque" —
+            # que es justo la lectura equivocada en un patrón raro con un único
+            # bloque, donde la tarjeta entera parecía vacía. Se marca con una
+            # banda gris a caballo del eje: hubo bloque, y salió plano.
+            planas = np.abs(y_dib) < tope * _FRAC_PLANA
+            if planas.any():
+                ax.bar(x[planas], tope * _FRAC_PLANA * 2,
+                       bottom=-tope * _FRAC_PLANA, width=w[planas], color=GRIS,
+                       alpha=0.55, align='edge', linewidth=0, zorder=2)
+
+            centros = x + w / 2
+            for fuera, marca, color in ((y > tope, '^', VERDE),
+                                        (y < -tope, 'v', ROJO)):
+                if fuera.any():
+                    ax.scatter(centros[fuera], y_dib[fuera], marker=marca, s=9,
+                               c=color, edgecolors=AMBAR, linewidths=0.4,
+                               zorder=3, clip_on=False)
+
             ax.axhline(0, color=GRIS, linewidth=0.7, linestyle='--', alpha=0.6)
-            ax.set_ylim(-max_abs * 1.15, max_abs * 1.15)
-            ylabel = 'Desv. HR vs 50% (pp)' if vista == 'hitrate' else 'Edge por bloque (pb)'
-            ax.set_ylabel(ylabel, fontsize=6, color=AX_FG)
+            ax.set_xlim(*lim)
+            ax.set_ylim(-tope * 1.15, tope * 1.15)
+            eje_fechas(ax)
+            unidad = 'pp' if vista == 'hitrate' else 'pb'
+            base = 'Desv. HR vs 50%' if vista == 'hitrate' else 'Edge por bloque'
+            # el tope va en la etiqueta: al ser compartido entre tarjetas, es
+            # lo que permite traducir "altura" a "cuánto" sin leer los ticks
+            # (en 1m los edges son de pocos pb y redondear a entero los igualaría)
+            tope_txt = f"{tope:,.1f}" if tope < 10 else f"{tope:,.0f}"
+            ax.set_ylabel(f"{base} ({unidad}) · ±{tope_txt}", fontsize=6,
+                          color=AX_FG)
         else:
             if n_total == 0:
                 msg = "Sin ocurrencias con este filtro"
@@ -1181,6 +1295,23 @@ class TabPatrones(QWidget):
         self._lanzar_siguiente()
 
     # ══════════════ estadística + refresco ══════════════
+    @staticmethod
+    def _marco_x(timestamps, todas_las_barras):
+        """Límites del eje X compartidos por todas las tarjetas: el histórico
+        completo del activo, ensanchado si algún bin sobresale (los bins de
+        semana/mes/año empiezan antes de la primera vela o acaban después de
+        la última) para que ninguna barra se corte contra el margen."""
+        ini = date2num(timestamps[0])
+        fin = date2num(timestamps[-1])
+        for b in todas_las_barras:
+            if not len(b['fechas']):
+                continue
+            ini = min(ini, float(date2num(b['fecha_ini']).min()))
+            fin = max(fin, float(date2num(b['fecha_fin']).max()))
+        if fin <= ini:
+            fin = ini + 1.0     # activo de una sola vela: eje degenerado
+        return (ini, fin)
+
     @_no_crash
     def _refresh_stats(self, motivo=None):
         if self._payload is None:
@@ -1208,16 +1339,15 @@ class TabPatrones(QWidget):
             else [n for n in PATRONES_INFO if n in PATRONES_ORIGINALES]
 
         regla_periodo = self.cmb_periodo.currentData()
-        # ancho de barra fijo según el periodo elegido (no según el hueco
-        # real entre bloques que sobrevivieron al filtro de mínimo de
-        # ocurrencias en agregar_por_periodo — si un bloque intermedio se
-        # descarta por tener pocas ocurrencias, ese hueco se agranda y un
-        # ancho basado en "espaciado medio" queda sobredimensionado, solapando
-        # las barras que sí están espaciadas con normalidad)
-        _minutos_periodo = PERIODOS_BARRAS[self.cmb_periodo.currentIndex()][2]
-        ancho_dias = (_minutos_periodo / 1440.0) * 0.8
 
+        # Fase 1: calcular la estadística de todos los patrones visibles SIN
+        # dibujar. Las tarjetas comparten un mismo marco (eje X y escala Y), y
+        # ese marco no se conoce hasta haber visto los datos de todas: antes,
+        # cada tarjeta autoescalaba a lo suyo y el resultado era que un patrón
+        # con un único bloque superviviente lo pintaba ocupando el gráfico
+        # entero mientras el de al lado mostraba barras de menos de un píxel.
         resultados = {}
+        barras_por_patron = {}
         total_occ = 0
         for nombre in nombres_visibles:
             occ = p['patrones'][nombre]
@@ -1229,11 +1359,25 @@ class TabPatrones(QWidget):
             resultados[nombre] = stats
             total_occ += stats['n_total']
             s_lag = stats['por_lag'][lag_rank]
-            barras = agregar_por_periodo(
+            barras_por_patron[nombre] = agregar_por_periodo(
                 s_lag['idx'], s_lag['dir'], s_lag['aciertos'], s_lag['signed_ret'],
                 p['timestamps'], regla_periodo, s_lag['ret_base'] or 0.0)
-            self._cards[nombre].update_stats(stats, p['timestamps'], vista, lag_rank,
-                                             barras, ancho_dias)
+
+        # marco común: el eje X es el histórico completo del activo (no el
+        # rango de bloques de cada patrón), extendido a los bordes de los bins
+        # extremos para que ninguna barra quede cortada contra el margen
+        xlim = self._marco_x(p['timestamps'], barras_por_patron.values())
+        valores = [(b['hit_rate'] - 0.5) * 100 if vista == 'hitrate' else b['edge_pb']
+                   for b in barras_por_patron.values() if len(b['fechas'])]
+        ylim_abs = escala_y_compartida(valores, vista)
+        n_max = max((int(b['n'].max()) for b in barras_por_patron.values()
+                     if len(b['n'])), default=0)
+
+        # Fase 2: dibujar, ya con el marco común
+        for nombre in nombres_visibles:
+            self._cards[nombre].update_stats(
+                resultados[nombre], p['timestamps'], vista, lag_rank,
+                barras_por_patron[nombre], xlim, ylim_abs, n_max)
 
         self.lbl_estado.setText(
             f"{p['n_velas']:,} velas · {total_occ:,} ocurrencias con el filtro actual")

@@ -1,0 +1,236 @@
+{
+  "nombre": "eth inversion",
+  "csv": "D:/DATOS/Activos/Limpiados/FUTURO/ethusdt/ethusdt_1m_limpiado.csv",
+  "tf": "15m",
+  "setups": [
+    {
+      "nombre": "Cruce de medias",
+      "plantilla": "Cruce de medias",
+      "params": {
+        "tipo": "EMA",
+        "rapida": 50,
+        "lenta": 200,
+        "direccion": "Ambas"
+      },
+      "riesgo_pct": 0.005,
+      "stop_atr": 0.0,
+      "tp_r": 0.0,
+      "salida_n_velas": 0,
+      "edge": false,
+      "be_atr": 1.0,
+      "be_unidad": "r",
+      "trailing_atr": 0.0,
+      "parciales": [
+        {
+          "pct": 100.0,
+          "r": 0.0,
+          "trigger": "senal",
+          "condiciones": [],
+          "gestion": {
+            "tipo": 0,
+            "val": 0.0
+          }
+        }
+      ],
+      "tramos": [
+        {
+          "pct": 25.0,
+          "val": 0.0,
+          "trigger": "senal",
+          "condiciones": [],
+          "gestion": {
+            "tipo": 0,
+            "val": 0.0
+          }
+        },
+        {
+          "pct": 65.0,
+          "val": 1.0,
+          "trigger": "avance",
+          "condiciones": [],
+          "gestion": {
+            "tipo": 0,
+            "val": 0.0
+          }
+        },
+        {
+          "pct": 10.0,
+          "val": 1.0,
+          "trigger": "avance",
+          "condiciones": [],
+          "gestion": {
+            "tipo": 0,
+            "val": 0.0
+          }
+        }
+      ],
+      "filtros": {
+        "dias_semana": null,
+        "regimen": {
+          "metodo": "ninguno",
+          "periodo": 100
+        },
+        "sesion": {
+          "tipo": "ninguna",
+          "hora_inicio": 0,
+          "hora_fin": 0
+        },
+        "condiciones_entrada": [],
+        "condiciones_salida": [],
+        "noticias": {
+          "activo": false,
+          "minutos_antes": 30,
+          "minutos_despues": 30,
+          "impacto_minimo": "alto",
+          "monedas": null,
+          "cerrar_posiciones": false
+        }
+      },
+      "salida_stop": {
+        "pct": 100.0,
+        "condiciones": [],
+        "gestion": {
+          "tipo": 0,
+          "val": 0.0
+        }
+      },
+      "salida_tp": {
+        "pct": 100.0,
+        "condiciones": [],
+        "gestion": {
+          "tipo": 0,
+          "val": 0.0
+        }
+      },
+      "salida_be": {
+        "pct": 100.0,
+        "condiciones": [],
+        "gestion": {
+          "tipo": 0,
+          "val": 0.0
+        }
+      },
+      "salida_trailing": {
+        "pct": 100.0,
+        "condiciones": [],
+        "gestion": {
+          "tipo": 0,
+          "val": 0.0
+        }
+      },
+      "salida_tiempo": {
+        "pct": 100.0,
+        "condiciones": [],
+        "gestion": {
+          "tipo": 0,
+          "val": 0.0
+        }
+      },
+      "edge_prev_stop": 0.0,
+      "edge_prev_tp": 0.0,
+      "edge_prev_be": 0.0,
+      "edge_prev_trail": 0.0
+    }
+  ],
+  "config": {
+    "capital_inicial": 10000.0,
+    "comision_pct": 0.0003,
+    "slippage_pct": 0.0002,
+    "config_por_setup": {
+      "0": {
+        "riesgo_pct": 0.005,
+        "stop_atr": 0.0,
+        "tp_r": 0.0,
+        "salida_n_velas": 0,
+        "be_atr": 1.0,
+        "be_unidad": "r",
+        "trailing_atr": 0.0,
+        "parciales": [
+          {
+            "pct": 100.0,
+            "r": 0.0,
+            "trigger": "senal",
+            "condiciones": [],
+            "gestion": {
+              "tipo": 0,
+              "val": 0.0
+            }
+          }
+        ],
+        "tramos": [
+          {
+            "pct": 25.0,
+            "val": 0.0,
+            "trigger": "senal",
+            "condiciones": [],
+            "gestion": {
+              "tipo": 0,
+              "val": 0.0
+            }
+          },
+          {
+            "pct": 65.0,
+            "val": 1.0,
+            "trigger": "avance",
+            "condiciones": [],
+            "gestion": {
+              "tipo": 0,
+              "val": 0.0
+            }
+          },
+          {
+            "pct": 10.0,
+            "val": 1.0,
+            "trigger": "avance",
+            "condiciones": [],
+            "gestion": {
+              "tipo": 0,
+              "val": 0.0
+            }
+          }
+        ],
+        "salida_stop": {
+          "pct": 100.0,
+          "condiciones": [],
+          "gestion": {
+            "tipo": 0,
+            "val": 0.0
+          }
+        },
+        "salida_tp": {
+          "pct": 100.0,
+          "condiciones": [],
+          "gestion": {
+            "tipo": 0,
+            "val": 0.0
+          }
+        },
+        "salida_be": {
+          "pct": 100.0,
+          "condiciones": [],
+          "gestion": {
+            "tipo": 0,
+            "val": 0.0
+          }
+        },
+        "salida_trailing": {
+          "pct": 100.0,
+          "condiciones": [],
+          "gestion": {
+            "tipo": 0,
+            "val": 0.0
+          }
+        },
+        "salida_tiempo": {
+          "pct": 100.0,
+          "condiciones": [],
+          "gestion": {
+            "tipo": 0,
+            "val": 0.0
+          }
+        }
+      }
+    },
+    "parciales_masks_long": [
+      [
+        

@@ -9,6 +9,7 @@ from gui.widgets.pdf_viewer import PdfViewer
 from gui.widgets.tab_patrones import TabPatrones
 from gui.widgets.analisis_graficos import GraficosAnalisis
 from gui.widgets.analisis_tarjetas import TarjetasKPI
+from gui.widgets.plot_common import icono_ayuda
 from core.config import tf_to_minutes
 
 STYLE_ANALISIS = """
@@ -169,6 +170,310 @@ QLabel#metricValue {
 """
 
 
+# ══════════════════════════════════════════════════════════════════
+#  Ayuda por categoría de métricas
+# ══════════════════════════════════════════════════════════════════
+# Cada entrada son las 4 pestañas del popup de `icono_ayuda`:
+# (Lógica, Significado, Uso, Resultados). La clave es el prefijo numérico
+# del título — no el título entero — porque la GUI le añade el sufijo
+# " — <Ventana>" cuando la categoría tiene filas por horizonte
+# (ver _render_metrics). Los títulos se generan en
+# library/scripts_utiles/analisis_descriptivo.py.
+AYUDA_CATEGORIAS = {
+    '1': (
+        "Lee la primera y la última marca de tiempo del archivo, cuenta las velas "
+        "y deduce el tipo de muestreo: temporal (velas de intervalo fijo) o por "
+        "ticks (una fila por operación, sin reloj regular).",
+        "Define el suelo estadístico del resto del informe. Un histórico corto o "
+        "con huecos hace que todo lo que venga después —Hurst, ADF, VaR— se "
+        "calcule sobre pocas observaciones y sea inestable.",
+        "Comprueba esto antes de fiarte de ninguna otra categoría. Por debajo de "
+        "unas 500 velas, los tests estadísticos no tienen potencia suficiente y "
+        "sus veredictos son ruido.",
+        "«Periodo» marca el rango real analizado, que puede ser menor que el "
+        "archivo si recortaste el rango al analizar. «Tipo de muestreo» avisa si "
+        "la serie es de ticks: en ese caso las métricas anualizadas y el Calmar "
+        "salen N/A porque no hay periodicidad que anualizar.",
+    ),
+    '2': (
+        "El CAGR se obtiene componiendo el retorno total sobre los años que cubre "
+        "el histórico. La media y la mediana son de los retornos logarítmicos vela "
+        "a vela. La alineación de marcos temporales puntúa de 0 a 3 cuántas "
+        "temporalidades superiores apuntan en la misma dirección.",
+        "Separa cuánto sube el activo de cómo lo sube. Una media positiva con "
+        "mediana negativa significa que el rendimiento vive en pocas velas "
+        "extremas: la mayoría de las velas pierden y unas pocas lo compensan.",
+        "Fija la expectativa de una estrategia larga pura. Si el buy & hold ya da "
+        "el CAGR que buscas, cualquier sistema tiene que batirlo después de "
+        "comisiones para justificar el riesgo operativo.",
+        "Compara «Media retorno» con «Mediana retorno»: cuanto más se separen, "
+        "más dependes de colas. «Retornos positivos» cerca del 50% es lo normal —"
+        " lo que genera el rendimiento es el tamaño de las velas, no el reparto. "
+        "«Alineación de marcos temporales» en 3/3 indica tendencia limpia en todas "
+        "las escalas.",
+    ),
+    '3': (
+        "La volatilidad histórica es la desviación típica de los retornos "
+        "logarítmicos, anualizada. Se recalcula en ventanas móviles de 7, 30, 90 y "
+        "365 días y cada una se divide por la volatilidad total, así que el valor "
+        "que ves es un múltiplo: 1.00x es volatilidad normal para este activo.",
+        "Sitúa el momento actual dentro de su propia historia. Por encima de 1.30x "
+        "el activo está más nervioso de lo habitual; por debajo de 0.70x está "
+        "comprimido y suele preceder a una expansión.",
+        "Ajusta el tamaño de posición y la distancia del stop. Con la HV corta muy "
+        "por encima de la larga, los stops calculados con medias largas se quedan "
+        "cortos y saltan por ruido.",
+        "Lee las cuatro HV como una escalera temporal: si HV 7d > HV 30d > HV 365d, "
+        "la volatilidad está expandiéndose ahora mismo; el orden inverso indica "
+        "calma reciente. «Desviación Escalado Fractal» mide cuánto se aleja la "
+        "serie de la ley √T; un valor alto avisa de que estimar la volatilidad de "
+        "un timeframe escalando otro te dará un número equivocado.",
+    ),
+    '4': (
+        "Los tres ratios dividen exceso de retorno por una medida de riesgo "
+        "distinta: Sharpe por la volatilidad total, Sortino solo por la "
+        "volatilidad de las caídas, Calmar por el máximo drawdown. La tasa libre "
+        "de riesgo es el T-Bill a 3 meses, indicado en la propia fila.",
+        "Cada uno castiga algo diferente. Sharpe penaliza también las subidas "
+        "bruscas; Sortino no. Sortino muy por encima de Sharpe significa que la "
+        "volatilidad del activo es mayoritariamente al alza.",
+        "Es la vara de medir contra la que compararás cualquier estrategia del "
+        "Backtester. Un sistema con Sharpe por debajo del que ya da el activo "
+        "comprado y mantenido no aporta nada.",
+        "Los valores vienen coloreados: verde por encima de 1, amarillo entre 0.5 "
+        "y 1, rojo por debajo. Mira el Calmar con más peso si operas apalancado —"
+        " es el único de los tres que mide el riesgo con la peor pérdida real y no "
+        "con una desviación típica.",
+    ),
+    '5': (
+        "El drawdown es la caída desde cada máximo histórico. El máximo histórico "
+        "recorre toda la serie; los internos se calculan reiniciando el máximo "
+        "cada día y cada semana. Un episodio es un tramo completo desde que se "
+        "pierde un máximo hasta que se recupera.",
+        "Es la pérdida que habrías tenido que aguantar sin vender. El máximo "
+        "histórico dice cuánto llegó a caer; el tiempo de recuperación dice cuánto "
+        "tiempo estuviste en pérdidas, que es lo que de verdad rompe la disciplina.",
+        "Determina el capital mínimo y el apalancamiento máximo tolerable. Con un "
+        "drawdown histórico del 40%, un apalancamiento x3 liquida la cuenta antes "
+        "de llegar al suelo.",
+        "«Max Drawdown Interno (Diario)» trae la fecha del peor día entre "
+        "paréntesis: úsala para ir al gráfico y ver qué pasó. Compara «Drawdown "
+        "medio» con el máximo — si están cerca, las caídas son consistentes; si el "
+        "máximo lo dobla, hubo un evento aislado que no representa el "
+        "comportamiento normal.",
+    ),
+    '6': (
+        "El VaR se calcula por percentiles empíricos de los retornos, no asumiendo "
+        "normalidad: el VaR 95% es el percentil 5 de la distribución real. "
+        "Skewness y kurtosis describen la forma de esa distribución, y el test de "
+        "Jarque-Bera contrasta si es compatible con una normal.",
+        "Marca la pérdida esperada en el peor 5% y el peor 1% de las velas. La "
+        "kurtosis alta —por encima de 3— significa colas gordas: los eventos "
+        "extremos son mucho más frecuentes de lo que predice la campana de Gauss.",
+        "Dimensiona el riesgo por operación. Si tu stop está dentro del VaR 95%, "
+        "saltará de forma rutinaria solo por el movimiento normal del activo, sin "
+        "que la tesis haya fallado.",
+        "«Distribucion normal: NO (fat tails)» es el resultado habitual en "
+        "mercados y no es un error: confirma que no puedes usar fórmulas basadas "
+        "en la normal para calcular riesgo. Skewness negativa indica que las "
+        "caídas son más bruscas que las subidas.",
+    ),
+    '7': (
+        "El Efficiency Ratio divide el desplazamiento neto del precio entre la "
+        "suma de los recorridos vela a vela: mide cuánto camino se aprovecha. El "
+        "exponente de Hurst mide si la serie tiene memoria, estimado sobre "
+        "ventanas móviles. Ambos se recalculan con los periodos propios de cada "
+        "ventana temporal cuando seleccionas un horizonte.",
+        "ER por encima de 0.5 es movimiento direccional; por debajo de 0.3 es "
+        "ruido lateral. Hurst por encima de 0.58 indica persistencia (lo que sube "
+        "tiende a seguir subiendo); por debajo de 0.52, reversión a la media. "
+        "Cerca de 0.5 la serie es un paseo aleatorio y no hay señal que extraer.",
+        "Es la categoría que decide qué familia de estrategia usar. Con dominio de "
+        "régimen tendencial, funcionan rupturas y seguimiento; con dominio de "
+        "reversión, funcionan bandas y sobreventa. Aplicar la equivocada pierde "
+        "dinero aunque la ejecución sea perfecta.",
+        "Mira las barras de reparto de periodos antes que las medias: te dicen "
+        "cuánto tiempo pasa el activo en cada régimen. «Mejora Sharpe (Tend vs "
+        "Rev)» resuelve la elección de un vistazo — positiva favorece seguir "
+        "tendencia, negativa favorece revertir. «Duración media racha tendencial» "
+        "te da el horizonte de mantenimiento realista en velas.",
+    ),
+    '8': (
+        "Correlaciona el retorno con la volatilidad en ventana móvil de unos 7 "
+        "días, y calcula la volatilidad media por franja horaria agrupando las "
+        "velas en las sesiones de Tokio, Londres y Nueva York en hora local de "
+        "cada plaza.",
+        "Una correlación retorno-volatilidad negativa es el patrón clásico de "
+        "pánico: el precio cae y la volatilidad se dispara a la vez. Positiva "
+        "indica euforia, con la volatilidad creciendo en las subidas. La "
+        "volatilidad por sesión, expresada como múltiplo, señala en qué horas se "
+        "mueve de verdad el activo.",
+        "Define el horario operativo y el sesgo direccional. Operar rupturas en la "
+        "sesión de menor volatilidad relativa produce falsos rompimientos "
+        "sistemáticos.",
+        "«Tiempo corr. negativa (%)» va coloreado: por encima del 50% en rojo, "
+        "porque significa que el activo pasa la mayor parte del tiempo en régimen "
+        "de miedo. Las tres barras de sesión se leen en múltiplos: 1.50x en "
+        "Londres significa que allí se mueve un 50% más que en su promedio "
+        "general.",
+    ),
+    '9': (
+        "La autocorrelación parcial (PACF) en lag 1 mide cuánto explica el retorno "
+        "de un periodo el retorno del periodo siguiente, aislando el efecto de los "
+        "lags intermedios. Se calcula reagregando la serie a escala diaria, "
+        "semanal, mensual y trimestral, y se compara con el umbral de "
+        "significancia estadística que aparece en la propia categoría.",
+        "Por encima del umbral hay memoria real: el pasado inmediato contiene "
+        "información sobre el futuro inmediato. Por debajo, la serie es ruido "
+        "blanco en esa escala y ningún modelo autorregresivo va a funcionar ahí.",
+        "Elige la temporalidad en la que operar. Opera en la escala donde la "
+        "dependencia supera el umbral e ignora las escalas marcadas como "
+        "ruido, por muy limpio que se vea el gráfico.",
+        "Compara cada «Dependencia» con «Significancia (Umbral)»: solo cuentan las "
+        "que lo superan en valor absoluto. «Memoria Estructural: Débil/Ruido» "
+        "significa que no hay dependencia lineal explotable a escala diaria — no "
+        "que no haya nada, pero sí que un modelo lineal no lo capturará.",
+    ),
+    '10': (
+        "Aplica autocorrelación a los retornos al cuadrado en lag 1 y confirma con "
+        "el test de Ljung-Box, cuya hipótesis nula es que no hay agrupación. Se "
+        "usan los retornos al cuadrado porque eliminan el signo y dejan solo la "
+        "magnitud del movimiento.",
+        "Detecta si la volatilidad se agrupa: días agitados seguidos de días "
+        "agitados, calma seguida de calma. Un p-valor por debajo de 0.05 rechaza "
+        "la nula y confirma el efecto ARCH.",
+        "Cuando hay clustering, la volatilidad es predecible aunque la dirección no "
+        "lo sea. Eso permite ajustar el tamaño de posición de forma anticipada: "
+        "reducir exposición tras una vela extrema, porque vienen más.",
+        "«Clustering detectado: SÍ» es lo habitual y valida usar stops adaptativos "
+        "por ATR en lugar de stops de distancia fija. Con un «NO», la volatilidad "
+        "es impredecible y conviene dimensionar por riesgo fijo.",
+    ),
+    '11': (
+        "Parkinson usa el rango máximo-mínimo; Garman-Klass añade apertura y "
+        "cierre; Rogers-Satchell corrige además la tendencia del periodo. Los tres "
+        "se comparan contra el Close-to-Close, que solo mira cierres y descarta "
+        "todo lo que pasó dentro de la vela.",
+        "La eficiencia indica cuántas veces menos datos necesita ese estimador "
+        "para la misma precisión que el Close-to-Close. Si los estimadores OHLC "
+        "dan mucho más que el CtC, el precio se mueve mucho dentro de la vela y "
+        "vuelve al cierre: hay recorrido que el cierre no ve.",
+        "Elige con qué volatilidad calculas stops y objetivos. Para scalping "
+        "importa el rango intravela, no la variación entre cierres — usar CtC "
+        "subestima el riesgo real de que te salte el stop.",
+        "«Estimador recomendado» ya resuelve la elección: Rogers-Satchell cuando "
+        "hay tendencia clara, porque es el único que no confunde deriva con "
+        "volatilidad. Una gran diferencia entre Parkinson y CtC señala mechas "
+        "largas y por tanto stops que necesitan más holgura.",
+    ),
+    '12': (
+        "ADF y KPSS se aplican dos veces: sobre el precio y sobre los retornos. "
+        "ADF plantea H0 = raíz unitaria, es decir serie no estacionaria; KPSS "
+        "plantea la hipótesis contraria, H0 = serie estacionaria. Se contrastan "
+        "los dos porque cada uno falla justo en el caso que el otro detecta.",
+        "El precio casi siempre sale no estacionario y los retornos estacionarios: "
+        "eso es lo normal y confirma que los datos son sanos. Un precio "
+        "estacionario indica un activo que revierte a un nivel; unos retornos no "
+        "estacionarios indican cambio de régimen dentro del periodo analizado.",
+        "Decide sobre qué serie se opera. Con precio no estacionario, las "
+        "estrategias de reversión sobre el precio crudo no tienen anclaje y hay "
+        "que trabajar con spreads, ratios o retornos. Con precio estacionario, la "
+        "reversión a la media es explotable directamente.",
+        "Lee primero los dos «Veredicto»: resumen ADF y KPSS ya combinados. Los "
+        "p-valores están debajo por si el veredicto queda en el límite — ADF "
+        "p < 0.05 rechaza la raíz unitaria; KPSS p < 0.05 rechaza la "
+        "estacionariedad.",
+    ),
+    '13': (
+        "Ajusta un modelo de Ornstein-Uhlenbeck sobre el logaritmo del precio: "
+        "regresa la variación de cada periodo contra el nivel anterior. El "
+        "coeficiente beta es la velocidad de reversión, y la vida media sale de "
+        "ln(2) dividido por esa velocidad.",
+        "La vida media es cuántas velas tarda una desviación en corregirse a la "
+        "mitad. Beta positiva significa que la serie se aleja en vez de volver: no "
+        "hay reversión y el dato sale N/A.",
+        "Fija la duración de las operaciones de reversión y el vencimiento de las "
+        "órdenes. Mantener una posición de reversión mucho más allá de la vida "
+        "media convierte una operación estadística en una apuesta direccional.",
+        "Usa «Half-Life (velas)» directamente como tiempo máximo de mantenimiento. "
+        "«Sin reversión detectada» no invalida el activo: significa que hay que "
+        "operarlo con seguimiento de tendencia, no con reversión.",
+    ),
+    '14': (
+        "Calcula el ATR normalizado —ATR dividido por el precio, en porcentaje— en "
+        "todas las temporalidades disponibles, para que sean comparables entre sí. "
+        "Después empareja timeframes y mide el ratio entre sus NATR y el desfase "
+        "lead-lag por correlación cruzada.",
+        "Al estar normalizado, el NATR permite comparar volatilidad entre "
+        "temporalidades y entre activos de precio muy distinto. El lead-lag "
+        "distinto de cero indica que una temporalidad anticipa los cambios de "
+        "volatilidad de la otra.",
+        "Elige el timeframe de trabajo por volatilidad disponible: por debajo de "
+        "cierto NATR el recorrido no cubre spread y comisiones. El lead-lag te da "
+        "un aviso temprano desde un timeframe vecino antes de que la volatilidad "
+        "llegue al tuyo.",
+        "Compara los NATR entre timeframes: deberían crecer con la raíz del "
+        "tiempo. Un par cuyo ratio se aleja mucho de esa proporción señala que una "
+        "escala está anormalmente agitada o anormalmente plana respecto a la otra.",
+    ),
+    '14.5': (
+        "Estandariza el NATR de cada temporalidad en un Z-score frente a su propia "
+        "media histórica, y encierra el ratio entre pares de timeframes en bandas "
+        "de Bollinger de ±2 desviaciones típicas. Todo se recalcula por horizonte, "
+        "con los pares propios de cada ventana.",
+        "El Z-score dice cuán extrema es la volatilidad de ahora comparada con lo "
+        "normal en ese timeframe: por encima de +2 es un extremo alto, por debajo "
+        "de -2 es compresión. Un ratio fuera de sus bandas indica que la relación "
+        "de volatilidad entre las dos escalas se ha roto.",
+        "Sirve para cronometrar la entrada. La compresión extrema precede a las "
+        "expansiones, así que un Z-score muy negativo favorece estrategias de "
+        "ruptura; uno muy positivo avisa de que llegas tarde y con stops caros.",
+        "Lee el signo y la magnitud del Z-score, no el valor del NATR en bruto. En "
+        "el ratio, compara «Actual» con «BB Sup» y «BB Inf»: dentro de las bandas "
+        "la relación entre timeframes es la habitual; fuera, uno de los dos está "
+        "en un régimen distinto y las señales cruzadas entre ellos dejan de ser "
+        "fiables.",
+    ),
+}
+
+# Ayuda del selector «Ventana» de la barra superior. Mismo formato de 4
+# pestañas: es el control que reinterpreta todo el informe, así que se explica
+# con el mismo detalle que una categoría.
+AYUDA_VENTANA = (
+    "Selecciona el horizonte de operativa con el que se lee el análisis. No "
+    "recorta los datos: reetiqueta el informe usando los periodos de indicador "
+    "propios de esa ventana —ER, KAMA, Hurst, ventanas de correlación y pares "
+    "de NATR— que ya se calcularon al analizar el activo. En «General» se "
+    "muestran los valores con los parámetros genéricos.",
+    "Cada ventana es un perfil temporal: Scalping trabaja con TF de 15m o "
+    "menos, Daytrading hasta 1h, Swingtrading cubre todas las temporalidades y "
+    "Position parte de 4h. Las ventanas incompatibles con el timeframe del "
+    "activo cargado salen en gris y no se pueden elegir — no tiene sentido "
+    "pedir métricas de scalping sobre velas diarias.",
+    "Cámbiala para comprobar si el activo se comporta igual en distintas "
+    "escalas antes de montar una estrategia. Un activo puede ser tendencial en "
+    "Position y puro ruido en Scalping: esa diferencia decide en qué "
+    "temporalidad operas.",
+    "Los gráficos y las tarjetas se actualizan al instante, pero la pestaña "
+    "Métricas exige pulsar «Aplicar». Cuando la ventana no es General, las "
+    "categorías afectadas añaden su nombre al título («… — Scalping») para que "
+    "veas cuáles cambiaron de verdad; las categorías 11, 12 y 13 solo aparecen "
+    "en General, Scalping y Daytrading, porque necesitan más muestras de las "
+    "que dejan las ventanas largas.",
+)
+
+_CLAVE_CAT_RE = re.compile(r'^(\d+(?:\.\d+)?)\.')
+
+
+def _ayuda_categoria(titulo):
+    """Ayuda de una categoría a partir de su título, tolerando el sufijo
+    " — <Ventana>" que añade _render_metrics. Devuelve None si la categoría no
+    tiene texto asociado (categorías nuevas: mejor sin icono que con un popup
+    vacío)."""
+    m = _CLAVE_CAT_RE.match(titulo.strip())
+    return AYUDA_CATEGORIAS.get(m.group(1)) if m else None
+
+
 class MetricRow(QWidget):
     def __init__(self, name, value_text, parent=None):
         super().__init__(parent)
@@ -221,7 +526,18 @@ class CategoryGroup(QWidget):
 
         header = QLabel(f"\u25b6 {title}")
         header.setObjectName("catHeader")
-        layout.addWidget(header)
+
+        # El icono va pegado al texto (no al borde del panel), igual que en las
+        # secciones de graficos: el stretch va detras.
+        fila_cab = QHBoxLayout()
+        fila_cab.setContentsMargins(0, 0, 0, 0)
+        fila_cab.setSpacing(6)
+        fila_cab.addWidget(header)
+        ayuda = _ayuda_categoria(title)
+        if ayuda:
+            fila_cab.addWidget(icono_ayuda(*ayuda))
+        fila_cab.addStretch()
+        layout.addLayout(fila_cab)
 
         sep = QFrame()
         sep.setFixedHeight(1)
@@ -320,6 +636,11 @@ class TabAnalisis(QWidget):
         self.horizon.setToolTip("Horizonte de analisis")
         self.horizon.currentIndexChanged.connect(self._on_horizon_changed)
         toolbar.addWidget(self.horizon)
+
+        # Detras del combo, no entre la etiqueta y el, para no separar el
+        # control de su nombre.
+        self.icono_ventana = icono_ayuda(*AYUDA_VENTANA)
+        toolbar.addWidget(self.icono_ventana)
 
         lbl_periodo_combo = QLabel("Periodo")
         lbl_periodo_combo.setStyleSheet("color: #aabbcc; font-size: 11px; font-weight: bold; padding-right: 4px; padding-left: 12px;")
