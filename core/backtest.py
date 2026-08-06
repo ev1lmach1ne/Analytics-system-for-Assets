@@ -899,6 +899,30 @@ def simular(o, h, l, c, senales, config):
             return np.where(a, np.int64(-1), np.int64(0))
         return np.ascontiguousarray(a, dtype=np.int64)
 
+    # Nº real de setups usados (no siempre 64). Las máscaras 3D (setups ×
+    # etapas × velas) dominan la RAM: con series largas y el optimizador
+    # (1 setup, cientos de combos) reservar 64× es ~64× más lento/pesado y
+    # deja la GUI "congelada" sin avanzar. Los escalares siguen en 64
+    # (baratos) para no tocar el contrato del motor numba.
+    n_setups = 1
+    if n:
+        n_setups = max(n_setups, int(setup.max()) + 1)
+    cfg_por_setup = config.get('config_por_setup') or {}
+    if cfg_por_setup:
+        n_setups = max(n_setups, max(int(k) for k in cfg_por_setup) + 1)
+    riesgo_por_setup = config.get('riesgo_por_setup') or {}
+    if riesgo_por_setup:
+        n_setups = max(n_setups, max(int(k) for k in riesgo_por_setup) + 1)
+    for _clave_m in (
+        'parciales_masks_long', 'parciales_masks_short',
+        'tramos_masks_long', 'tramos_masks_short',
+        'mecanismos_masks_long', 'mecanismos_masks_short',
+    ):
+        _m = config.get(_clave_m)
+        if _m:
+            n_setups = max(n_setups, len(_m))
+    n_setups = min(max(n_setups, 1), 64)
+
     # config por setup: los escalares globales actúan de defecto
     riesgos = np.full(64, float(config.get('riesgo_pct', 0.01)))
     stops = np.full(64, float(config.get('stop_atr', 0.0)))
@@ -913,11 +937,11 @@ def simular(o, h, l, c, senales, config):
     # (0 = desactivado, que es el comportamiento sin órdenes límite)
     vigencias = np.zeros(64, dtype=np.int64)
     avances_cancel = np.zeros(64, dtype=np.float64)
-    for sid, pct in (config.get('riesgo_por_setup') or {}).items():
+    for sid, pct in riesgo_por_setup.items():
         sid = int(sid)
         if 0 <= sid < 64:
             riesgos[sid] = float(pct)
-    for sid, cfg_s in (config.get('config_por_setup') or {}).items():
+    for sid, cfg_s in cfg_por_setup.items():
         sid = int(sid)
         if not 0 <= sid < 64:
             continue
@@ -954,7 +978,7 @@ def simular(o, h, l, c, senales, config):
     parc_rmin_all = np.zeros((64, max_parc), dtype=np.float64)
     n_parc_all = np.zeros(64, dtype=np.int64)
 
-    for sid, cfg_s in (config.get('config_por_setup') or {}).items():
+    for sid, cfg_s in cfg_por_setup.items():
         sid = int(sid)
         if not 0 <= sid < 64:
             continue
@@ -990,12 +1014,12 @@ def simular(o, h, l, c, senales, config):
                     parc_velas_all[sid, e] = int(ep.get('velas_max', 0))
                     parc_rmin_all[sid, e] = float(ep.get('r_min', 0.0))
 
-    # condition masks: 3D (64 setups × 8 stages × n bars). Padded with True.
-    parc_ml = np.ones((64, max_parc, n), dtype=np.bool_)
-    parc_ms = np.ones((64, max_parc, n), dtype=np.bool_)
+    # condition masks: 3D (n_setups × 8 stages × n bars). Padded with True.
+    parc_ml = np.ones((n_setups, max_parc, n), dtype=np.bool_)
+    parc_ms = np.ones((n_setups, max_parc, n), dtype=np.bool_)
     masks_in = config.get('parciales_masks_long')
     if masks_in and len(masks_in) > 0:
-        for sid in range(min(len(masks_in), 64)):
+        for sid in range(min(len(masks_in), n_setups)):
             m = masks_in[sid]
             if m is not None and len(m) > 0:
                 m = np.array(m, dtype=np.bool_)
@@ -1005,7 +1029,7 @@ def simular(o, h, l, c, senales, config):
                 parc_ml[sid, :stages, :] = m[:stages, :]
     masks_in = config.get('parciales_masks_short')
     if masks_in and len(masks_in) > 0:
-        for sid in range(min(len(masks_in), 64)):
+        for sid in range(min(len(masks_in), n_setups)):
             m = masks_in[sid]
             if m is not None and len(m) > 0:
                 m = np.array(m, dtype=np.bool_)
@@ -1026,7 +1050,7 @@ def simular(o, h, l, c, senales, config):
     tramo_has_conds = np.zeros((64, max_tram), dtype=np.bool_)
     n_tramos_all = np.ones(64, dtype=np.int64)
 
-    for sid, cfg_s in (config.get('config_por_setup') or {}).items():
+    for sid, cfg_s in cfg_por_setup.items():
         sid = int(sid)
         if not 0 <= sid < 64:
             continue
@@ -1046,11 +1070,11 @@ def simular(o, h, l, c, senales, config):
                 conds = tr.get('condiciones')
                 tramo_has_conds[sid, e] = bool(conds and len(conds) > 0)
 
-    tramo_ml = np.ones((64, max_tram, n), dtype=np.bool_)
-    tramo_ms = np.ones((64, max_tram, n), dtype=np.bool_)
+    tramo_ml = np.ones((n_setups, max_tram, n), dtype=np.bool_)
+    tramo_ms = np.ones((n_setups, max_tram, n), dtype=np.bool_)
     masks_in = config.get('tramos_masks_long')
     if masks_in and len(masks_in) > 0:
-        for sid in range(min(len(masks_in), 64)):
+        for sid in range(min(len(masks_in), n_setups)):
             m = masks_in[sid]
             if m is not None and len(m) > 0:
                 m = np.array(m, dtype=np.bool_)
@@ -1060,7 +1084,7 @@ def simular(o, h, l, c, senales, config):
                 tramo_ml[sid, :stages, :] = m[:stages, :]
     masks_in = config.get('tramos_masks_short')
     if masks_in and len(masks_in) > 0:
-        for sid in range(min(len(masks_in), 64)):
+        for sid in range(min(len(masks_in), n_setups)):
             m = masks_in[sid]
             if m is not None and len(m) > 0:
                 m = np.array(m, dtype=np.bool_)
@@ -1077,7 +1101,7 @@ def simular(o, h, l, c, senales, config):
     mec_gv_all = np.zeros((64, n_mec), dtype=np.float64)
     mec_has_conds = np.zeros((64, n_mec), dtype=np.bool_)
 
-    for sid, cfg_s in (config.get('config_por_setup') or {}).items():
+    for sid, cfg_s in cfg_por_setup.items():
         sid = int(sid)
         if not 0 <= sid < 64:
             continue
@@ -1092,13 +1116,13 @@ def simular(o, h, l, c, senales, config):
             conds = m_cfg.get('condiciones')
             mec_has_conds[sid, k] = bool(conds and len(conds) > 0)
 
-    mec_ml = np.ones((64, n_mec, n), dtype=np.bool_)
-    mec_ms = np.ones((64, n_mec, n), dtype=np.bool_)
+    mec_ml = np.ones((n_setups, n_mec, n), dtype=np.bool_)
+    mec_ms = np.ones((n_setups, n_mec, n), dtype=np.bool_)
     for clave_cfg, destino in (('mecanismos_masks_long', mec_ml),
                                ('mecanismos_masks_short', mec_ms)):
         masks_in = config.get(clave_cfg)
         if masks_in and len(masks_in) > 0:
-            for sid in range(min(len(masks_in), 64)):
+            for sid in range(min(len(masks_in), n_setups)):
                 m = masks_in[sid]
                 if m is not None and len(m) > 0:
                     m = np.array(m, dtype=np.bool_)

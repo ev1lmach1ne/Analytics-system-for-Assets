@@ -12,8 +12,16 @@ módulo no sustituye a ese pipeline, solo alimenta la selección previa.
 
 Sin Qt, sin I/O — funciones puras pensadas para correr dentro de un QThread
 de la GUI o en tests.
+
+Rendimiento:
+- Las señales solo dependen de params de estrategia (+ filtros fijos del
+  setup). Si se barren riesgo/stop/TP, se reutiliza la misma señal.
+- Las simulaciones (numba nogil) se reparten en un pool de hilos.
 """
 import itertools
+import os
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 
@@ -25,6 +33,9 @@ from core.strategies import generar_senales_sistema
 LIMITE_COMBOS_DEFECTO = 2000
 PREFIJO_RIESGO = '_riesgo.'   # evita colisión con claves de params de estrategia
 N_PUNTOS_SPARKLINE = 80
+# Hilos para simular en paralelo. El motor es numba nogil; generar señales
+# (pandas) sigue serializado vía caché por params de estrategia.
+N_WORKERS_DEFECTO = max(1, min(8, (os.cpu_count() or 2)))
 
 
 def generar_grid(sweep, limite=LIMITE_COMBOS_DEFECTO):
@@ -104,10 +115,58 @@ def _sharpe_expansivo(equity, velas_por_anio=None):
     return sharpe
 
 
+def _clave_params(params_combo):
+    """Clave hashable de los params de estrategia de una combo (orden estable)."""
+    return tuple(sorted(params_combo.items()))
+
+
+def _config_motor(setup, config_global):
+    """Config del motor para un setup ya materializado (riesgo incluido)."""
+    config = dict(config_global)
+    cfg0 = {
+        'riesgo_pct': float(setup.get('riesgo_pct', 0.01)),
+        'stop_atr': float(setup.get('stop_atr', 0.0)),
+        'tp_r': float(setup.get('tp_r', 0.0)),
+        'salida_n_velas': int(setup.get('salida_n_velas', 0)),
+        'be_atr': float(setup.get('be_atr', 0.0)),
+        'be_unidad': setup.get('be_unidad', 'atr'),
+        'trailing_atr': float(setup.get('trailing_atr', 0.0)),
+        'parciales': setup.get('parciales', []),
+        'tramos': setup.get('tramos', []),
+        'limite_vigencia_velas': int(setup.get('limite_vigencia_velas', 0)),
+        'limite_cancelar_avance_r': float(
+            setup.get('limite_cancelar_avance_r', 0.0)),
+    }
+    for clave_mec in MECANISMOS_SALIDA:
+        if setup.get(clave_mec):
+            cfg0[clave_mec] = setup[clave_mec]
+    config['config_por_setup'] = {0: cfg0}
+    return config
+
+
+def _evaluar_combo(o, h, l, c, n_is, senales, setup, combo, config_global,
+                   velas_por_anio):
+    """Una combo: simular + métricas + sparklines (sin generar señales)."""
+    config = _config_motor(setup, config_global)
+    resultado = simular(o, h, l, c, senales, config)
+    met = calcular_metricas(resultado, 0, n_is, velas_por_anio)
+    equity = resultado['equity']
+    eq0 = equity[0] if len(equity) and equity[0] > 0 else 1.0
+    curva_pct = (equity / eq0 - 1.0) * 100.0
+    return {
+        'params_barridos': combo,
+        'setup': setup,
+        'metricas': met,
+        'equity_sparkline': _downsample(curva_pct),
+        'sharpe_sparkline': _downsample(
+            _sharpe_expansivo(equity, velas_por_anio)),
+    }
+
+
 def optimizar_setup(df, setup_base, sweep_params, sweep_riesgo, config_global,
                      pct_oos, metrica='sharpe', velas_por_anio=None,
                      limite_combos=LIMITE_COMBOS_DEFECTO, progreso_cb=None,
-                     eventos_noticias=None):
+                     eventos_noticias=None, n_workers=None):
     """Recorre la grid de combinaciones para UN setup, simulando SOLO el
     tramo IS (df.iloc[:corte], corte = dividir_is_oos(len(df), pct_oos)).
 
@@ -118,6 +177,13 @@ def optimizar_setup(df, setup_base, sweep_params, sweep_riesgo, config_global,
     eventos_noticias: tupla de preparar_eventos_noticias() ya resuelta por el
     llamador (la GUI descarga/cachea una sola vez), o None si el setup no usa
     el filtro de noticias — se reenvía tal cual a generar_senales_sistema.
+    n_workers: hilos para simular en paralelo (None = N_WORKERS_DEFECTO;
+    1 = secuencial, útil en tests deterministas de orden de progreso).
+
+    Optimizaciones:
+    1) Caché de señales por params de estrategia: barrer solo riesgo/stop no
+       regenera Bollinger/RSI/etc.
+    2) Pool de hilos sobre simular (numba nogil) cuando hay varias combos.
 
     Devuelve la lista de resultados — cada uno
     {'params_barridos', 'setup', 'metricas', 'equity_sparkline'} — ordenada
@@ -127,63 +193,81 @@ def optimizar_setup(df, setup_base, sweep_params, sweep_riesgo, config_global,
     n = len(df)
     corte = dividir_is_oos(n, pct_oos)
     df_is = df.iloc[:corte]
-    o = df_is['open'].values
-    h = df_is['high'].values
-    l = df_is['low'].values
-    c = df_is['close'].values
+    o = np.ascontiguousarray(df_is['open'].values, dtype=np.float64)
+    h = np.ascontiguousarray(df_is['high'].values, dtype=np.float64)
+    l = np.ascontiguousarray(df_is['low'].values, dtype=np.float64)
+    c = np.ascontiguousarray(df_is['close'].values, dtype=np.float64)
     n_is = len(df_is)
 
     sweep = dict(sweep_params)
     sweep.update({PREFIJO_RIESGO + k: v for k, v in sweep_riesgo.items()})
     combos = generar_grid(sweep, limite_combos) if sweep else [{}]
 
-    resultados = []
     total = len(combos)
-    for i, combo in enumerate(combos):
+    if progreso_cb:
+        progreso_cb(0, total)
+
+    # Agrupar por params de estrategia → una sola generación de señales
+    # por grupo (el riesgo solo cambia el motor).
+    trabajos = []
+    cache_senales = {}
+    for combo in combos:
         params_combo = {k: v for k, v in combo.items()
                         if not k.startswith(PREFIJO_RIESGO)}
         riesgo_combo = {k[len(PREFIJO_RIESGO):]: v for k, v in combo.items()
                         if k.startswith(PREFIJO_RIESGO)}
-
+        clave = _clave_params(params_combo)
+        if clave not in cache_senales:
+            setup_senal = dict(
+                setup_base, params=dict(setup_base['params'], **params_combo))
+            cache_senales[clave] = generar_senales_sistema(
+                df_is, [setup_senal], eventos_noticias)
         setup = dict(setup_base, params=dict(setup_base['params'], **params_combo))
         setup.update(riesgo_combo)
+        trabajos.append((combo, setup, cache_senales[clave]))
 
-        senales = generar_senales_sistema(df_is, [setup], eventos_noticias)
-        config = dict(config_global)
-        config['config_por_setup'] = {0: {
-            'riesgo_pct': float(setup.get('riesgo_pct', 0.01)),
-            'stop_atr': float(setup.get('stop_atr', 0.0)),
-            'tp_r': float(setup.get('tp_r', 0.0)),
-            'salida_n_velas': int(setup.get('salida_n_velas', 0)),
-            'be_atr': float(setup.get('be_atr', 0.0)),
-            'be_unidad': setup.get('be_unidad', 'atr'),
-            'trailing_atr': float(setup.get('trailing_atr', 0.0)),
-            'parciales': setup.get('parciales', []),
-            'tramos': setup.get('tramos', []),
-            'limite_vigencia_velas': int(setup.get('limite_vigencia_velas', 0)),
-            'limite_cancelar_avance_r': float(
-                setup.get('limite_cancelar_avance_r', 0.0)),
-        }}
-        for clave_mec in MECANISMOS_SALIDA:
-            if setup.get(clave_mec):
-                config['config_por_setup'][0][clave_mec] = setup[clave_mec]
-        resultado = simular(o, h, l, c, senales, config)
-        met = calcular_metricas(resultado, 0, n_is, velas_por_anio)
-
-        equity = resultado['equity']
-        eq0 = equity[0] if len(equity) and equity[0] > 0 else 1.0
-        curva_pct = (equity / eq0 - 1.0) * 100.0
-
-        resultados.append({
-            'params_barridos': combo,
-            'setup': setup,
-            'metricas': met,
-            'equity_sparkline': _downsample(curva_pct),
-            'sharpe_sparkline': _downsample(
-                _sharpe_expansivo(equity, velas_por_anio)),
-        })
+    workers = N_WORKERS_DEFECTO if n_workers is None else max(1, int(n_workers))
+    # Una sola combo o 1 worker: secuencial (menos overhead y orden estable).
+    if total <= 1 or workers <= 1:
+        resultados = []
+        for i, (combo, setup, senales) in enumerate(trabajos):
+            resultados.append(_evaluar_combo(
+                o, h, l, c, n_is, senales, setup, combo, config_global,
+                velas_por_anio))
+            if progreso_cb:
+                progreso_cb(i + 1, total)
+    else:
+        resultados = [None] * total
+        # 1ª combo en el hilo principal: calienta numba (JIT) y evita
+        # reevaluarla en el pool.
+        combo0, setup0, senales0 = trabajos[0]
+        resultados[0] = _evaluar_combo(
+            o, h, l, c, n_is, senales0, setup0, combo0, config_global,
+            velas_por_anio)
+        hechos = 1
         if progreso_cb:
-            progreso_cb(i + 1, total)
+            progreso_cb(1, total)
+        lock = threading.Lock()
+
+        def _uno(idx_combo_setup_sen):
+            idx, combo, setup, senales = idx_combo_setup_sen
+            return idx, _evaluar_combo(
+                o, h, l, c, n_is, senales, setup, combo, config_global,
+                velas_por_anio)
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futs = [
+                pool.submit(_uno, (i, combo, setup, senales))
+                for i, (combo, setup, senales) in enumerate(trabajos)
+                if i > 0
+            ]
+            for fut in as_completed(futs):
+                idx, item = fut.result()
+                resultados[idx] = item
+                if progreso_cb:
+                    with lock:
+                        hechos += 1
+                        progreso_cb(hechos, total)
 
     def _clave_orden(item):
         v = item['metricas'].get(metrica)

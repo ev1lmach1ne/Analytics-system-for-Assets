@@ -1099,6 +1099,38 @@ def describir(nombre_estrategia, params=None):
 
 # ══════════════ filtros de entrada por setup ══════════════
 
+# Umbrales del filtro de régimen. ABSOLUTOS a propósito: "entro solo si el
+# mercado es direccional" tiene que significar lo mismo en todos los activos y
+# no depender de la distribución del propio histórico (que además metía datos
+# futuros en la decisión de las primeras velas).
+UMBRAL_ER_TENDENCIA = 0.5
+UMBRAL_ER_RUIDO = 0.3
+# Hurst: los mismos que contar_regimen_hurst (core/metrics.py) y que la tabla
+# del Analizador, que ya eran coherentes entre sí.
+UMBRAL_HURST_TENDENCIA = 0.58
+UMBRAL_HURST_REVERSION = 0.52
+
+# Ventanas por defecto — ER y Hurst NO comparten escala:
+#  · ER 10 es el valor de Kaufman para el AMA (mismo que el periodo_er de la
+#    plantilla KAMA). Con 100, ER>0.5 no lo cruza ni el 0,1% de las velas y el
+#    filtro de tendencia bloquea todo.
+#  · Hurst necesita ventana larga: el estimador R/S con pocos lags tiene sesgo
+#    positivo y sobre ruido puro devuelve ~0,58-0,60, justo encima del umbral.
+#    Por debajo de VENTANA_HURST_MINIMA el filtro deja de significar lo que dice.
+VENTANA_ER_DEFECTO = 10
+VENTANA_HURST_DEFECTO = 400
+VENTANA_HURST_MINIMA = 200
+
+METODOS_REGIMEN_ER = ('er_tendencia', 'er_rango')
+METODOS_REGIMEN_HURST = ('hurst_tendencia', 'hurst_reversion')
+
+
+def ventana_regimen_defecto(metodo):
+    """Ventana de fábrica del filtro de régimen según el método elegido."""
+    return (VENTANA_HURST_DEFECTO if metodo in METODOS_REGIMEN_HURST
+            else VENTANA_ER_DEFECTO)
+
+
 def _filtros_por_defecto():
     """Filtros de ENTRADA de un setup — None/'ninguno' en cualquier eje =
     sin restricción en ese eje. Solo se aplican a NUEVAS entradas (ver
@@ -1107,7 +1139,7 @@ def _filtros_por_defecto():
     cambia a mitad de una operación."""
     return {
         'dias_semana': None,      # None = todos; si no, lista de ints 0=Lun..6=Dom
-        'regimen': {'metodo': 'ninguno', 'periodo': 100},
+        'regimen': {'metodo': 'ninguno', 'periodo': VENTANA_ER_DEFECTO},
         # metodo: 'ninguno'|'er_tendencia'|'er_rango'|'hurst_tendencia'|'hurst_reversion'
         'volatilidad': {'metodo': 'ninguno', 'periodo': 100, 'percentil': 50.0},
         # metodo: 'ninguno'|'atr_percentil_alto'|'atr_percentil_bajo'|
@@ -1161,7 +1193,7 @@ def _mascara_evitar_ventanas(ts_velas, ts_eventos, antes_s, despues_s):
     return admitida
 
 
-def _mascara_filtros_setup(df, filtros, eventos_noticias=None):
+def _mascara_filtros_setup(df, filtros, eventos_noticias=None, avisos=None):
     """(m_long, m_short, m_forzar_salida): máscaras AND de los filtros
     activos de un setup (True = vela admitida para NUEVAS entradas).
     Día/régimen/sesión/noticias son agnósticos a la dirección y se aplican a
@@ -1176,7 +1208,11 @@ def _mascara_filtros_setup(df, filtros, eventos_noticias=None):
     aquí, no en el proveedor, para que dos setups del mismo sistema puedan
     pedir umbrales distintos. m_forzar_salida es None si el setup no pide
     cerrar posiciones abiertas antes de la noticia (o si no hay filtro de
-    noticias activo)."""
+    noticias activo).
+
+    avisos: lista donde se anotan los filtros que se han pedido pero NO se han
+    podido aplicar. Antes eso pasaba en silencio y el backtest salía como si no
+    hubiera filtro — indistinguible de uno sin filtrar."""
     n = len(df)
     m = np.ones(n, dtype=bool)
     m_forzar_salida = None
@@ -1193,23 +1229,47 @@ def _mascara_filtros_setup(df, filtros, eventos_noticias=None):
     ses = filtros.get('sesion') or {}
     tipo_sesion = ses.get('tipo', 'ninguna')
 
-    necesita_er = metodo in ('er_tendencia', 'er_rango')
-    necesita_hurst = metodo in ('hurst_tendencia', 'hurst_reversion')
+    necesita_er = metodo in METODOS_REGIMEN_ER
+    necesita_hurst = metodo in METODOS_REGIMEN_HURST
     necesita_ctx = necesita_er or necesita_hurst or tipo_sesion in ('overnight', 'londres', 'ny')
+
+    def _avisar(texto):
+        if avisos is not None and texto not in avisos:
+            avisos.append(texto)
 
     if necesita_ctx:
         close = df['close'].values.astype(np.float64)
-        periodo = int(reg.get('periodo', 100))
+        periodo = int(reg.get('periodo') or ventana_regimen_defecto(metodo))
         er_vals = _er_serie(close, periodo).values if necesita_er else None
         hurst_vals = _hurst_serie(close, periodo) if necesita_hurst else None
         ctx = preparar_contexto(
             close, er=er_vals, hurst=hurst_vals,
-            timestamps=df['timestamp'].values if tipo_sesion != 'ninguna' else None)
+            timestamps=df['timestamp'].values if tipo_sesion != 'ninguna' else None,
+            umbrales_er=(UMBRAL_ER_RUIDO, UMBRAL_ER_TENDENCIA))
 
-        if necesita_er and ctx['regimen_er'] is not None:
-            m &= (ctx['regimen_er'] == (2 if metodo == 'er_tendencia' else 0))
-        if necesita_hurst and ctx['regimen_hurst'] is not None:
-            m &= (ctx['regimen_hurst'] == (2 if metodo == 'hurst_tendencia' else 0))
+        # Cuando el régimen no se ha podido calcular hay que DECIRLO: seguir
+        # sin aplicar la máscara deja un backtest idéntico a uno sin filtro,
+        # y eso antes no se distinguía de que el filtro sí hubiera actuado.
+        if necesita_er:
+            if ctx['regimen_er'] is not None:
+                m &= (ctx['regimen_er'] == (2 if metodo == 'er_tendencia' else 0))
+            else:
+                _avisar(f"Filtro de régimen ER NO aplicado: con ventana {periodo} "
+                        f"sobre {len(close):,} velas no se puede calcular el ER. "
+                        f"El backtest ha corrido SIN ese filtro.")
+        if necesita_hurst:
+            if ctx['regimen_hurst'] is not None:
+                m &= (ctx['regimen_hurst'] == (2 if metodo == 'hurst_tendencia' else 0))
+                if periodo < VENTANA_HURST_MINIMA:
+                    _avisar(f"Filtro de régimen Hurst con ventana {periodo}: por "
+                            f"debajo de {VENTANA_HURST_MINIMA} el estimador se va "
+                            f"por encima de {UMBRAL_HURST_TENDENCIA} incluso sobre "
+                            f"ruido puro, así que el régimen que marca no es "
+                            f"fiable.")
+            else:
+                _avisar(f"Filtro de régimen Hurst NO aplicado: la ventana "
+                        f"{periodo} no cabe en {len(close):,} velas. El backtest "
+                        f"ha corrido SIN ese filtro.")
         if tipo_sesion in ('overnight', 'londres', 'ny'):
             m_sesion = _mascara_sesion(ctx, tipo_sesion)
             if m_sesion is not None:
@@ -1410,6 +1470,10 @@ def generar_senales_sistema(df, setups, eventos_noticias=None):
            'orden_short_precio': np.full(n, np.nan),
            'cancelar_orden_long': np.zeros(n, dtype=np.int64),
            'cancelar_orden_short': np.zeros(n, dtype=np.int64),
+           # filtros pedidos que no se han podido aplicar, o aplicados con
+           # parámetros en los que no son fiables: la GUI los enseña para que
+           # un backtest sin filtrar no pase por uno filtrado
+           'avisos': [],
            'atr': None}
     reclamada = np.zeros(n, dtype=bool)   # vela ya reclamada por un setup previo
 
@@ -1423,8 +1487,11 @@ def generar_senales_sistema(df, setups, eventos_noticias=None):
         sal_s = np.asarray(s['salidas_short'], dtype=bool)
         filtros = setup.get('filtros')
         if filtros:
+            avisos_setup = []
             m_ent_long, m_ent_short, m_forzar_salida = _mascara_filtros_setup(
-                df, filtros, eventos_noticias)
+                df, filtros, eventos_noticias, avisos=avisos_setup)
+            nombre = setup.get('nombre') or f'Setup {k + 1}'
+            out['avisos'] += [f'{nombre}: {a}' for a in avisos_setup]
             ent_l = ent_l & m_ent_long
             ent_s = ent_s & m_ent_short
             # condiciones_salida SÍ restringe la salida (a diferencia de
@@ -1938,12 +2005,12 @@ def _desc_filtros(filtros):
     reg = filtros.get('regimen') or {}
     metodo = reg.get('metodo', 'ninguno')
     if metodo != 'ninguno':
-        per = reg.get('periodo', 100)
+        per = reg.get('periodo') or ventana_regimen_defecto(metodo)
         etiquetas = {
-            'er_tendencia': f"ER({per}) por encima del umbral de tendencia",
-            'er_rango': f"ER({per}) por debajo del umbral de ruido",
-            'hurst_tendencia': f"Hurst({per}) > 0.58 (tendencia)",
-            'hurst_reversion': f"Hurst({per}) < 0.52 (reversión a la media)",
+            'er_tendencia': f"ER({per}) > {UMBRAL_ER_TENDENCIA} (tendencia)",
+            'er_rango': f"ER({per}) < {UMBRAL_ER_RUIDO} (ruido/rango)",
+            'hurst_tendencia': f"Hurst({per}) > {UMBRAL_HURST_TENDENCIA} (tendencia)",
+            'hurst_reversion': f"Hurst({per}) < {UMBRAL_HURST_REVERSION} (reversión a la media)",
         }
         lineas.append(f"Régimen: solo entra si {etiquetas[metodo]}")
     vol = filtros.get('volatilidad') or {}

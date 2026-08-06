@@ -15,15 +15,16 @@ import traceback
 import numpy as np
 import pandas as pd
 
-from PyQt6.QtCore import Qt, QSize, QPointF
+from PyQt6.QtCore import Qt, QSize, QPointF, QPoint
 from PyQt6.QtGui import QIcon, QPixmap, QPainter, QPen, QColor, QPolygonF
 from PyQt6.QtWidgets import (QSizePolicy, QLabel, QDialog, QTabWidget,
-                             QVBoxLayout)
+                             QVBoxLayout, QApplication)
 
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
 from matplotlib.dates import date2num, AutoDateLocator, ConciseDateFormatter
+from matplotlib.ticker import Locator, FuncFormatter
 
 # ══════════════ paleta ══════════════
 # Misma que la del Backtester (gui/widgets/tab_backtest.py): el Analizador se
@@ -87,6 +88,166 @@ def eje_fechas(ax, x=None):
     ax.xaxis.set_major_locator(loc)
     ax.xaxis.set_major_formatter(ConciseDateFormatter(loc))
     ax.xaxis.get_offset_text().set_color(AX_FG)
+
+
+# ══════════ eje X ordinal (índice de vela) con etiquetas de fecha ══════════
+# Escalones "redondos" de menor a mayor, con la duración aproximada de cada uno
+# en segundos: se recorren en orden y se elige el primero que deja como mucho
+# `max_ticks` marcas en la ventana visible.
+_PASOS_ORDINALES = [
+    ('minuto', 1), ('minuto', 5), ('minuto', 15), ('minuto', 30),
+    ('hora', 1), ('hora', 3), ('hora', 6), ('hora', 12),
+    ('dia', 1), ('semana', 1),
+    ('mes', 1), ('mes', 3), ('mes', 6),
+    ('anio', 1), ('anio', 2), ('anio', 5), ('anio', 10),
+]
+_SEGUNDOS_PASO = {'minuto': 60.0, 'hora': 3600.0, 'dia': 86400.0,
+                  'semana': 604800.0, 'mes': 2629800.0, 'anio': 31557600.0}
+
+
+def _bordes_periodo(unidad, k, t0, t1):
+    """Timestamps de inicio de cada periodo de `k` `unidad` que cae en [t0, t1].
+
+    Las unidades de calendario (mes/año) usan DateOffset porque su duración no
+    es fija; las demás parten de medianoche del primer día, con lo que las
+    marcas caen siempre en horas/minutos redondos sin depender de alias de
+    frecuencia de pandas (que han ido cambiando entre versiones).
+    """
+    if unidad == 'anio':
+        ini = pd.Timestamp(year=t0.year, month=1, day=1)
+        return pd.date_range(ini, t1, freq=pd.DateOffset(years=k))
+    if unidad == 'mes':
+        ini = pd.Timestamp(year=t0.year, month=1, day=1)
+        return pd.date_range(ini, t1, freq=pd.DateOffset(months=k))
+    if unidad == 'semana':
+        lunes = t0.normalize() - pd.Timedelta(days=int(t0.weekday()))
+        return pd.date_range(lunes, t1, freq=pd.Timedelta(days=7 * k))
+    if unidad == 'dia':
+        return pd.date_range(t0.normalize(), t1, freq=pd.Timedelta(days=k))
+    paso = (pd.Timedelta(hours=k) if unidad == 'hora'
+            else pd.Timedelta(minutes=k))
+    return pd.date_range(t0.normalize(), t1, freq=paso)
+
+
+class _LocalizadorOrdinalFechas(Locator):
+    """Marcas del eje en índices de vela, colocadas en fronteras de calendario.
+
+    Un MaxNLocator sobre el índice repartiría las marcas a intervalos regulares
+    de VELAS, con lo que las fechas que se leen debajo serían arbitrarias ("14
+    mar", "2 jun"...) y cambiarían al hacer scroll. Aquí se elige primero el
+    escalón de calendario y luego se busca qué vela abre cada periodo, que es
+    lo que produce etiquetas estables tipo "mar", "abr", "2025".
+    """
+
+    def __init__(self, ts, max_ticks=6):
+        self.ts = ts
+        self.max_ticks = max_ticks
+        self.unidad = 'dia'   # lo consulta el formateador para elegir patrón
+        # ningún escalón por debajo del espaciado real entre velas: con 3 velas
+        # diarias en pantalla, un escalón de 12 h pondría marcas en instantes
+        # donde no hay ninguna vela.
+        #
+        # Vía TimedeltaIndex y no vía los enteros crudos del índice: `asi8`
+        # devuelve el valor en la unidad del propio DatetimeIndex (ns, us...),
+        # que no es la misma en todas las versiones de pandas, y dividir por
+        # 1e9 a ciegas daba un espaciado 1000 veces menor del real.
+        if len(ts) > 1:
+            paso_barra = float(np.median((ts[1:] - ts[:-1]).total_seconds()))
+        else:
+            paso_barra = 0.0
+        self.segundos_barra = paso_barra
+
+    def __call__(self):
+        return self.tick_values(*self.axis.get_view_interval())
+
+    def tick_values(self, vmin, vmax):
+        ts = self.ts
+        n = len(ts)
+        if n == 0:
+            return []
+        if vmin > vmax:
+            vmin, vmax = vmax, vmin
+        i0 = int(np.clip(np.ceil(vmin), 0, n - 1))
+        i1 = int(np.clip(np.floor(vmax), 0, n - 1))
+        if i1 <= i0:
+            return [float(i0)]
+        t0, t1 = ts[i0], ts[i1]
+        span = (t1 - t0).total_seconds()
+        unidad, k = _PASOS_ORDINALES[-1]
+        for u, mult in _PASOS_ORDINALES:
+            dur = _SEGUNDOS_PASO[u] * mult
+            if dur < self.segundos_barra:
+                continue
+            if span / dur <= self.max_ticks:
+                unidad, k = u, mult
+                break
+        self.unidad = unidad
+        bordes = _bordes_periodo(unidad, k, t0, t1)
+        if len(bordes) == 0:
+            return [float(i0), float(i1)]
+        # la vela que ABRE cada periodo: la primera cuyo timestamp alcanza el
+        # borde. Varios bordes seguidos sin velas (un mes entero sin datos)
+        # colapsan en el mismo índice, de ahí el unique. Se busca sobre el
+        # propio DatetimeIndex (no sobre sus enteros crudos) para que pandas
+        # concilie las unidades de los dos índices.
+        idx = ts.searchsorted(bordes, side='left')
+        idx = np.unique(idx[(idx >= i0) & (idx <= i1)])
+        if len(idx) == 0:
+            return [float(i0), float(i1)]
+        return [float(i) for i in idx]
+
+
+def _formateador_ordinal(ts, locator):
+    """Índice de vela → etiqueta corta, promocionando la unidad en los cambios
+    de periodo (el año en el cambio de año, el mes en el cambio de mes...), que
+    es el mismo criterio de ConciseDateFormatter: la marca dice lo mínimo para
+    situarse, y el contexto lo da la marca anterior."""
+
+    def _fmt(valor, _pos=None):
+        n = len(ts)
+        i = int(round(valor))
+        if n == 0 or i < 0 or i >= n:
+            return ''
+        t = ts[i]
+        previo = ts[i - 1] if i > 0 else None
+        unidad = locator.unidad
+        if unidad == 'anio':
+            return t.strftime('%Y')
+        if unidad == 'mes':
+            return t.strftime('%Y') if t.month == 1 else t.strftime('%b')
+        if unidad in ('dia', 'semana'):
+            if previo is None or t.year != previo.year:
+                return t.strftime('%Y')
+            if t.month != previo.month:
+                return t.strftime('%b')
+            return t.strftime('%d')
+        if previo is None or t.date() != previo.date():
+            return t.strftime('%d %b')
+        return t.strftime('%H:%M')
+
+    return FuncFormatter(_fmt)
+
+
+def eje_fechas_ordinal(ax, ts, max_ticks=6):
+    """Eje X en índice de vela (0, 1, 2...) con etiquetas de fecha.
+
+    Alternativa a `eje_fechas` para gráficos de velas: al dibujar contra el
+    índice y no contra la fecha, los tramos sin mercado (fin de semana,
+    festivos, cierres de sesión) dejan de ocupar espacio y la serie se ve
+    continua, como en TradingView. La contrapartida es que el eje ya no es
+    lineal en tiempo, así que no sirve para leer duraciones a ojo.
+
+    Devuelve (locator, formatter) para poder inspeccionarlos en tests.
+    """
+    ts = pd.DatetimeIndex(ts)
+    if ts.tz is not None:
+        ts = ts.tz_convert(None)
+    loc = _LocalizadorOrdinalFechas(ts, max_ticks=max_ticks)
+    fmt = _formateador_ordinal(ts, loc)
+    ax.xaxis.set_major_locator(loc)
+    ax.xaxis.set_major_formatter(fmt)
+    ax.xaxis.get_offset_text().set_color(AX_FG)
+    return loc, fmt
 
 
 def ax_placeholder(ax, texto):
@@ -298,9 +459,13 @@ def agregar_crosshair(fig, ejes, x, series, texto_fn, nombre='default',
 
 
 class _PopupAyuda(QDialog):
-    """Panel flotante con 4 pestañas (Lógica/Significado/Uso/Resultados);
-    se cierra solo al perder el foco, igual que los editores de condiciones
-    del Backtester (gui/widgets/tab_backtest.py, Qt.WindowType.Popup)."""
+    """Panel flotante con las secciones de ayuda (Lógica/Significado/Uso/
+    Resultados) en pestañas; se cierra solo al perder el foco, igual que los
+    editores de condiciones del Backtester (gui/widgets/tab_backtest.py,
+    Qt.WindowType.Popup).
+
+    Con UNA sola sección no se monta la barra de pestañas: una pestaña
+    solitaria se lee como una interfaz a medio hacer."""
 
     def __init__(self, secciones, parent=None):
         super().__init__(parent, Qt.WindowType.Popup)
@@ -316,6 +481,12 @@ class _PopupAyuda(QDialog):
             "QLabel { color: #c8d6e5; font-size: 11px; padding: 8px; }")
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
+        if len(secciones) == 1:
+            lbl = QLabel(secciones[0][1])
+            lbl.setWordWrap(True)
+            lbl.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+            lay.addWidget(lbl)
+            return
         tabs = QTabWidget()
         tabs.setDocumentMode(True)
         # Ancho de texto real dentro de la pestaña (fijo=360 menos bordes y
@@ -340,10 +511,11 @@ class _PopupAyuda(QDialog):
         lay.addWidget(tabs)
 
 
-def icono_ayuda(logica, significado, uso, resultados):
-    """QLabel «?» en forma de badge; un clic abre un popup con 4 pestañas
-    (Lógica/Significado/Uso/Resultados) en vez de un tooltip al pasar el
-    ratón — para explicaciones largas que conviene poder leer con calma."""
+def _badge_ayuda(secciones, tooltip=None):
+    """QLabel «?» en forma de badge que abre `secciones` en un popup al hacer
+    clic. TODO icono de ayuda de la app pasa por aquí: si unos respondieran al
+    clic y otros solo al pasar el ratón, siendo idénticos, los segundos se leen
+    como rotos (era el caso de los del Backtester)."""
     icono = QLabel("?")
     icono.setFixedSize(16, 16)
     icono.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -351,18 +523,71 @@ def icono_ayuda(logica, significado, uso, resultados):
         "QLabel { background-color: #253a60; color: #8fb3d9; "
         "border-radius: 8px; font-size: 10px; font-weight: bold; }")
     icono.setCursor(Qt.CursorShape.PointingHandCursor)
-    secciones = [('Lógica', logica), ('Significado', significado),
-                 ('Uso', uso), ('Resultados', resultados)]
+    if tooltip:
+        icono.setToolTip(tooltip)
 
     def _abrir(event):
         # Referencia guardada en el propio icono: sin ella, el wrapper de
         # Python del popup puede recolectarse antes de que Qt lo muestre,
         # pese a llevar `icono` como parent en C++.
-        icono._popup = _PopupAyuda(secciones, icono)
-        icono._popup.move(icono.mapToGlobal(icono.rect().bottomLeft()))
-        icono._popup.show()
+        icono._popup = popup = _PopupAyuda(secciones, icono)
+        popup.move(_posicion_popup(icono, popup))
+        popup.show()
     icono.mousePressEvent = _abrir
     return icono
+
+
+def _posicion_popup(icono, popup):
+    """Esquina superior izquierda donde soltar el popup, recortada a la
+    pantalla del icono.
+
+    Sin este recorte el popup se ancla a la esquina inferior izquierda del
+    icono y se extiende 360 px hacia la derecha, y eso lo hacía INVISIBLE en
+    los iconos del Backtester: allí van alineados a la derecha de su grupo
+    (`_fila_ayuda`), o sea pegados al borde de la ventana, así que con la
+    ventana maximizada el panel entero caía fuera del monitor. Se abría, pero
+    no había dónde verlo — se leía como un icono muerto.
+
+    Lo mismo por abajo: un icono en la parte baja de una página larga abriría
+    su panel por debajo del borde inferior. Ahí se prueba primero a abrirlo
+    hacia ARRIBA del icono, que es lo que hace cualquier menú.
+    """
+    # el tamaño definitivo no está calculado hasta que se muestra: sin esto,
+    # width()/height() devuelven el tamaño por defecto y el recorte se haría
+    # contra medidas que no son las del panel
+    popup.adjustSize()
+    destino = icono.mapToGlobal(icono.rect().bottomLeft())
+    pantalla = icono.screen() or QApplication.primaryScreen()
+    if pantalla is None:
+        return destino
+    libre = pantalla.availableGeometry()
+
+    x = min(destino.x(), libre.right() - popup.width() + 1)
+    x = max(x, libre.left())
+
+    y = destino.y()
+    if y + popup.height() > libre.bottom():
+        arriba = icono.mapToGlobal(icono.rect().topLeft()).y() - popup.height()
+        if arriba >= libre.top():
+            y = arriba
+    # recorte final por si tampoco cabe arriba (panel más alto que la pantalla,
+    # o icono fuera del área visible): siempre dentro, aunque tape al icono
+    y = max(libre.top(), min(y, libre.bottom() - popup.height() + 1))
+    return QPoint(x, y)
+
+
+def icono_ayuda(logica, significado, uso, resultados):
+    """Badge «?» cuyo popup trae 4 pestañas (Lógica/Significado/Uso/
+    Resultados) — para explicaciones largas que conviene leer con calma."""
+    return _badge_ayuda([('Lógica', logica), ('Significado', significado),
+                         ('Uso', uso), ('Resultados', resultados)])
+
+
+def icono_ayuda_texto(texto):
+    """Badge «?» de una sola explicación: el mismo texto en el tooltip al pasar
+    el ratón y en el popup al hacer clic, para que el gesto que haga el usuario
+    funcione sea cual sea."""
+    return _badge_ayuda([('Ayuda', texto)], tooltip=texto)
 
 
 def no_crash(fn):

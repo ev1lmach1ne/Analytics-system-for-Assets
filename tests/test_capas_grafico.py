@@ -6,6 +6,7 @@ de mirar `get_visible()` — ocultarlos no funcionaría, porque
 `_iniciar_sesion_blit` los devuelve a visibles en cuanto se arrastra el gráfico.
 """
 import os
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -462,6 +463,86 @@ def test_reencender_un_oscilador_conserva_su_altura(app, payload_variado):
     w._capas_estado['panel:rsi'] = True
     w._dibujar_principal()
     assert w._pesos_paneles['rsi'] == 2.5
+
+
+# ── eje Y de los paneles de oscilador ──
+
+def _evento(x, y, dblclick=False):
+    """Lo mínimo que leen _zona_eje / _on_press_ejes / _on_motion_ejes de un
+    evento de matplotlib."""
+    return SimpleNamespace(x=x, y=y, dblclick=dblclick, inaxes=None,
+                           xdata=None, ydata=None, button=1)
+
+
+def _punto_franja_y(ax):
+    b = ax.get_window_extent()
+    return (b.x1 + 8, (b.y0 + b.y1) / 2)
+
+
+def test_la_franja_y_de_cada_panel_tiene_su_propia_zona(app, payload_variado):
+    """Antes, un clic sobre las etiquetas de un oscilador caía fuera de las
+    tres zonas y no hacía nada. Las zonas ya existentes no pueden perder
+    prioridad: el borde entre paneles sigue siendo para redimensionar."""
+    w = _widget(app, payload_variado)
+    w._dibujar_principal()
+    ax_precio, ax_osc = w._paneles[0][1], w._paneles[1][1]
+
+    assert w._zona_eje(_evento(*_punto_franja_y(ax_osc))) == 'y:1'
+    assert w._zona_eje(_evento(*_punto_franja_y(ax_precio))) == 'y'
+    b_precio, b_osc = ax_precio.get_window_extent(), ax_osc.get_window_extent()
+    borde = _evento((b_precio.x0 + b_precio.x1) / 2, (b_osc.y1 + b_precio.y0) / 2)
+    assert w._zona_eje(borde) == 'resize_panel:0'
+
+
+def test_arrastrar_el_eje_y_de_un_panel_solo_le_afecta_a_el(app, payload_variado):
+    w = _widget(app, payload_variado)
+    w._dibujar_principal()
+    kind, ax_osc = w._paneles[1]
+    ylim_osc0, ylim_precio0 = ax_osc.get_ylim(), w._ax_principal.get_ylim()
+
+    x, y = _punto_franja_y(ax_osc)
+    w._on_press_ejes(_evento(x, y))
+    assert w._drag_modo == 'y:1'
+    w._on_motion_ejes(_evento(x, y + 60))
+    w._on_release_ejes(_evento(x, y + 60))
+
+    assert ax_osc.get_ylim() != ylim_osc0
+    assert w._ax_principal.get_ylim() == ylim_precio0, "el precio no se toca"
+    assert w._ylim_paneles[kind] == pytest.approx(ax_osc.get_ylim())
+
+
+def test_la_escala_del_panel_sobrevive_a_apagarlo_y_reencenderlo(app, payload_variado):
+    """_ylim_paneles va indexado por TIPO, igual que _pesos_paneles: si fuera
+    por posición se perdería en cuanto cambie el número de paneles."""
+    w = _widget(app, payload_variado)
+    w._dibujar_principal()
+    w._ylim_paneles['rsi'] = (20.0, 80.0)
+
+    w._dibujar_principal()
+    ax_rsi = dict(w._paneles)['rsi']
+    assert ax_rsi.get_ylim() == pytest.approx((20.0, 80.0))
+
+    w._capas_estado['panel:rsi'] = False
+    w._dibujar_principal()
+    w._capas_estado['panel:rsi'] = True
+    w._dibujar_principal()
+    assert dict(w._paneles)['rsi'].get_ylim() == pytest.approx((20.0, 80.0))
+
+
+def test_doble_clic_en_la_franja_y_devuelve_la_escala_natural(app, payload_variado):
+    w = _widget(app, payload_variado)
+    w._dibujar_principal()
+    w._ylim_paneles['rsi'] = (20.0, 80.0)
+    w._dibujar_principal()
+
+    ax_rsi = dict(w._paneles)['rsi']
+    idx = [k for k, _ax in w._paneles].index('rsi')
+    x, y = _punto_franja_y(ax_rsi)
+    assert w._zona_eje(_evento(x, y)) == f'y:{idx}'
+    w._on_press_ejes(_evento(x, y, dblclick=True))
+
+    assert 'rsi' not in w._ylim_paneles
+    assert dict(w._paneles)['rsi'].get_ylim() == pytest.approx((0.0, 100.0))
 
 
 def test_conmutar_una_capa_no_mueve_el_encuadre(app, payload_variado):

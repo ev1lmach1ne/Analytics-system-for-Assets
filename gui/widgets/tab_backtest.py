@@ -50,10 +50,11 @@ from PyQt6.QtWidgets import (
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
-from matplotlib.dates import date2num, num2date
+from matplotlib.dates import date2num
 import matplotlib.dates as mdates
 from matplotlib.collections import PolyCollection, LineCollection
 from matplotlib.patches import FancyArrowPatch
+from matplotlib.ticker import MaxNLocator
 
 from core.config import (
     LIMPIADOS_DIR, SISTEMAS_DIR, FAVORITOS_DIR, TF_PATTERN, tf_to_minutes,
@@ -82,13 +83,22 @@ from core.strategies import (
     _sar_serie, donchian, _zigzag_pivotes, _ZIGZAG_DESVIACION_REGLA,
     _entrada_por_defecto, NIVELES_FIB, tramos_zigzag_vigentes,
     preparar_eventos_noticias,
+    _er_serie, _hurst_serie, ventana_regimen_defecto,
+    METODOS_REGIMEN_ER, METODOS_REGIMEN_HURST,
+    UMBRAL_ER_TENDENCIA, UMBRAL_ER_RUIDO,
+    UMBRAL_HURST_TENDENCIA, UMBRAL_HURST_REVERSION,
+    VENTANA_ER_DEFECTO, VENTANA_HURST_DEFECTO, VENTANA_HURST_MINIMA,
 )
 from core.candle_patterns import detectar_patrones
 from core.data_providers import economic_calendar
 from gui.widgets.file_explorer import FileExplorer
 from gui.widgets.tf_common import TF_LABELS, parsear_tf_custom, regla_de_tf
 from gui.widgets.lwc_chart import LwcChart, WEBENGINE_OK
-from gui.widgets.plot_common import icono_ayuda as _icono_ayuda_popup
+from gui.widgets.plot_common import (
+    icono_ayuda as _icono_ayuda_popup,
+    icono_ayuda_texto as _icono_ayuda_texto,
+    eje_fechas_ordinal,
+)
 
 FIG_BG = '#0d1424'
 AX_FG = '#c8d6e5'
@@ -147,11 +157,26 @@ LEFT_PANEL, RIGHT_PANEL = 0.035, 0.95
 TOP_PANEL, BOTTOM_STACK = 0.94, 0.075
 GAP_PANEL = 0.018
 ETIQUETA_PANEL = {'precio': 'Precio', 'rsi': 'RSI', 'atr': 'ATR',
-                  'stoch': 'Estocástico', 'williams': 'Williams %R', 'cci': 'CCI'}
+                  'stoch': 'Estocástico', 'williams': 'Williams %R', 'cci': 'CCI',
+                  'er': 'Régimen ER', 'hurst': 'Régimen Hurst'}
 # primer color de la paleta de cada panel: es el que representa al oscilador en
 # el cuadradito del panel de capas
-COLOR_PANEL_OSC = {'rsi': '#f1c40f', 'atr': '#2ecc71', 'stoch': '#26c6da',
-                   'williams': '#ec407a', 'cci': '#5c6bc0'}
+COLOR_PANEL_OSC = {'rsi': '#ffffff', 'atr': '#2ecc71', 'stoch': '#26c6da',
+                   'williams': '#ec407a', 'cci': '#5c6bc0',
+                   'er': '#ff9800', 'hurst': '#ab47bc'}
+# (kind, clave en _recolectar_indicadores) de cada panel apilado bajo el precio,
+# en el orden en que se apilan. Un solo sitio: lo recorren el dibujo y el
+# catálogo de capas.
+PANELES_OSCILADOR = (('rsi', 'rsis'), ('atr', 'atrs'), ('stoch', 'stochs'),
+                     ('williams', 'williams'), ('cci', 'ccis'),
+                     ('er', 'ers'), ('hurst', 'hursts'))
+# banda que el filtro ADMITE en cada método, para sombrearla en su panel
+BANDA_REGIMEN = {
+    'er_tendencia': (UMBRAL_ER_TENDENCIA, 1.0),
+    'er_rango': (0.0, UMBRAL_ER_RUIDO),
+    'hurst_tendencia': (UMBRAL_HURST_TENDENCIA, 1.0),
+    'hurst_reversion': (0.0, UMBRAL_HURST_REVERSION),
+}
 
 MODOS_WFA = [
     'Retorno %',
@@ -355,6 +380,36 @@ def _fmt(v, dec=2, sufijo=''):
     if v == float('inf'):
         return '∞'
     return f"{v:.{dec}f}{sufijo}"
+
+
+def _marcar_niveles_eje(ax, niveles):
+    """Escribe en el eje Y de un panel EXACTAMENTE los valores que significan
+    algo (70/50/30 del RSI, umbrales del ER...), cada etiqueta del color de su
+    línea horizontal.
+
+    El repartidor automático de matplotlib elige múltiplos redondos — en el RSI,
+    0-20-40-60-80-100 — así que justo los números que definen el indicador eran
+    los únicos que no se leían: había que estimar a ojo dónde caía la línea de
+    puntos de sobrecompra.
+
+    Devuelve False (y no toca el eje) si no hay niveles que marcar o si son
+    demasiados para un panel de ~90 px; en ese caso el llamador deja el
+    localizador automático, que siempre da alguna referencia de escala.
+    """
+    MAX_MARCAS = 6
+    if not niveles:
+        return False
+    por_valor = {}
+    for valor, color in niveles:
+        por_valor.setdefault(float(valor), color)
+    if len(por_valor) > MAX_MARCAS:
+        return False
+    valores = sorted(por_valor)
+    ax.set_yticks(valores)
+    ax.set_yticklabels([f'{v:g}' for v in valores])
+    for valor, etiqueta in zip(valores, ax.get_yticklabels()):
+        etiqueta.set_color(por_valor[valor])
+    return True
 
 
 def _decimar_ohlc(x, o, h, l, c, x0, x1, max_velas=2500):
@@ -648,6 +703,10 @@ class _BacktestThread(QThread):
                 'setups': self._setups,
                 'tf': self._tf_label,
                 'eventos_noticias': df_eventos,
+                # filtros pedidos que no se pudieron aplicar (ver
+                # _mascara_filtros_setup): sin esto, un backtest sin filtrar
+                # es indistinguible de uno filtrado
+                'avisos': senales.get('avisos') or [],
             })
         except Exception as e:
             import traceback
@@ -679,6 +738,13 @@ class _OptimizerThread(QThread):
 
     def run(self):
         try:
+            # Progreso 0/N ya durante la carga del CSV (antes del bucle),
+            # para que la UI no quede en "cargando" sin barra.
+            sweep_prev = dict(self._sweep_params)
+            sweep_prev.update(
+                {PREFIJO_RIESGO + k: v for k, v in self._sweep_riesgo.items()})
+            total_prev = n_combinaciones(sweep_prev) if sweep_prev else 1
+            self.progreso.emit(0, total_prev)
             df = _cargar_ohlc(self._csv, self._regla_resample)
             n = len(df)
             if n < 50:
@@ -716,18 +782,13 @@ class _OptimizerThread(QThread):
 
 # ══════════════ ayuda contextual (icono "?" por sección) ══════════════
 def _icono_ayuda(tooltip):
-    """QLabel «?» en forma de badge, con `tooltip` al pasar el ratón — el
-    icono de ayuda reutilizado en cada título de sección de Constructor y
-    Resultados."""
-    icono = QLabel("?")
-    icono.setFixedSize(16, 16)
-    icono.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    icono.setStyleSheet(
-        "QLabel { background-color: #253a60; color: #8fb3d9; "
-        "border-radius: 8px; font-size: 10px; font-weight: bold; }")
-    icono.setToolTip(tooltip)
-    icono.setCursor(Qt.CursorShape.WhatsThisCursor)
-    return icono
+    """Badge «?» de cada título de sección de Constructor y Resultados.
+
+    Responde a las DOS cosas: tooltip al pasar el ratón y popup con el mismo
+    texto al hacer clic. Antes solo llevaba tooltip, y como es idéntico a los
+    iconos de Análisis y de los gráficos —que sí abren un panel al clicarlos—,
+    clicar uno del Backtester no hacía nada y se leía como un icono roto."""
+    return _icono_ayuda_texto(tooltip)
 
 
 def _fila_ayuda(tooltip):
@@ -2309,11 +2370,19 @@ class OptimizadorWidget(QWidget):
         self.cmb_regimen.currentTextChanged.connect(self._on_regimen_changed)
         f_filtros.addRow("Régimen:", self.cmb_regimen)
         self.sp_regimen_periodo = QSpinBox()
-        self.sp_regimen_periodo.setRange(10, 5000)
-        self.sp_regimen_periodo.setValue(100)
+        self.sp_regimen_periodo.setRange(5, 5000)
+        self.sp_regimen_periodo.setValue(VENTANA_ER_DEFECTO)
         self.sp_regimen_periodo.setToolTip(
-            "Ventana rodante del ER/Hurst usada para clasificar el régimen "
-            "de la vela (mismos umbrales fijos que la pestaña Patrones)")
+            "Ventana rodante con la que se calcula el ER o el Hurst de cada "
+            "vela.\n"
+            f"· ER: {VENTANA_ER_DEFECTO} (Kaufman). Con ventanas largas el ER "
+            "decae y casi\n"
+            f"  ninguna vela llega a {UMBRAL_ER_TENDENCIA}, así que el filtro "
+            "de tendencia bloquea todo.\n"
+            f"· Hurst: {VENTANA_HURST_DEFECTO}, y nunca por debajo de "
+            f"{VENTANA_HURST_MINIMA} — con menos, el estimador\n"
+            f"  supera {UMBRAL_HURST_TENDENCIA} incluso sobre ruido puro y el "
+            "régimen que marca no es fiable.")
         self.sp_regimen_periodo.valueChanged.connect(self._guardar_setup_actual)
         f_filtros.addRow("Periodo (ventana):", self.sp_regimen_periodo)
 
@@ -2926,7 +2995,10 @@ class OptimizadorWidget(QWidget):
             self._actualizar_dias_checkboxes()
             self.cmb_regimen.setCurrentText(
                 _MAPA_REGIMEN_INV.get(filtros.get('regimen', {}).get('metodo', 'ninguno'), 'Ninguno'))
-            self.sp_regimen_periodo.setValue(filtros.get('regimen', {}).get('periodo', 100))
+            _reg_guardado = filtros.get('regimen', {}) or {}
+            self.sp_regimen_periodo.setValue(
+                _reg_guardado.get('periodo')
+                or ventana_regimen_defecto(_reg_guardado.get('metodo', 'ninguno')))
             volatilidad = filtros.get('volatilidad') or {}
             self.cmb_volatilidad.setCurrentText(
                 _MAPA_VOLATILIDAD_INV.get(volatilidad.get('metodo', 'ninguno'), 'Ninguna'))
@@ -3182,9 +3254,27 @@ class OptimizadorWidget(QWidget):
         self.chk_noticias_cerrar.setEnabled(activo)
 
     @_no_crash
-    def _on_regimen_changed(self, _texto):
+    def _on_regimen_changed(self, texto):
+        self._proponer_ventana_regimen(texto)
         self._actualizar_visibilidad_filtros()
         self._guardar_setup_actual()
+
+    def _proponer_ventana_regimen(self, texto):
+        """Al cambiar de método, llevar la ventana al valor de fábrica de ESE
+        método: ER y Hurst no comparten escala (10 vs 400) y dejar la del otro
+        deja el filtro inservible sin que se note.
+
+        Solo se propone si la ventana actual sigue siendo un valor de fábrica —
+        un número escrito a mano no se pisa nunca."""
+        metodo = _MAPA_REGIMEN.get(texto, 'ninguno')
+        if metodo == 'ninguno':
+            return
+        actual = self.sp_regimen_periodo.value()
+        if actual not in (VENTANA_ER_DEFECTO, VENTANA_HURST_DEFECTO):
+            return
+        nueva = ventana_regimen_defecto(metodo)
+        if nueva != actual:
+            self.sp_regimen_periodo.setValue(nueva)
 
     def _bloquear_entrada_limite(self):
         """Deja la entrada por orden límite a la vista pero en gris y sin poder
@@ -5571,6 +5661,11 @@ class ResultadosWidget(QWidget):
         self._timer_graficos.setInterval(0)
         self._timer_graficos.timeout.connect(self._pintar_graficos)
 
+        # eje X del gráfico principal: índice de vela (_x_full) + su traducción
+        # a fecha (_ts_full), ambos poblados en _dibujar_principal
+        self._x_full = None
+        self._ts_full = None
+
         # estado de trades (poblado en _dibujar_principal) para recortar
         # compra/venta/trayecto/cajas de salida al rango visible en cada frame
         self._tr = None
@@ -5619,6 +5714,11 @@ class ResultadosWidget(QWidget):
         self._paneles = []
         self._pesos_paneles = {}
         self._pesos_paneles_prev = {}
+        # escala vertical que el usuario haya estirado a mano en cada panel,
+        # {kind: (lo, hi)}. Indexado por TIPO igual que _pesos_paneles: así
+        # sobrevive a apagar y reencender el panel y a los redibujados
+        # completos, en vez de perderse con la posición.
+        self._ylim_paneles = {}
 
         # capas del gráfico (ver _catalogo_capas): {clave: visible}. Persiste
         # entre redibujados y entre backtests — una clave lleva sus parámetros
@@ -5633,6 +5733,14 @@ class ResultadosWidget(QWidget):
         self._scroll_timer = QTimer(self)
         self._scroll_timer.setSingleShot(True)
         self._scroll_timer.timeout.connect(self._finalizar_blit)
+        # coalescencia de frames de arrastre: el ratón manda eventos más
+        # deprisa de lo que se rasteriza un frame, así que se pinta uno solo
+        # por vuelta del bucle de eventos (ver _solicitar_frame_blit)
+        self._ax_frame_pendiente = None
+        self._timer_frame = QTimer(self)
+        self._timer_frame.setSingleShot(True)
+        self._timer_frame.setInterval(0)
+        self._timer_frame.timeout.connect(self._pintar_frame_pendiente)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -5657,6 +5765,16 @@ class ResultadosWidget(QWidget):
         self.btn_favorito.clicked.connect(self._guardar_favorito)
         fila_titulo.addWidget(self.btn_favorito)
         root.addLayout(fila_titulo)
+        # avisos del motor (filtros pedidos que no se pudieron aplicar). Va
+        # fuera del scroll y pegado al título: si se pierde de vista, el
+        # backtest se lee como si el filtro hubiera actuado.
+        self.lbl_avisos = QLabel("")
+        self.lbl_avisos.setWordWrap(True)
+        self.lbl_avisos.setVisible(False)
+        self.lbl_avisos.setStyleSheet(
+            "background-color: #2a2010; color: #ffb74d; border: 1px solid #5a4520;"
+            " border-radius: 4px; padding: 6px; font-size: 11px;")
+        root.addWidget(self.lbl_avisos)
         root.addLayout(self._construir_fila_direccion())
         root.addWidget(scroll)
 
@@ -5751,11 +5869,26 @@ class ResultadosWidget(QWidget):
         self._drag_modo = None
         self._drag_inicio = None
         self._drag_lim0 = None
+        # cruceta de hover: artistas (recreados en cada _dibujar_principal) y
+        # su bitmap de fondo, con el flag que evita capturarlo a media captura
+        # del fondo de arrastre (ver _capturar_fondo_hover)
+        self._art_cruceta = []
+        self._cruceta_v = []
+        self._cruceta_h = []
+        self._cruceta_lbl_y = []
+        self._cruceta_lbl_x = None
+        self._bg_hover = None
+        self._hover_pintado = False
+        self._capturando_fondo_drag = False
+        self._patron_fecha = '%Y-%m-%d'
         self.canvas.mpl_connect('button_press_event', self._on_press_ejes)
         self.canvas.mpl_connect('motion_notify_event', self._on_motion_ejes)
         self.canvas.mpl_connect('button_release_event', self._on_release_ejes)
         self.canvas.mpl_connect('scroll_event', self._on_scroll)
         self.canvas.mpl_connect('resize_event', self._on_resize_canvas)
+        self.canvas.mpl_connect('draw_event', self._capturar_fondo_hover)
+        self.canvas.mpl_connect('figure_leave_event',
+                                lambda _e: self._ocultar_cruceta())
 
         # leyenda interactiva flotando sobre el gráfico (ver PanelCapas): hija
         # del canvas, así que se reposiciona con el eventFilter de abajo
@@ -6214,6 +6347,14 @@ class ResultadosWidget(QWidget):
                          payload['metricas']['Total'].get('retorno_pct'))
         self._dibujar_mfe_mae(payload)
 
+    def _mostrar_avisos(self, avisos):
+        """Banda ámbar sobre el gráfico con los filtros que se pidieron y no se
+        pudieron aplicar. Sin esto, un backtest que ha corrido SIN el filtro de
+        régimen se lee exactamente igual que uno filtrado."""
+        self.lbl_avisos.setVisible(bool(avisos))
+        if avisos:
+            self.lbl_avisos.setText('⚠  ' + '\n⚠  '.join(avisos))
+
     # ── render principal ──
     @_no_crash
     def mostrar(self, payload):
@@ -6244,6 +6385,7 @@ class ResultadosWidget(QWidget):
             f"{estrategia}{detalle_periodo}")
         self.btn_favorito.setEnabled(True)
         self.btn_favorito.setText("⭐ Guardar como favorito")
+        self._mostrar_avisos(payload.get('avisos') or [])
 
         # selector de dirección: el modo elegido se conserva entre ejecuciones
         # (quien está analizando los cortos de un sistema no quiere que se
@@ -6410,14 +6552,18 @@ class ResultadosWidget(QWidget):
 
         # osciladores: cada uno vive en su propio panel bajo el precio, así que
         # apagarlo no quita una línea sino el panel entero
-        for kind, clave_ind in (('rsi', 'rsis'), ('atr', 'atrs'), ('stoch', 'stochs'),
-                                ('williams', 'williams'), ('cci', 'ccis')):
-            if ind[clave_ind]:
+        for kind, clave_ind in PANELES_OSCILADOR:
+            if ind.get(clave_ind):
+                ayuda = ('Se dibuja en su propio panel bajo el precio; al '
+                         'apagarlo el panel desaparece.')
+                if kind in ('er', 'hurst'):
+                    ayuda = ('La serie que usa el filtro de régimen de este '
+                             'setup, con sus umbrales y la banda que admite '
+                             'sombreada: las entradas deben caer dentro.')
                 capas.append({'clave': f'panel:{kind}',
                               'etiqueta': ETIQUETA_PANEL[kind],
                               'color': COLOR_PANEL_OSC[kind], 'grupo': 'panel',
-                              'ayuda': 'Se dibuja en su propio panel bajo el '
-                                       'precio; al apagarlo el panel desaparece.'})
+                              'ayuda': ayuda})
         return capas
 
     def _capa_activa(self, clave):
@@ -6465,8 +6611,9 @@ class ResultadosWidget(QWidget):
         """
         xlim = ylim = None
         if getattr(self, '_ax_principal', None) is not None:
-            a, b = self._ax_principal.get_xlim()
-            xlim = (pd.Timestamp(num2date(a)), pd.Timestamp(num2date(b)))
+            # el eje ya está en índice de vela: se reenvía tal cual, sin pasar
+            # por fechas (ver _dibujar_principal)
+            xlim = self._ax_principal.get_xlim()
             if self._y_manual:
                 ylim = self._ax_principal.get_ylim()
         self._dibujar_principal(xlim=xlim, ylim=ylim)
@@ -6500,10 +6647,19 @@ class ResultadosWidget(QWidget):
         xt = self._x_full[idx_full]
         return (xt >= x0) & (xt <= x1)
 
-    def _redibujar_datos(self, ax):
-        """Redibuja solo las velas/línea, decimadas al rango visible de
-        `ax` — se llama tanto en el dibujo inicial como en cada zoom/pan
-        (callback 'xlim_changed'), sin tocar sombreado/flechas/leyenda/slider."""
+    def _max_velas_visibles(self):
+        """Tope de velas a dibujar, atado al ancho REAL del lienzo.
+
+        Dibujar más velas que píxeles no enseña nada: con menos de ~3 px por
+        vela el cuerpo no llega ni a un píxel y el gráfico se ve como una
+        mancha, pero cuesta el rasterizado completo igual. Medido en un canvas
+        de 900 px: 1200 velas = 22 ms/frame, 400 velas = 8 ms/frame con el
+        mismo resultado en pantalla. El suelo de 120 evita quedarse sin
+        detalle en un canvas diminuto."""
+        ancho_px = self.canvas.get_width_height()[0] or 900
+        return max(120, min(2500, int(ancho_px / 3)))
+
+    def _descartar_artistas_datos(self):
         for art in self._art_datos:
             try:
                 art.remove()
@@ -6511,39 +6667,75 @@ class ResultadosWidget(QWidget):
                 pass
         self._art_datos = []
 
+    def _crear_artistas_datos(self, ax, segs, verts, colores, xb, cb):
+        """Crea los artistas de la serie. Solo la primera vez tras un dibujo
+        completo: a partir de ahí cada pan/zoom los MUTA (ver
+        _redibujar_datos), que es entre 5 y 6 veces más barato."""
+        self._descartar_artistas_datos()
+        if self._modo_grafico == 'velas':
+            # mechas y cuerpos como DOS colecciones y no un artista por vela:
+            # ax.bar crea un Rectangle individual y actualiza los límites de
+            # datos en cada add_patch, el cuello de botella real con miles de
+            # barras (~1,2 s en add_patch/_update_patch_limits para 2500).
+            #
+            # autolim=False: los dos ejes se fijan a mano aquí abajo y en
+            # _dibujar_principal, así que recalcular dataLim en cada frame de
+            # arrastre solo sería trabajo tirado.
+            mechas = LineCollection(segs, colors=colores, linewidths=0.6)
+            cuerpos = PolyCollection(verts, facecolors=colores,
+                                     edgecolors=colores, linewidths=0)
+            ax.add_collection(mechas, autolim=False)
+            ax.add_collection(cuerpos, autolim=False)
+            self._art_datos = [mechas, cuerpos]
+        else:
+            linea, = ax.plot(xb, cb, color=AX_FG, linewidth=0.8)
+            self._art_datos = [linea]
+
+    def _redibujar_datos(self, ax):
+        """Redibuja solo las velas/línea, decimadas al rango visible de
+        `ax` — se llama tanto en el dibujo inicial como en cada zoom/pan
+        (callback 'xlim_changed'), sin tocar sombreado/flechas/leyenda/slider.
+
+        Los artistas se reutilizan mutándolos in-place mientras siga en pie el
+        mismo dibujo: crear y destruir un PolyCollection por frame costaba unos
+        19 ms de los ~50 que tardaba un frame de arrastre."""
         x0, x1 = ax.get_xlim()
         xb, ob, hb, lb, cb = _decimar_ohlc(
             self._x_full, self._o_full, self._h_full, self._l_full, self._c_full,
-            x0, x1)
+            x0, x1, max_velas=self._max_velas_visibles())
         if len(xb) == 0:
+            self._descartar_artistas_datos()
             return
 
         if self._modo_grafico == 'velas':
             colores = np.where(cb >= ob, VERDE, ROJO)
             ancho = np.median(np.diff(xb)) * 0.7 if len(xb) > 1 else 0.7
-            col_vlines = ax.vlines(xb, lb, hb, color=colores, linewidth=0.6)
-            # cuerpos como UN solo PolyCollection (no ax.bar): ax.bar crea un
-            # Rectangle individual por vela y actualiza los límites de datos
-            # en cada add_patch, lo que con miles de velas es el cuello de
-            # botella real del redibujado (medido con cProfile: ~1.2s en
-            # add_patch/_update_patch_limits para 2500 barras)
             half = ancho / 2.0
             yb = np.minimum(ob, cb)
             yt = np.maximum(ob, cb)
+            segs = np.stack([np.column_stack([xb, lb]),
+                             np.column_stack([xb, hb])], axis=1)
             verts = np.stack([
                 np.column_stack([xb - half, yb]),
                 np.column_stack([xb + half, yb]),
                 np.column_stack([xb + half, yt]),
                 np.column_stack([xb - half, yt]),
             ], axis=1)
-            cuerpos = PolyCollection(verts, facecolors=colores, edgecolors=colores,
-                                     linewidths=0)
-            ax.add_collection(cuerpos)
-            self._art_datos = [col_vlines, cuerpos]
+            if len(self._art_datos) == 2:
+                mechas, cuerpos = self._art_datos
+                mechas.set_segments(segs)
+                mechas.set_color(colores)
+                cuerpos.set_verts(verts)
+                cuerpos.set_facecolor(colores)
+                cuerpos.set_edgecolor(colores)
+            else:
+                self._crear_artistas_datos(ax, segs, verts, colores, xb, cb)
             y_lo, y_hi = float(np.min(lb)), float(np.max(hb))
         else:
-            line, = ax.plot(xb, cb, color=AX_FG, linewidth=0.8)
-            self._art_datos = [line]
+            if len(self._art_datos) == 1:
+                self._art_datos[0].set_data(xb, cb)
+            else:
+                self._crear_artistas_datos(ax, None, None, None, xb, cb)
             y_lo, y_hi = float(np.min(cb)), float(np.max(cb))
 
         if not self._y_manual:
@@ -6670,6 +6862,17 @@ class ResultadosWidget(QWidget):
             return 'pan'
         if bbox.y0 <= event.y <= bbox.y1 and event.x > bbox.x1:
             return 'y'
+        # interior y franja de etiquetas del eje Y de un panel de oscilador:
+        # mismo criterio que el 'pan'/'y' del precio, pero contra el bbox de
+        # ese panel. Van después del precio y de resize_panel, que tienen
+        # prioridad. Las dos zonas son excluyentes: 'y:' exige estar A LA
+        # DERECHA del panel y 'pan:' exige estar DENTRO.
+        for i, (_kind, ax_panel) in enumerate(paneles[1:], start=1):
+            b = ax_panel.get_window_extent()
+            if b.y0 <= event.y <= b.y1 and event.x > b.x1:
+                return f'y:{i}'
+            if b.x0 <= event.x <= b.x1 and b.y0 <= event.y <= b.y1:
+                return f'pan:{i}'
         ultimo = paneles[-1][1]
         bbox_ult = ultimo.get_window_extent()
         if bbox.x0 <= event.x <= bbox.x1 and 0 < event.y < bbox_ult.y0:
@@ -6681,6 +6884,9 @@ class ResultadosWidget(QWidget):
         zona = self._zona_eje(event)
         if zona is None:
             return
+        # empieza un gesto: la cruceta se retira (como en TradingView) para no
+        # dejar su posición congelada mientras el gráfico se mueve debajo
+        self._ocultar_cruceta(repintar=False)
         if zona.startswith('resize_panel:'):
             idx = int(zona.split(':')[1])
             if event.dblclick:
@@ -6689,6 +6895,41 @@ class ResultadosWidget(QWidget):
                 self._iniciar_arrastre_panel(idx, event)
             return
         ax = self._ax_principal
+        if zona.startswith('y:'):
+            # eje Y de un panel de oscilador: mismo gesto que el del precio,
+            # pero sobre el Axes de ese panel
+            kind, ax_panel = self._paneles[int(zona.split(':')[1])]
+            if event.dblclick:
+                # doble clic: se olvida el estirado y vuelve la escala natural
+                # de ese oscilador (0-100 en RSI, autoescala en ATR...)
+                self._ylim_paneles.pop(kind, None)
+                self._redibujar_principal_conservando_zoom()
+                return
+            # el modo se fija ANTES de capturar el fondo: _iniciar_sesion_blit
+            # lo consulta para saber que el eje Y de este panel es dinámico y
+            # no debe quedarse pegado en el bitmap
+            self._drag_modo = zona
+            self._drag_inicio = (event.x, event.y)
+            self._drag_lim0 = ax_panel.get_ylim()
+            self._iniciar_sesion_blit()
+            return
+        if zona.startswith('pan:'):
+            # interior de un panel de oscilador: arrastrar mueve el tiempo
+            # (eje X, compartido con el precio) y la escala de ESE panel
+            kind, ax_panel = self._paneles[int(zona.split(':')[1])]
+            if event.dblclick:
+                # mismo gesto que el doble clic sobre su franja de números:
+                # olvida el estirado y vuelve la escala natural del panel
+                self._ylim_paneles.pop(kind, None)
+                self._redibujar_principal_conservando_zoom()
+                return
+            # el modo, antes del blit: ver el comentario de la rama 'y:'
+            self._drag_modo = zona
+            self._drag_inicio = (event.x, event.y)
+            self._drag_lim0 = (ax.get_xlim(), ax_panel.get_ylim())
+            self._iniciar_sesion_blit()
+            self.canvas.setCursor(Qt.CursorShape.ClosedHandCursor)
+            return
         if zona == 'y' and event.dblclick:
             # doble clic sobre el eje Y: volver a autoescala de precio
             self._y_manual = False
@@ -6780,10 +7021,13 @@ class ResultadosWidget(QWidget):
             annot.set_va(va)
             annot.set_text(texto)
             annot.set_visible(True)
-            self.canvas.draw_idle()
-        elif annot.get_visible():
+        else:
             annot.set_visible(False)
-            self.canvas.draw_idle()
+        # no se pinta aquí: el repintado lo hace _actualizar_cruceta en una
+        # sola pasada de blit con la cruceta. Antes esto llamaba a draw_idle()
+        # en CADA movimiento del ratón, y un draw completo del gráfico cuesta
+        # cientos de ms con series largas — con la cruceta encima, además, los
+        # dos repintados competirían y se vería parpadear.
 
     @_no_crash
     def _on_motion_ejes(self, event):
@@ -6792,14 +7036,23 @@ class ResultadosWidget(QWidget):
             return
         if self._drag_modo is None:
             zona = self._zona_eje(event)
-            if zona is not None and zona.startswith('resize_panel'):
-                self.canvas.setCursor(Qt.CursorShape.SizeVerCursor)
-                return
-            cursores = {'y': Qt.CursorShape.SizeVerCursor,
-                        'x': Qt.CursorShape.SizeHorCursor,
-                        'pan': Qt.CursorShape.OpenHandCursor}
-            self.canvas.setCursor(cursores.get(zona, Qt.CursorShape.ArrowCursor))
+            if zona is not None and (zona.startswith('resize_panel')
+                                     or zona.startswith('y:')):
+                cursor = Qt.CursorShape.SizeVerCursor
+            elif zona is not None and zona.startswith('pan:'):
+                # interior de un panel de oscilador: se arrastra igual que el
+                # precio, así que la mano abierta lo anuncia igual
+                cursor = Qt.CursorShape.OpenHandCursor
+            else:
+                cursores = {'y': Qt.CursorShape.SizeVerCursor,
+                            'x': Qt.CursorShape.SizeHorCursor,
+                            'pan': Qt.CursorShape.OpenHandCursor}
+                cursor = cursores.get(zona, Qt.CursorShape.ArrowCursor)
+            self.canvas.setCursor(cursor)
+            # ambos son capa de hover y comparten pasada de blit: el tooltip
+            # solo decide su visibilidad, y la cruceta pinta los dos
             self._actualizar_tooltip_trade(event, ax, zona)
+            self._actualizar_cruceta(event, zona)
             return
         if event.x is None or event.y is None:
             return
@@ -6818,22 +7071,50 @@ class ResultadosWidget(QWidget):
             ax.set_ylim(ylim0[0] - dyd, ylim0[1] - dyd)
             ax.set_xlim(xlim0[0] - dxd, xlim0[1] - dxd)  # dispara xlim_changed
             self._sync_dateedits(*ax.get_xlim())
-            self._pintar_frame_blit(ax)
+            self._solicitar_frame_blit(ax)
+            return
+        if self._drag_modo.startswith('pan:'):
+            # el eje X es el del precio (compartido: mueve todo el gráfico) y
+            # el Y es el del panel arrastrado. Son escalas distintas, así que
+            # cada desplazamiento se convierte con SU propia transData.
+            kind, ax_panel = self._paneles[int(self._drag_modo.split(':')[1])]
+            xlim0, ylim0 = self._drag_lim0
+            inv = ax.transData.inverted()
+            dxd = inv.transform((event.x, event.y))[0] - inv.transform((x0, y0))[0]
+            inv_p = ax_panel.transData.inverted()
+            dyd = inv_p.transform((event.x, event.y))[1] - inv_p.transform((x0, y0))[1]
+            nuevo_y = (ylim0[0] - dyd, ylim0[1] - dyd)
+            ax_panel.set_ylim(*nuevo_y)
+            # se recuerda como escala manual de ese TIPO de panel, igual que el
+            # estirado: si no, apagar y encender el panel lo devolvería al sitio
+            self._ylim_paneles[kind] = nuevo_y
+            ax.set_xlim(xlim0[0] - dxd, xlim0[1] - dxd)   # dispara xlim_changed
+            self._sync_dateedits(*ax.get_xlim())
+            self._solicitar_frame_blit(ax)
             return
         lo, hi = self._drag_lim0
         centro = (lo + hi) / 2.0
-        if self._drag_modo == 'y':
+        if self._drag_modo.startswith('y:'):
+            # mismo estirado que el del precio, sobre el panel arrastrado
+            kind, ax_panel = self._paneles[int(self._drag_modo.split(':')[1])]
+            factor = np.exp(-(event.y - y0) * 0.005)
+            medio = (hi - lo) / 2.0 * factor
+            nuevo = (centro - medio, centro + medio)
+            ax_panel.set_ylim(*nuevo)
+            self._ylim_paneles[kind] = nuevo
+            self._solicitar_frame_blit(ax)
+        elif self._drag_modo == 'y':
             factor = np.exp(-(event.y - y0) * 0.005)
             medio = (hi - lo) / 2.0 * factor
             self._y_manual = True
             ax.set_ylim(centro - medio, centro + medio)
-            self._pintar_frame_blit(ax)
+            self._solicitar_frame_blit(ax)
         else:
             factor = np.exp(-(event.x - x0) * 0.005)
             medio = (hi - lo) / 2.0 * factor
             ax.set_xlim(centro - medio, centro + medio)  # dispara xlim_changed
             self._sync_dateedits(*ax.get_xlim())
-            self._pintar_frame_blit(ax)
+            self._solicitar_frame_blit(ax)
 
     @_no_crash
     def _on_release_ejes(self, event):
@@ -6860,8 +7141,164 @@ class ResultadosWidget(QWidget):
         factor = 0.85 if subir else 1.0 / 0.85
         ax.set_xlim(ancla + (lo - ancla) * factor, ancla + (hi - ancla) * factor)
         self._sync_dateedits(*ax.get_xlim())
-        self._pintar_frame_blit(ax)
+        self._solicitar_frame_blit(ax)
         self._scroll_timer.start(180)
+
+    # ── cruceta de hover (estilo TradingView) ──
+    #
+    # Capa aparte de la de pan/zoom: aquella repinta velas y trades en cada
+    # frame de arrastre, esta solo cuatro artistas mientras el ratón se pasea
+    # con el gráfico quieto. Comparten canvas pero nunca están activas a la
+    # vez (la cruceta se esconde en cuanto empieza un arrastre), así que cada
+    # una cachea su propio fondo.
+    #
+    # Todos los artistas van con animated=True: canvas.draw() los OMITE, y así
+    # el fondo cacheado nunca sale con una cruceta vieja horneada dentro, que
+    # es el fallo clásico de este patrón (se ve como un rastro fantasma que no
+    # se borra hasta el siguiente redibujado completo).
+    def _crear_cruceta(self):
+        """Crea los artistas de la cruceta sobre los paneles ya posicionados.
+        Se llama desde _dibujar_principal en cada dibujo completo porque
+        fig.clear() destruye los Axes que los contienen."""
+        self._art_cruceta = []
+        self._cruceta_v = []       # línea vertical: una por panel, se ven todas
+        self._cruceta_h = []       # horizontal: solo la del panel bajo el ratón
+        self._cruceta_lbl_y = []   # etiqueta de precio/valor, idem
+        self._cruceta_lbl_x = None
+        if not self._paneles:
+            return
+        for _kind, axx in self._paneles:
+            v = axx.axvline(0, color=AX_FG, linewidth=0.7, alpha=0.55,
+                            linestyle=(0, (4, 3)), zorder=95,
+                            visible=False, animated=True)
+            h = axx.axhline(0, color=AX_FG, linewidth=0.7, alpha=0.55,
+                            linestyle=(0, (4, 3)), zorder=95,
+                            visible=False, animated=True)
+            # la franja de números está a la derecha en todos los paneles
+            # (yaxis.tick_right), así que la etiqueta sale por x=1 en fracción
+            # de ejes y sigue al ratón en Y en coordenadas de datos
+            lbl_y = axx.annotate(
+                "", xy=(1, 0), xycoords=('axes fraction', 'data'),
+                xytext=(5, 0), textcoords='offset points',
+                ha='left', va='center', fontsize=6.5, color=FIG_BG,
+                bbox=dict(boxstyle='round,pad=0.25', fc=AX_FG, ec=AX_FG),
+                zorder=102, annotation_clip=False, visible=False,
+                animated=True)
+            self._cruceta_v.append(v)
+            self._cruceta_h.append(h)
+            self._cruceta_lbl_y.append(lbl_y)
+            self._art_cruceta += [v, h, lbl_y]
+        # la fecha va una sola vez, bajo el último panel: es el único con las
+        # etiquetas del eje X visibles (ver _aplicar_pesos_paneles)
+        ax_ultimo = self._paneles[-1][1]
+        self._cruceta_lbl_x = ax_ultimo.annotate(
+            "", xy=(0, 0), xycoords=('data', 'axes fraction'),
+            xytext=(0, -5), textcoords='offset points',
+            ha='center', va='top', fontsize=6.5, color=FIG_BG,
+            bbox=dict(boxstyle='round,pad=0.25', fc=AX_FG, ec=AX_FG),
+            zorder=102, annotation_clip=False, visible=False, animated=True)
+        self._art_cruceta.append(self._cruceta_lbl_x)
+
+    def _artistas_hover(self):
+        """Capa de hover completa: cruceta + tooltip de operación."""
+        arts = list(getattr(self, '_art_cruceta', ()))
+        annot = getattr(self, '_annot_trade', None)
+        if annot is not None:
+            arts.append(annot)
+        return arts
+
+    def _capturar_fondo_hover(self, _event=None):
+        """Cachea el lienzo tras CUALQUIER draw() completo (primer pintado,
+        resize, fin de un arrastre, cambio de capa...), que es justo cuando el
+        fondo de la cruceta deja de ser válido.
+
+        Se salta la captura durante _iniciar_sesion_blit: ese draw() deja el
+        lienzo sin velas ni trades a propósito, y guardarlo aquí dejaría la
+        cruceta pintando sobre un gráfico vacío al soltar el arrastre."""
+        if self._capturando_fondo_drag:
+            return
+        # un draw() completo se lleva por delante lo que hubiera pintado el
+        # último blit de hover, así que ya no hay nada que borrar
+        self._hover_pintado = False
+        try:
+            self._bg_hover = self.canvas.copy_from_bbox(self.fig.bbox)
+        except Exception:
+            self._bg_hover = None
+
+    def _pintar_hover_blit(self):
+        """Restaura el fondo cacheado y repinta encima la capa de hover.
+
+        Se salta el trabajo cuando no hay nada que pintar NI nada que borrar
+        (_hover_pintado recuerda si el último frame dejó algo en pantalla): si
+        no, pasear el ratón por los márgenes del lienzo dispararía un blit por
+        cada evento de movimiento sin cambiar un solo píxel."""
+        if self._bg_hover is None:
+            return
+        arts = [a for a in self._artistas_hover()
+                if a.get_visible() and a.axes is not None]
+        if not arts and not self._hover_pintado:
+            return
+        self.canvas.restore_region(self._bg_hover)
+        for art in arts:
+            art.axes.draw_artist(art)
+        self.canvas.blit(self.fig.bbox)
+        self._hover_pintado = bool(arts)
+
+    def _ocultar_cruceta(self, repintar=True):
+        for art in getattr(self, '_art_cruceta', ()):
+            art.set_visible(False)
+        if repintar:
+            self._pintar_hover_blit()
+
+    @staticmethod
+    def _fmt_nivel(valor, rango):
+        """Decimales atados a la escala visible, no al activo: en un panel de
+        RSI sobran los decimales y en un par de divisas hacen falta cuatro."""
+        if rango >= 10:
+            dec = 2
+        elif rango >= 0.1:
+            dec = 4
+        else:
+            dec = 6
+        return f"{valor:,.{dec}f}"
+
+    def _actualizar_cruceta(self, event, zona):
+        """Coloca la cruceta sobre la vela bajo el cursor y repinta la capa de
+        hover (cruceta + tooltip de operación) en una sola pasada de blit.
+
+        La vertical se engancha al centro de la vela —trivial ahora que el eje
+        es el índice— para que la fecha de la etiqueta sea la de una vela real
+        y no un instante interpolado entre dos. La horizontal va libre, que es
+        lo que permite usarla para medir un nivel de precio a ojo."""
+        dentro = (zona is not None and (zona == 'pan' or zona.startswith('pan:'))
+                  and event is not None and event.inaxes is not None
+                  and event.xdata is not None and event.ydata is not None)
+        ts = getattr(self, '_ts_full', None)
+        if not dentro or ts is None or len(ts) == 0 or not self._cruceta_v:
+            self._ocultar_cruceta()
+            return
+        i = int(np.clip(round(event.xdata), 0, len(ts) - 1))
+        for v in self._cruceta_v:
+            v.set_xdata([i, i])
+            v.set_visible(True)
+        lo, hi = event.inaxes.get_ylim()
+        rango = abs(hi - lo)
+        for axx, h, lbl in zip((a for _k, a in self._paneles),
+                               self._cruceta_h, self._cruceta_lbl_y):
+            if axx is not event.inaxes:
+                h.set_visible(False)
+                lbl.set_visible(False)
+                continue
+            h.set_ydata([event.ydata, event.ydata])
+            h.set_visible(True)
+            lbl.xy = (1, event.ydata)
+            lbl.set_text(self._fmt_nivel(event.ydata, rango))
+            lbl.set_visible(True)
+        self._cruceta_lbl_x.xy = (i, 0)
+        self._cruceta_lbl_x.set_text(
+            ts[i].strftime(getattr(self, '_patron_fecha', '%Y-%m-%d')))
+        self._cruceta_lbl_x.set_visible(True)
+        self._pintar_hover_blit()
 
     # ── blitting: pan/zoom fluido sin re-rasterizar la figura completa ──
     def _artistas_dinamicos(self):
@@ -6892,6 +7329,23 @@ class ResultadosWidget(QWidget):
                         self._art_entrada_track, self._art_zona_riesgo)
             if a is not None]
 
+    def _yaxis_panel_arrastrado(self):
+        """Eje Y del panel de oscilador que se está estirando o desplazando
+        ahora mismo, o None. Solo ESE eje se repinta por frame: cada uno cuesta
+        ~10 ms, así que meter todos los paneles siempre saldría caro para nada.
+
+        Cubre los dos gestos que mueven la escala de un panel: 'y:<i>' (estirar
+        desde su franja de números) y 'pan:<i>' (arrastrar dentro del panel).
+        Si el eje no entra aquí se queda pegado en el bitmap de fondo y sus
+        números no acompañan a la línea durante el arrastre."""
+        modo = self._drag_modo
+        if not modo or not (modo.startswith('y:') or modo.startswith('pan:')):
+            return None
+        idx = int(modo.split(':')[1])
+        if idx >= len(self._paneles):
+            return None
+        return self._paneles[idx][1].yaxis
+
     def _iniciar_sesion_blit(self):
         """Al empezar un arrastre/scroll: cachea un bitmap de fondo SIN la
         capa dinámica (para poder repintarla encima en cada frame sin dejar
@@ -6916,18 +7370,50 @@ class ResultadosWidget(QWidget):
             # el último panel apilado es el único con etiquetas de fecha
             # visibles (los demás las ocultan, ver _aplicar_pesos_paneles)
             dinamicos.append(ultimo_ax.xaxis)
+        eje_panel = self._yaxis_panel_arrastrado()
+        if eje_panel is not None:
+            dinamicos.append(eje_panel)
         for art in dinamicos:
             art.set_visible(False)
-        self.canvas.draw()
+        # este draw() es el "despojado": que _capturar_fondo_hover no se lo
+        # quede como fondo de la cruceta
+        self._capturando_fondo_drag = True
+        try:
+            self.canvas.draw()
+        finally:
+            self._capturando_fondo_drag = False
         self._blit_bg = self.canvas.copy_from_bbox(self.fig.bbox)
         for art in dinamicos:
             art.set_visible(True)
         self._pintar_frame_blit(ax)
 
+    def _solicitar_frame_blit(self, ax):
+        """Pide un frame de arrastre, sin pintarlo en el acto.
+
+        Un ratón a 125 Hz manda un evento cada 8 ms y rasterizar un frame
+        cuesta bastante más, así que atender uno por evento deja el gráfico
+        corriendo por detrás del cursor: la sensación de "va trabado" no viene
+        solo de lo que tarda cada frame, sino de pintar frames ya caducados.
+        Con el timer a 0 ms los eventos intermedios solo mueven el xlim y se
+        pinta una vez por vuelta del bucle de Qt, siempre con la última
+        posición. Mismo patrón que _timer_graficos."""
+        self._ax_frame_pendiente = ax
+        if not self._timer_frame.isActive():
+            self._timer_frame.start()
+
+    def _pintar_frame_pendiente(self):
+        ax = self._ax_frame_pendiente
+        self._ax_frame_pendiente = None
+        if ax is not None:
+            self._pintar_frame_blit(ax)
+
     def _finalizar_blit(self):
         """Al soltar el ratón / tras el debounce de scroll: descarta el
         fondo cacheado y deja todo consistente con un draw_idle() completo
         (una sola vez, no por frame)."""
+        # un frame pendiente pintaría por blitting con el fondo ya descartado
+        self._timer_frame.stop()
+        self._ax_frame_pendiente = None
         self._blit_bg = None
         self.canvas.draw_idle()
 
@@ -6940,6 +7426,9 @@ class ResultadosWidget(QWidget):
         figura (0-1), así que no hace falta recalcularlas aquí — siguen
         siendo válidas al cambiar de tamaño."""
         self._blit_bg = None
+        # el fondo de la cruceta tiene el mismo problema de tamaño; el
+        # draw_event que sigue al resize lo vuelve a capturar
+        self._bg_hover = None
         if self._drag_modo is not None and not self._drag_modo.startswith('resize_panel:'):
             self._iniciar_sesion_blit()
 
@@ -7046,6 +7535,9 @@ class ResultadosWidget(QWidget):
         ultimo_ax = self._paneles[-1][1] if self._paneles else ax
         if ultimo_ax is not ax:
             ultimo_ax.draw_artist(ultimo_ax.xaxis)
+        eje_panel = self._yaxis_panel_arrastrado()
+        if eje_panel is not None:
+            eje_panel.axes.draw_artist(eje_panel)
         for art in dinamicos:
             # los overlays/líneas de oscilador pertenecen a su propio Axes,
             # no siempre al de precio — draw_artist solo necesita el
@@ -7065,7 +7557,25 @@ class ResultadosWidget(QWidget):
         self._tr = tr
         self._entr = p['resultado'].get('entradas')
 
-        self._x_full = date2num(ts)
+        # eje X = ÍNDICE de vela, no la fecha (ver eje_fechas_ordinal en
+        # plot_common): con date2num, los tramos sin mercado —fin de semana,
+        # festivos, cierres de sesión— ocupaban su hueco en el eje y la serie
+        # salía a peine. Además el hueco aparecía y desaparecía según el zoom,
+        # porque al alejar _decimar_ohlc agrega velas en bloques y el ancho
+        # (mediana de np.diff) crecía hasta taparlo. Con el índice, la
+        # separación entre velas es 1 en todo momento y a cualquier zoom.
+        # ts se conserva aparte: es lo que traduce índice -> fecha en las
+        # etiquetas del eje, la cruceta y los QDateEdit de rango.
+        self._ts_full = ts
+        self._x_full = np.arange(len(ts), dtype=float)
+        # nombre propio: `x` ya se usa más abajo para las X de los marcadores
+        # (_alturas_marcadores), y pisarlo dejaba los overlays con 2 puntos
+        x_idx = self._x_full
+        # patrón de la etiqueta de fecha de la cruceta: con velas de un día o
+        # más, la hora siempre sería 00:00 y solo estorba
+        paso = (ts[1] - ts[0]) if len(ts) > 1 else pd.Timedelta(0)
+        self._patron_fecha = ('%Y-%m-%d %H:%M' if paso < pd.Timedelta(days=1)
+                              else '%Y-%m-%d')
         self._o_full = p.get('open', p['close'])
         self._h_full = p.get('high', p['close'])
         self._l_full = p.get('low', p['close'])
@@ -7080,8 +7590,7 @@ class ResultadosWidget(QWidget):
         self._actualizar_panel_capas(ind, p)
         paneles_spec = []
         n_osc_disponibles = 0
-        for kind, clave in (('rsi', 'rsis'), ('atr', 'atrs'), ('stoch', 'stochs'),
-                            ('williams', 'williams'), ('cci', 'ccis')):
+        for kind, clave in PANELES_OSCILADOR:
             datos = ind[clave]
             if not datos:
                 continue
@@ -7110,12 +7619,17 @@ class ResultadosWidget(QWidget):
             bbox=dict(boxstyle="round,pad=0.4", fc=FIG_BG, ec=GRID_C, alpha=0.95),
             color=AX_FG, fontsize=7, zorder=99, annotation_clip=False)
         self._annot_trade.set_visible(False)
+        # animated: el tooltip lo pinta la capa de hover por blitting junto a la
+        # cruceta (ver _pintar_hover_blit). Marcado así, canvas.draw() lo omite
+        # y nunca queda horneado en el bitmap de fondo.
+        self._annot_trade.set_animated(True)
         for i, (kind, datos) in enumerate(paneles_spec, start=1):
             ax_osc = self.fig.add_subplot(gs[i, 0], sharex=ax)
             self._paneles.append((kind, ax_osc))
             self._art_osciladores += self._dibujar_panel_oscilador(
-                ax_osc, kind, datos, ts, y, self._h_full, self._l_full)
+                ax_osc, kind, datos, x_idx, y, self._h_full, self._l_full)
         self._aplicar_pesos_paneles()
+        self._crear_cruceta()
         # la altura se reserva por los osciladores que el sistema TIENE, no por
         # los que estén encendidos: si encogiera al apagar uno, el canvas se
         # haría más bajo y toda la pestaña se recolocaría bajo el ratón. Así el
@@ -7124,13 +7638,26 @@ class ResultadosWidget(QWidget):
 
         # sombreado IS / OOS — artistas "dinámicos baratos": se repintan en
         # cada frame de blit junto con las velas (ver _pintar_frame_blit)
-        p1 = ax.axvspan(ts[0], ts[corte - 1] if corte > 0 else ts[0],
+        p1 = ax.axvspan(0.0, corte - 1 if corte > 0 else 0.0,
                         color=AZUL, alpha=0.05)
         self._art_fijos_dinamicos = [p1]
         if corte < len(ts):
-            p2 = ax.axvspan(ts[corte], ts[-1], color=AMBAR, alpha=0.06)
-            p3 = ax.axvline(ts[corte], color=AMBAR, linewidth=0.9, linestyle='--', alpha=0.8)
+            p2 = ax.axvspan(corte, len(ts) - 1, color=AMBAR, alpha=0.06)
+            p3 = ax.axvline(corte, color=AMBAR, linewidth=0.9, linestyle='--', alpha=0.8)
             self._art_fijos_dinamicos += [p2, p3]
+
+        # Ticks contados y etiquetas cortas. Cada etiqueta se rasteriza de nuevo
+        # en CADA frame de arrastre (matplotlib no cachea el texto dibujado) y
+        # sale a ~1,4 ms la unidad: las 9 fechas largas del formateador por
+        # defecto ("07-06 12") costaban 17 ms por frame, más que las propias
+        # velas. eje_fechas_ordinal escribe "mar" y promociona el año solo en su
+        # frontera, así que además se lee mejor.
+        #
+        # Con sharex, los Axes apilados COMPARTEN el objeto Ticker del eje X, así
+        # que instalarlo aquí basta para que el panel de abajo —el único con las
+        # etiquetas visibles, ver _aplicar_pesos_paneles— las herede.
+        eje_fechas_ordinal(ax, ts, max_ticks=6)
+        ax.yaxis.set_major_locator(MaxNLocator(nbins=6))
 
         if xlim is not None:
             ax.set_xlim(*xlim)
@@ -7379,30 +7906,30 @@ class ResultadosWidget(QWidget):
             if not self._capa_activa(clave):
                 continue
             f = ema if tipo == 'EMA' else sma
-            line, = ax.plot(ts, f(y, per), color=self._color_capa(clave),
+            line, = ax.plot(x_idx, f(y, per), color=self._color_capa(clave),
                             linewidth=1.0, alpha=0.75)
             self._art_overlays_extra.append(line)
         for per, desv in sorted(bbs):
             if not self._capa_activa(f'bb:{per}:{desv:g}'):
                 continue
             media, sup, inf = bollinger(y, per, desv)
-            sup_line, = ax.plot(ts, sup, color=COLOR_BOLLINGER, linewidth=0.5, alpha=0.4)
-            inf_line, = ax.plot(ts, inf, color=COLOR_BOLLINGER, linewidth=0.5, alpha=0.4)
-            fill = ax.fill_between(ts, inf, sup, color=COLOR_BOLLINGER, alpha=0.05)
+            sup_line, = ax.plot(x_idx, sup, color=COLOR_BOLLINGER, linewidth=0.5, alpha=0.4)
+            inf_line, = ax.plot(x_idx, inf, color=COLOR_BOLLINGER, linewidth=0.5, alpha=0.4)
+            fill = ax.fill_between(x_idx, inf, sup, color=COLOR_BOLLINGER, alpha=0.05)
             self._art_overlays_extra += [sup_line, inf_line, fill]
         for per_er, rapido, lento in sorted(kamas):
             if not self._capa_activa(f'kama:{per_er}:{rapido}:{lento}'):
                 continue
             val = _kama_serie(y, per_er, rapido, lento)
-            line, = ax.plot(ts, val, color=COLOR_KAMA, linewidth=1.1, alpha=0.8)
+            line, = ax.plot(x_idx, val, color=COLOR_KAMA, linewidth=1.1, alpha=0.8)
             self._art_overlays_extra.append(line)
         for per in sorted(donchianes):
             if not self._capa_activa(f'donchian:{per}'):
                 continue
             sup, inf = donchian(p.get('high', y), p.get('low', y), per)
-            sup_line, = ax.plot(ts, sup, color=COLOR_DONCHIAN, linewidth=0.6, alpha=0.5)
-            inf_line, = ax.plot(ts, inf, color=COLOR_DONCHIAN, linewidth=0.6, alpha=0.5)
-            fill = ax.fill_between(ts, inf, sup, color=COLOR_DONCHIAN, alpha=0.04)
+            sup_line, = ax.plot(x_idx, sup, color=COLOR_DONCHIAN, linewidth=0.6, alpha=0.5)
+            inf_line, = ax.plot(x_idx, inf, color=COLOR_DONCHIAN, linewidth=0.6, alpha=0.5)
+            fill = ax.fill_between(x_idx, inf, sup, color=COLOR_DONCHIAN, alpha=0.04)
             self._art_overlays_extra += [sup_line, inf_line, fill]
         if zigzags:
             df_zz = pd.DataFrame({'high': p.get('high', y), 'low': p.get('low', y)})
@@ -7413,7 +7940,7 @@ class ResultadosWidget(QWidget):
                 # se dibuja en la vela en que OCURRIÓ el pivote, no en la de
                 # confirmación: es donde el usuario lo ve en el gráfico, aunque
                 # la estrategia solo pudiera reaccionar unas velas después
-                xs = [ts[i] for i, _conf, _pr, _tp in pivotes if i < len(ts)]
+                xs = [i for i, _conf, _pr, _tp in pivotes if i < len(ts)]
                 ys = [pr for i, _conf, pr, _tp in pivotes if i < len(ts)]
                 if not xs:
                     continue
@@ -7425,7 +7952,7 @@ class ResultadosWidget(QWidget):
                 continue
             sar_val, _tend = _sar_serie(p.get('high', y), p.get('low', y),
                                         af_i, af_p, af_m)
-            sc = ax.scatter(ts, sar_val, s=3, color=COLOR_SAR, alpha=0.75)
+            sc = ax.scatter(x_idx, sar_val, s=3, color=COLOR_SAR, alpha=0.75)
             self._art_overlays_extra.append(sc)
         if patrones_set and self._capa_activa('patrones'):
             o_all, h_all, l_all = (p.get('open', y), p.get('high', y),
@@ -7443,7 +7970,7 @@ class ResultadosWidget(QWidget):
                 if len(idx) == 0:
                     continue
                 color_pat = COLOR_PATRONES if np.mean(dirs) > 0 else ROJO
-                sc = ax.scatter(ts[idx], l_all[idx] - offset_pat,
+                sc = ax.scatter(idx, l_all[idx] - offset_pat,
                                 marker='^' if np.mean(dirs) > 0 else 'v',
                                 color=color_pat, s=8, alpha=0.7, zorder=5)
                 self._art_overlays_extra.append(sc)
@@ -7481,7 +8008,7 @@ class ResultadosWidget(QWidget):
                 origen, extremo = tramos['anterior'][i0], tramos['ultimo'][i0]
                 if not np.isfinite(origen) or not np.isfinite(extremo):
                     continue
-                x0, x1 = ts[i0], ts[i1]
+                x0, x1 = i0, i1
                 banda = ax.fill_between([x0, x1], origen, extremo,
                                         color=AMARILLO_FIB, alpha=0.05, zorder=1)
                 self._art_overlays_extra.append(banda)
@@ -7505,7 +8032,7 @@ class ResultadosWidget(QWidget):
                     continue
                 res = int(ol['resultado'][k])
                 color_o = colores_orden.get(res, GRIS)
-                linea, = ax.plot([ts[i0], ts[i1]],
+                linea, = ax.plot([i0, i1],
                                  [ol['precio'][k], ol['precio'][k]],
                                  color=color_o, linewidth=1.0, linestyle=':',
                                  alpha=0.8, zorder=4,
@@ -7526,9 +8053,32 @@ class ResultadosWidget(QWidget):
         self._ax_principal = ax
         self.canvas.draw_idle()
 
-    def _sync_dateedits(self, num_ini, num_fin):
-        d0 = num2date(num_ini)
-        d1 = num2date(num_fin)
+    def _fecha_de_indice(self, i):
+        """Índice de vela (float, posiblemente fuera de rango tras un pan) ->
+        Timestamp. Los extremos se recortan al primer/último dato: el eje deja
+        desplazarse más allá de la serie, pero ahí no hay fecha que enseñar."""
+        ts = getattr(self, '_ts_full', None)
+        if ts is None or len(ts) == 0:
+            return None
+        return ts[int(np.clip(round(i), 0, len(ts) - 1))]
+
+    def _indice_de_fecha(self, t):
+        """Timestamp -> índice de la primera vela que lo alcanza. Inversa de
+        _fecha_de_indice para lo que entra por la UI en fechas (los QDateEdit
+        de rango, las celdas de la tabla de trades)."""
+        ts = getattr(self, '_ts_full', None)
+        if ts is None or len(ts) == 0:
+            return 0.0
+        # searchsorted del propio DatetimeIndex, no de sus enteros crudos:
+        # `asi8` va en la unidad del índice (ns, us... según la versión de
+        # pandas) y compararlo con Timestamp.value caía siempre fuera de rango
+        return float(np.clip(ts.searchsorted(pd.Timestamp(t)), 0, len(ts) - 1))
+
+    def _sync_dateedits(self, i_ini, i_fin):
+        d0 = self._fecha_de_indice(i_ini)
+        d1 = self._fecha_de_indice(i_fin)
+        if d0 is None or d1 is None:
+            return
         self.fecha_ini.setDate(QDate(d0.year, d0.month, d0.day))
         self.fecha_fin.setDate(QDate(d1.year, d1.month, d1.day))
 
@@ -7538,7 +8088,8 @@ class ResultadosWidget(QWidget):
             return
         d0 = self.fecha_ini.date().toPyDate()
         d1 = self.fecha_fin.date().toPyDate()
-        self._dibujar_principal(xlim=(pd.Timestamp(d0), pd.Timestamp(d1)))
+        self._dibujar_principal(xlim=(self._indice_de_fecha(d0),
+                                      self._indice_de_fecha(d1)))
 
     @_no_crash
     def _reset_rango(self):
@@ -7569,13 +8120,20 @@ class ResultadosWidget(QWidget):
     def _centrar_en(self, entrada, salida, precios=None):
         """Reencuadra el gráfico principal sobre la ventana [entrada, salida],
         con un margen proporcional a la duración del trade, y ajusta el eje Y
-        al recorrido de precio si se pasan (precio_entrada, precio_salida)."""
-        ts = pd.DatetimeIndex(self._payload['timestamps'])
-        margen_min = (ts[-1] - ts[0]) / 40
-        duracion = salida - entrada
-        margen = max(duracion * 0.4, margen_min)
+        al recorrido de precio si se pasan (precio_entrada, precio_salida).
+
+        `entrada`/`salida` llegan como Timestamps (salen de la tabla de trades);
+        el margen se calcula ya en VELAS, que es la unidad del eje: así una
+        operación abierta sobre un fin de semana no se lleva un margen inflado
+        por unas horas que en el gráfico no ocupan nada."""
+        if getattr(self, '_ts_full', None) is None:
+            self._ts_full = pd.DatetimeIndex(self._payload['timestamps'])
+        i_ent = self._indice_de_fecha(entrada)
+        i_sal = self._indice_de_fecha(salida)
+        margen_min = len(self._ts_full) / 40.0
+        margen = max((i_sal - i_ent) * 0.4, margen_min)
         self._y_manual = False  # re-autoescalar el precio a esta ventana concreta
-        self._dibujar_principal(xlim=(entrada - margen, salida + margen))
+        self._dibujar_principal(xlim=(i_ent - margen, i_sal + margen))
 
         if precios is not None and self._ax_principal is not None:
             p_in, p_out = precios
@@ -7661,6 +8219,9 @@ class ResultadosWidget(QWidget):
         sars = set()
         donchianes = set()
         zigzags = set()
+        # (periodo, metodo) del filtro de régimen de cada setup
+        ers = set()
+        hursts = set()
         # {indice_setup: (desviacion, piernas, nivel_fib)} — indexado POR SETUP
         # porque ordenes_limite['setup'] dice quién colocó cada orden y cada
         # setup puede medir su retroceso con un nivel distinto
@@ -7729,14 +8290,26 @@ class ResultadosWidget(QWidget):
                     for lado in (cond.get('izq', {}), cond.get('der', {})):
                         _acumular_indicador_spec(lado, mas, rsis, atrs, bbs,
                                                  donchianes, zigzags)
+
+            # el régimen NO viene de la plantilla sino del filtro del setup: se
+            # dibuja para poder comprobar que las entradas caen donde el filtro
+            # dice que caen, que es la única forma de auditarlo desde la GUI
+            reg = filtros.get('regimen') or {}
+            metodo_reg = reg.get('metodo', 'ninguno')
+            if metodo_reg in METODOS_REGIMEN_ER + METODOS_REGIMEN_HURST:
+                periodo_reg = int(reg.get('periodo')
+                                  or ventana_regimen_defecto(metodo_reg))
+                destino = (ers if metodo_reg in METODOS_REGIMEN_ER else hursts)
+                destino.add((periodo_reg, metodo_reg))
         return {
             'mas': mas, 'bbs': bbs, 'rsis': rsis, 'atrs': atrs,
             'patrones': patrones_set, 'stochs': stochs, 'williams': williams,
             'ccis': ccis, 'kamas': kamas, 'sars': sars,
             'donchianes': donchianes, 'zigzags': zigzags, 'fibs': fibs,
+            'ers': ers, 'hursts': hursts,
         }
 
-    def _dibujar_panel_oscilador(self, ax, kind, datos, ts, c, h, l):
+    def _dibujar_panel_oscilador(self, ax, kind, datos, x, c, h, l):
         """Dibuja el contenido de un panel de oscilador (RSI/ATR/Estocástico/
         Williams %R/CCI) en el Axes ya posicionado `ax`. `datos` es el
         conjunto de tuplas de parámetros recolectado por
@@ -7744,66 +8317,144 @@ class ResultadosWidget(QWidget):
         de datos (líneas/umbrales/relleno) creados, para que el llamador los
         registre como "dinámicos" de cara al blitting (ver
         _artistas_dinamicos): comparten eje X con el precio, así que su
-        ventana visible cambia con cada pan/zoom igual que las velas."""
+        ventana visible cambia con cada pan/zoom igual que las velas.
+
+        `x` es el índice de vela, no la fecha: el eje es el mismo (sharex) que
+        el del precio, que dejó de ser temporal para no dejar huecos de fin de
+        semana (ver _dibujar_principal)."""
         _style_ax(ax)
         ax.yaxis.tick_right()
         ax.yaxis.set_label_position('right')
         artes = []
+        # (valor, color) de cada línea de referencia del panel: se escriben en
+        # el eje Y al final (ver _marcar_niveles_eje)
+        niveles = []
         if kind == 'rsi':
-            pal = ['#f1c40f', '#e67e22', '#fd79a8']
+            pal = ['#ffffff', '#e67e22', '#fd79a8']
             for i, per in enumerate(sorted(datos)):
-                line, = ax.plot(ts, rsi(c, per), color=pal[i % len(pal)],
+                line, = ax.plot(x, rsi(c, per), color=pal[i % len(pal)],
                                 linewidth=1.0, alpha=0.85, label=f'RSI({per})')
                 artes.append(line)
             artes.append(ax.axhline(70, color=ROJO, linewidth=0.5, linestyle='--', alpha=0.4))
             artes.append(ax.axhline(50, color=GRIS, linewidth=0.5, linestyle='--', alpha=0.3))
             artes.append(ax.axhline(30, color=VERDE, linewidth=0.5, linestyle='--', alpha=0.4))
+            niveles += [(70, ROJO), (50, GRIS), (30, VERDE)]
             ax.set_ylim(0, 100)
         elif kind == 'atr':
             pal = ['#2ecc71', '#1abc9c']
             for i, per in enumerate(sorted(datos)):
                 val = atr(h, l, c, per)
                 color = pal[i % len(pal)]
-                line, = ax.plot(ts, val, color=color, linewidth=0.9, alpha=0.85,
+                line, = ax.plot(x, val, color=color, linewidth=0.9, alpha=0.85,
                                 label=f'ATR({per})')
-                fill = ax.fill_between(ts, 0, val, color=color, alpha=0.08)
+                fill = ax.fill_between(x, 0, val, color=color, alpha=0.08)
                 artes += [line, fill]
         elif kind == 'stoch':
             pal_k = ['#26c6da', '#4fc3f7', '#80deea']
             pal_d = ['#f06292', '#ec407a', '#f8bbd0']
             for i, (per_k, suav_k, per_d, sobreventa, sobrecompra) in enumerate(sorted(datos)):
                 k, d = stochastic(h, l, c, per_k, suav_k, per_d)
-                lk, = ax.plot(ts, k, color=pal_k[i % len(pal_k)], linewidth=1.0,
+                lk, = ax.plot(x, k, color=pal_k[i % len(pal_k)], linewidth=1.0,
                               alpha=0.9, label=f'%K({per_k},{suav_k})')
-                ld, = ax.plot(ts, d, color=pal_d[i % len(pal_d)], linewidth=0.9,
+                ld, = ax.plot(x, d, color=pal_d[i % len(pal_d)], linewidth=0.9,
                               alpha=0.75, label=f'%D({per_d})')
                 h_sc = ax.axhline(sobrecompra, color=ROJO, linewidth=0.5, linestyle='--', alpha=0.4)
                 h_sv = ax.axhline(sobreventa, color=VERDE, linewidth=0.5, linestyle='--', alpha=0.4)
                 artes += [lk, ld, h_sc, h_sv]
+                niveles += [(sobrecompra, ROJO), (sobreventa, VERDE)]
             ax.set_ylim(0, 100)
         elif kind == 'williams':
             pal = ['#ec407a', '#f06292', '#f8bbd0']
             for i, (per, sobreventa, sobrecompra) in enumerate(sorted(datos)):
                 val = williams_r(h, l, c, per)
-                line, = ax.plot(ts, val, color=pal[i % len(pal)], linewidth=1.0,
+                line, = ax.plot(x, val, color=pal[i % len(pal)], linewidth=1.0,
                                 alpha=0.85, label=f'%R({per})')
                 h_sc = ax.axhline(sobrecompra, color=ROJO, linewidth=0.5, linestyle='--', alpha=0.4)
                 h_sv = ax.axhline(sobreventa, color=VERDE, linewidth=0.5, linestyle='--', alpha=0.4)
                 artes += [line, h_sc, h_sv]
+                niveles += [(sobrecompra, ROJO), (sobreventa, VERDE)]
             ax.set_ylim(-100, 0)
         elif kind == 'cci':
             pal = ['#5c6bc0', '#7986cb', '#9fa8da']
             for i, (per, sobreventa, sobrecompra) in enumerate(sorted(datos)):
                 val = cci(h, l, c, per)
-                line, = ax.plot(ts, val, color=pal[i % len(pal)], linewidth=1.0,
+                line, = ax.plot(x, val, color=pal[i % len(pal)], linewidth=1.0,
                                 alpha=0.85, label=f'CCI({per})')
                 h_sc = ax.axhline(sobrecompra, color=ROJO, linewidth=0.5, linestyle='--', alpha=0.4)
                 h_0 = ax.axhline(0, color=GRIS, linewidth=0.5, linestyle='--', alpha=0.3)
                 h_sv = ax.axhline(sobreventa, color=VERDE, linewidth=0.5, linestyle='--', alpha=0.4)
                 artes += [line, h_sc, h_0, h_sv]
+                niveles += [(sobrecompra, ROJO), (0, GRIS), (sobreventa, VERDE)]
+        elif kind in ('er', 'hurst'):
+            artes_reg, niveles_reg = self._dibujar_panel_regimen(ax, kind, datos, x, c)
+            artes += artes_reg
+            niveles += niveles_reg
         ax.set_ylabel(ETIQUETA_PANEL.get(kind, kind), fontsize=8, color=AX_FG)
         ax.legend(fontsize=6, framealpha=0.15, labelcolor=AX_FG, loc='upper left')
+        # escala que el usuario haya estirado a mano en este tipo de panel
+        # (ver _ylim_paneles): va DESPUÉS del set_ylim de cada rama, que es su
+        # valor por defecto
+        ylim_manual = self._ylim_paneles.get(kind)
+        if ylim_manual:
+            ax.set_ylim(*ylim_manual)
+            # con la escala estirada a mano los niveles pueden caer fuera de la
+            # vista, y el eje se quedaría SIN una sola etiqueta: ahí manda el
+            # localizador automático
+            niveles = []
+        _marcar_niveles_eje(ax, niveles)
         return artes
+
+    def _dibujar_panel_regimen(self, ax, kind, datos, x, c):
+        """Panel del filtro de régimen: la serie de ER o de Hurst con sus
+        umbrales y la banda que el filtro admite sombreada.
+
+        Usa `_er_serie` / `_hurst_serie` de core.strategies, las MISMAS
+        funciones que aplica el filtro — no una reimplementación. Así, si las
+        entradas no caen dentro de la banda sombreada, el problema está en el
+        filtro y no en el dibujo.
+
+        Devuelve (artistas, niveles) — los niveles son los umbrales, que el
+        llamador escribe en el eje Y (ver _marcar_niveles_eje)."""
+        artes = []
+        es_er = kind == 'er'
+        pal = ['#ff9800', '#ffb74d'] if es_er else ['#ab47bc', '#ce93d8']
+        for i, (periodo, metodo) in enumerate(sorted(datos)):
+            if es_er:
+                val = _er_serie(c, periodo).values
+            else:
+                val = _hurst_serie(c, periodo)
+                if val is None:
+                    # ventana mayor que el histórico: el filtro tampoco se
+                    # aplica (ver _mascara_filtros_setup), y decirlo aquí es
+                    # más útil que un panel en blanco
+                    artes.append(ax.text(
+                        0.5, 0.5, f'Hurst({periodo}) no calculable: la ventana '
+                        f'no cabe en {len(c):,} velas',
+                        transform=ax.transAxes, ha='center', va='center',
+                        color=AMBAR, fontsize=7))
+                    continue
+            etiqueta = f"{'ER' if es_er else 'Hurst'}({periodo})"
+            banda = BANDA_REGIMEN.get(metodo)
+            if banda is not None:
+                lo, hi = banda
+                admitidas = ((val > lo) if hi >= 1.0 else (val < hi))
+                etiqueta += f' — admite {admitidas.mean() * 100:.1f}% de las velas'
+                artes.append(ax.axhspan(lo, hi, color=VERDE, alpha=0.07, zorder=0))
+            line, = ax.plot(x, val, color=pal[i % len(pal)], linewidth=1.0,
+                            alpha=0.9, label=etiqueta)
+            artes.append(line)
+        umbrales = ((UMBRAL_ER_TENDENCIA, UMBRAL_ER_RUIDO) if es_er
+                    else (UMBRAL_HURST_TENDENCIA, UMBRAL_HURST_REVERSION))
+        artes.append(ax.axhline(umbrales[0], color=VERDE, linewidth=0.5,
+                                linestyle='--', alpha=0.5))
+        artes.append(ax.axhline(umbrales[1], color=ROJO, linewidth=0.5,
+                                linestyle='--', alpha=0.5))
+        if es_er:
+            ax.set_ylim(0, 1)
+        else:
+            ax.set_ylim(0.3, 0.9)
+        return artes, [(umbrales[0], VERDE), (umbrales[1], ROJO)]
+
 
     def _dibujar_wfa(self, wfa, ts, equity=None):
         if not wfa:
@@ -8863,28 +9514,59 @@ class TabBacktest(QWidget):
 
         opt.btn_run.setEnabled(False)
         opt.btn_optimizar.setEnabled(False)
-        opt.lbl_estado.setText("Optimizando parámetros sobre IS…")
+        opt.lbl_estado.setText("Optimizando IS… cargando datos")
+        # Barra del Constructor (visible en la pestaña actual) + la de
+        # Optimizador. Antes solo se actualizaba Comparativa (oculta) y el
+        # cursor de espera: parecía colgado aunque el hilo avanzara.
+        opt.progreso.setRange(0, 1)
+        opt.progreso.setValue(0)
+        opt.progreso.setTextVisible(True)
+        opt.progreso.setFormat("%v / %m")
+        opt.progreso.setFixedHeight(14)
+        opt.progreso.setVisible(True)
         self.comparativa.progreso.setVisible(True)
         self.comparativa.progreso.setValue(0)
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        self.comparativa.lbl_resumen.setText("Optimizando IS… cargando datos")
+        self.tabs.setCurrentWidget(self.comparativa)
         tf_label, regla_resample = opt.tf_resample()
         th = _OptimizerThread(
             opt.csv_path, setup, sweep_params, sweep_riesgo,
             opt.config_global(), opt.slider_oos.value() / 100.0, metrica,
             tf_label=tf_label, regla_resample=regla_resample, parent=self,
         )
-        th.progreso.connect(self.comparativa.actualizar_progreso)
+        th.progreso.connect(self._on_optimizacion_progreso)
         th.terminado.connect(self._on_optimizacion_terminada)
         th.finished.connect(lambda t=th: self._on_thread_finished(t))
         self._threads.append(th)
         th.start()
 
     @_no_crash
+    def _on_optimizacion_progreso(self, i, total):
+        total = max(int(total), 1)
+        i = max(0, min(int(i), total))
+        opt = self.constructor
+        opt.progreso.setMaximum(total)
+        opt.progreso.setValue(i)
+        self.comparativa.actualizar_progreso(i, total)
+        if i <= 0:
+            msg = f"Optimizando IS… 0/{total} (preparando 1ª combinación)"
+        else:
+            msg = f"Optimizando IS… {i}/{total}"
+        opt.lbl_estado.setText(msg)
+        self.comparativa.lbl_resumen.setText(msg)
+
+    @_no_crash
     def _on_optimizacion_terminada(self, payload):
         opt = self.constructor
         self.comparativa.progreso.setVisible(False)
+        opt.progreso.setVisible(False)
+        opt.progreso.setTextVisible(False)
+        opt.progreso.setFixedHeight(6)
+        opt.progreso.setRange(0, 0)
         if 'error' in payload:
             opt.lbl_estado.setText(f"Error: {payload['error']}")
+            self.comparativa.lbl_resumen.setText(
+                f"Error en la optimización: {payload['error']}")
             return
         opt.lbl_estado.setText(
             f"Optimización completada: {len(payload['resultados'])} combinaciones probadas sobre IS")

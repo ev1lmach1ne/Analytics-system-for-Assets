@@ -26,7 +26,9 @@ from PyQt6.QtCore import QUrl
 from core.backtest import ORDEN_RELLENADA
 from core.strategies import (
     sma, ema, rsi, atr, bollinger, stochastic, williams_r, cci, _kama_serie,
-    _zigzag_pivotes, tramos_zigzag_vigentes,
+    _zigzag_pivotes, tramos_zigzag_vigentes, _er_serie, _hurst_serie,
+    UMBRAL_ER_TENDENCIA, UMBRAL_ER_RUIDO,
+    UMBRAL_HURST_TENDENCIA, UMBRAL_HURST_REVERSION,
 )
 from core.candle_patterns import detectar_patrones
 
@@ -82,7 +84,11 @@ _COLOR_MEDIA_FIJO = {20: '#2B7FFF', 50: '#FF8904', 200: '#800000'}
 _PALETA_MA = [_AZUL, _AMBAR, _VERDE, '#9b59b6', '#e67e22']
 _BB_COLOR = '#9b59b6'
 _KAMA_COLOR = '#ab47bc'
-_PAL_RSI = ['#f1c40f', '#e67e22', '#fd79a8']
+# mismos colores que COLOR_PANEL_OSC de tab_backtest.py para los paneles de
+# régimen, que las dos vistas enseñan el mismo dato
+_NARANJA_ER = '#ff9800'
+_MORADO_HURST = '#ab47bc'
+_PAL_RSI = ['#ffffff', '#e67e22', '#fd79a8']
 _PAL_ATR = ['#2ecc71', '#1abc9c']
 _PAL_STOCH_K = ['#26c6da', '#4fc3f7', '#80deea']
 _PAL_STOCH_D = ['#f06292', '#ec407a', '#f8bbd0']
@@ -593,5 +599,27 @@ class LwcChart(QWidget):
                                    {'value': 0, 'color': _GRIS},
                                    {'value': sobreventa, 'color': _VERDE}]
             osciladores.append(panel)
+
+        # régimen ER / Hurst: mismas series y umbrales que la vista clásica
+        # (ver _dibujar_panel_regimen en tab_backtest.py), o conmutar de vista
+        # enseñaría un régimen distinto del que aplica el filtro
+        for clave, color, umbrales in (
+                ('ers', _NARANJA_ER, (UMBRAL_ER_TENDENCIA, UMBRAL_ER_RUIDO)),
+                ('hursts', _MORADO_HURST,
+                 (UMBRAL_HURST_TENDENCIA, UMBRAL_HURST_REVERSION))):
+            datos = indicadores.get(clave, ())
+            if not datos:
+                continue
+            panel = {'height': 120, 'series': [], 'lines': []}
+            for periodo, _metodo in sorted(datos):
+                val = (_er_serie(y, periodo).values if clave == 'ers'
+                       else _hurst_serie(y, periodo))
+                if val is None:
+                    continue
+                panel['series'].append({'color': color, 'data': _serie(val)})
+            if panel['series']:
+                panel['lines'] = [{'value': umbrales[0], 'color': _VERDE},
+                                  {'value': umbrales[1], 'color': _ROJO}]
+                osciladores.append(panel)
 
         return overlays, bandas, osciladores, patron_markers

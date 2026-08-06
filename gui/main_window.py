@@ -1,4 +1,4 @@
-from PyQt6.QtWidgets import (QMainWindow, QTabWidget, QWidget, QVBoxLayout,
+﻿from PyQt6.QtWidgets import (QMainWindow, QTabWidget, QWidget, QVBoxLayout,
                              QLabel, QPushButton, QHBoxLayout, QFrame, QSizePolicy,
                              QApplication)
 from PyQt6.QtCore import Qt, QPoint, pyqtSignal
@@ -76,7 +76,7 @@ class HeaderBar(QFrame):
         subtitle.setStyleSheet("color: #3a5a7a; font-size: 11px;")
         subtitle.setContentsMargins(6, 0, 0, 0)
 
-        version = QLabel("v0.6.6")
+        version = QLabel("v0.6.7")
         version.setStyleSheet("color: #2a4a6a; font-size: 10px; padding-left: 8px;")
 
         layout.addWidget(title)
@@ -193,7 +193,7 @@ class StatusBar(QFrame):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Analytics System for Assets v0.6.6")
+        self.setWindowTitle("Analytics System for Assets v0.6.7")
         # 1400x900 como tamaño deseado, recortado al área visible de la
         # pantalla (en portátiles pequeños 1400x900 no cabe) y centrado.
         disp = QApplication.primaryScreen().availableGeometry()

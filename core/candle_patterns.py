@@ -355,7 +355,8 @@ def detectar_patrones(o, h, l, c, params=None):
 
 
 def preparar_contexto(close, interpolado=None, anomalia=None,
-                      er=None, hurst=None, lags=LAGS, timestamps=None):
+                      er=None, hurst=None, lags=LAGS, timestamps=None,
+                      umbrales_er=None):
     """Precomputa por vela todo lo que la estadística necesita, para que el
     cambio de filtros en la GUI sea O(n_ocurrencias) y no relea nada.
 
@@ -366,6 +367,9 @@ def preparar_contexto(close, interpolado=None, anomalia=None,
     None si no se pasa `timestamps` — misma semántica que la columna
     hora_utc de library/scripts_utiles/limpieza_datos_er.py, calculada al
     vuelo para que funcione igual tras un resample a otra temporalidad),
+    umbrales_er: (ruido, tendencia) absolutos para clasificar el régimen ER.
+    Sin él se usan los adaptativos de calcular_umbrales_er (media ± 1σ de la
+    propia serie), que es lo que espera la pestaña Patrones.
     hora_local (dict {clave_sesion: int8[0-23]} para las sesiones de
     SESIONES con huso horario propio — 'londres'/'ny' — convertido con la
     zona IANA correspondiente, así que ya incorpora el cambio de horario de
@@ -414,13 +418,24 @@ def preparar_contexto(close, interpolado=None, anomalia=None,
     if er is not None:
         er_arr = np.nan_to_num(np.asarray(er, dtype=np.float64), nan=0.0)
         if np.nanstd(er_arr) > 0:
-            import pandas as pd
-            u = calcular_umbrales_er(pd.Series(er_arr))
-            reg = np.ones(n, dtype=np.int8)          # 1 = neutro
-            reg[er_arr > u['umbral_tendencia']] = 2  # tendencia
-            reg[er_arr < u['umbral_ruido']] = 0      # ruido
+            if umbrales_er is not None:
+                # umbrales ABSOLUTOS impuestos por el llamador (los usa el
+                # filtro de régimen del Backtester): "tendencia" significa
+                # siempre lo mismo, sin depender de la distribución de ER de
+                # este activo ni, por tanto, de datos futuros.
+                u_ruido, u_tendencia = (float(x) for x in umbrales_er)
+            else:
+                # por defecto, media ± 1σ de la propia serie — es lo que
+                # espera la pestaña Patrones, que enseña el umbral resultante
+                # en la etiqueta de su desplegable
+                import pandas as pd
+                u = calcular_umbrales_er(pd.Series(er_arr))
+                u_ruido, u_tendencia = u['umbral_ruido'], u['umbral_tendencia']
+            reg = np.ones(n, dtype=np.int8)   # 1 = neutro
+            reg[er_arr > u_tendencia] = 2     # tendencia
+            reg[er_arr < u_ruido] = 0         # ruido
             ctx['regimen_er'] = reg
-            ctx['umbrales_er'] = (u['umbral_ruido'], u['umbral_tendencia'])
+            ctx['umbrales_er'] = (u_ruido, u_tendencia)
 
     ctx['regimen_hurst'] = None
     if hurst is not None:

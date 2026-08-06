@@ -121,6 +121,40 @@ def test_optimizar_setup_barre_riesgo():
     assert riesgos == pytest.approx([0.01, 0.02])
 
 
+def _setup_bollinger(periodo=20, desv=2.0, stop_atr=1.5, riesgo=0.01):
+    return {
+        'nombre': 'BB', 'plantilla': 'Bollinger + ATR',
+        'params': {'periodo': periodo, 'desv': desv, 'direccion': 'Ambas'},
+        'riesgo_pct': riesgo, 'stop_atr': stop_atr, 'tp_r': 2.0,
+        'salida_n_velas': 0,
+    }
+
+
+def test_optimizar_setup_bollinger_periodo_desv_riesgo_stop():
+    """Caso GUI reportado: Bollinger + ATR barriendo periodo BB, desviaciones,
+    riesgo del setup y stop ×ATR debe terminar y devolver todas las combos."""
+    df = _df_tendencia(n=400)
+    sweep_params = {
+        'periodo': {'min': 10, 'max': 20, 'step': 5, 'tipo': 'int'},
+        'desv': {'min': 1.5, 'max': 2.5, 'step': 0.5, 'tipo': 'float'},
+    }
+    sweep_riesgo = {
+        'riesgo_pct': {'min': 0.005, 'max': 0.015, 'step': 0.005, 'tipo': 'float'},
+        'stop_atr': {'min': 1.0, 'max': 2.0, 'step': 0.5, 'tipo': 'float'},
+    }
+    # 3 periodos × 3 desv × 3 riesgos × 3 stops = 81 combos
+    avances = []
+    res = optimizar_setup(
+        df, _setup_bollinger(), sweep_params, sweep_riesgo, CONFIG_GLOBAL,
+        pct_oos=0.30, metrica='sharpe',
+        progreso_cb=lambda i, total: avances.append((i, total)))
+    assert len(res) == 81
+    assert avances[0] == (0, 81)
+    assert avances[-1] == (81, 81)
+    assert all('periodo' in r['params_barridos'] for r in res)
+    assert all('_riesgo.stop_atr' in r['params_barridos'] for r in res)
+
+
 def test_optimizar_setup_respeta_limite_combos():
     df = _df_tendencia()
     sweep_params = {'rapida': {'min': 1, 'max': 100, 'step': 1, 'tipo': 'int'},
