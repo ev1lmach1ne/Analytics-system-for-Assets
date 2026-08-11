@@ -26,6 +26,9 @@ from core.data_providers.hyperliquid_provider import HyperliquidProvider
 from core.data_providers.base_provider import AssetInfo
 from core.connectors import load_connectors, provider_class_for_type
 
+_CHEVRON_SVG = os.path.join(os.path.dirname(__file__), '..', 'assets',
+                            'chevron-down.svg').replace('\\', '/')
+
 STYLE_DOWNLOAD = """
 QWidget { background-color: #141e30; }
 QPushButton {
@@ -49,18 +52,33 @@ QPushButton#tf:checked {
 QLabel#title { color: #4fc3f7; font-size: 13px; font-weight: bold; }
 QLabel#path { color: #3a5a7a; font-size: 10px; padding: 2px 0; }
 QLabel#range { color: #BA7517; font-size: 11px; padding: 4px 0; }
-QLineEdit, QComboBox {
+QLineEdit {
     background-color: #1a2a45; color: #c8d6e5; border: none;
     padding: 6px 10px; border-radius: 4px; font-size: 11px; min-width: 90px;
 }
-QComboBox::drop-down { border: none; background: transparent; width: 20px; }
-QComboBox::down-arrow { border: none; }
 QComboBox {
+    background-color: #111828; font-size: 11px; min-width: 90px;
     combobox-popup: 0;
 }
+QComboBox::drop-down { border: none; background: transparent; width: 22px; }
+QComboBox::down-arrow {
+    image: url("__CHEVRON__");
+    width: 12px; height: 8px;
+}
+QComboBox::down-arrow:on { }
 QComboBox QAbstractItemView {
-    background-color: #1a2a45; color: #c8d6e5; selection-background-color: #2a4a6a;
+    background-color: #1a2a45; color: #c8d6e5;
+    selection-background-color: #2a4a6a; selection-color: #4fc3f7;
     border: 1px solid #253a60; outline: none; margin: 0px;
+}
+QComboBox QAbstractItemView::item {
+    padding: 6px 10px; border-bottom: 1px solid #182030;
+}
+QComboBox QAbstractItemView::item:selected {
+    background-color: #2a4a6a; color: #4fc3f7;
+}
+QComboBox QAbstractItemView::item:hover {
+    background-color: #223755;
 }
 QListWidget {
     background-color: #0d1424; color: #c8d6e5; border: 1px solid #253a60;
@@ -75,6 +93,10 @@ QProgressBar {
     text-align: center; color: #c8d6e5; font-size: 10px; max-height: 18px;
 }
 QProgressBar::chunk { background-color: #4fc3f7; border-radius: 4px; }
+QLabel#providerInfo {
+    background-color: #0d1a2a; color: #8a9ab0;
+    padding: 6px 10px; border-radius: 4px; font-size: 10px;
+}
 """
 
 TF_LABELS = ['1m', '5m', '15m', '1h', '4h', '1d']
@@ -83,10 +105,34 @@ _SEPARATOR_SYMBOL = '__SEPARATOR__'
 
 # Providers disponibles para el dropdown
 _PROVIDERS = {
-    'Dukascopy': DukascopyProvider,
     'yfinance': YFinanceProvider,
     'ccxt (Binance)': CCXTProvider,
+    'Dukascopy': DukascopyProvider,
     'Hyperliquid': HyperliquidProvider,
+}
+
+_PROVIDER_INFO = {
+    'yfinance': (
+        'Amplia cobertura: forex, metales, cripto, acciones, indices, ETFs. '
+        'Rapido (velas OHLC directas). intraday limitado: 1m -> 7d, '
+        '5m/15m -> 60d, 1h -> 730d, 4h resampleado de 1h. '
+        'Diario -> historico completo.'
+    ),
+    'ccxt (Binance)': (
+        'Historico completo en TODOS los TFs: 1m/5m/15m desde el listing '
+        '(archivos ZIP de data.binance.vision), 1h+ via API. Solo cripto '
+        '(pares USDT spot). Rapido.'
+    ),
+    'Dukascopy': (
+        'MUY LENTO: descarga tick data .bi5 y resamplea a OHLC. '
+        '1m puede tardar dias para decadas. Catalogo limitado: solo forex '
+        'majors, XAUUSD, XAGUSD, BTCUSD y ETHUSD.'
+    ),
+    'Hyperliquid': (
+        'Solo ~5.000 velas por TF (historial muy corto). '
+        'HIP-3 (acciones/indices/commodities) desde 2025-2026. '
+        'Solo perpetual swaps. Util para datos muy recientes.'
+    ),
 }
 
 _SEARCH_DEBOUNCE_MS = 350
@@ -152,7 +198,7 @@ class TabDescargar(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setStyleSheet(STYLE_DOWNLOAD)
+        self.setStyleSheet(STYLE_DOWNLOAD.replace('__CHEVRON__', _CHEVRON_SVG))
         self._running = False
         self._selected_symbol = None
         self._catalog = []
@@ -205,6 +251,12 @@ class TabDescargar(QWidget):
 
         layout.addLayout(toolbar)
 
+        # Info del provider
+        self.label_provider_info = QLabel(_PROVIDER_INFO.get('yfinance', ''))
+        self.label_provider_info.setObjectName("providerInfo")
+        self.label_provider_info.setWordWrap(True)
+        layout.addWidget(self.label_provider_info)
+
         # ── Catalogo de activos + panel derecho ──
         content = QHBoxLayout()
         content.setSpacing(8)
@@ -234,7 +286,7 @@ class TabDescargar(QWidget):
         date_group = QGroupBox("Rango de fechas")
         date_layout = QVBoxLayout(date_group)
         self.full_history_cb = QCheckBox("Historial Completo")
-        self.full_history_cb.setChecked(False)
+        self.full_history_cb.setChecked(True)
         self.full_history_cb.toggled.connect(self._on_full_history_toggled)
         date_layout.addWidget(self.full_history_cb)
 
@@ -245,12 +297,14 @@ class TabDescargar(QWidget):
         self.date_start.setCalendarPopup(True)
         self.date_start.setDate(QDate.currentDate().addYears(-3))
         self.date_start.setDisplayFormat("dd/MM/yyyy")
+        self.date_start.setEnabled(False)
         date_picker_row.addWidget(self.date_start)
         date_picker_row.addWidget(QLabel("Fin:"))
         self.date_end = QDateEdit()
         self.date_end.setCalendarPopup(True)
         self.date_end.setDate(QDate.currentDate())
         self.date_end.setDisplayFormat("dd/MM/yyyy")
+        self.date_end.setEnabled(False)
         date_picker_row.addWidget(self.date_end)
         date_layout.addLayout(date_picker_row)
         right_panel.addWidget(date_group)
@@ -395,7 +449,10 @@ class TabDescargar(QWidget):
         self.btn_refresh.setText("  Actualizar catalogo")
         self.btn_refresh.setEnabled(True)
 
-    def _on_provider_changed(self, _name):
+    def _on_provider_changed(self, name):
+        info = _PROVIDER_INFO.get(name, '')
+        self.label_provider_info.setText(info)
+        self.label_provider_info.setVisible(bool(info))
         self._load_catalog()
 
     def _populate_list(self):

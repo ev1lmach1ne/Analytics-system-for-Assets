@@ -14,8 +14,18 @@ QComboBox {
 QComboBox::drop-down { border: none; background: transparent; width: 22px; }
 QComboBox::down-arrow { border: none; }
 QComboBox QAbstractItemView {
-    background-color: #1a2a45; color: #c8d6e5; selection-background-color: #2a4a6a;
+    background-color: #1a2a45; color: #c8d6e5;
+    selection-background-color: #2a4a6a; selection-color: #4fc3f7;
     border: 1px solid #253a60; outline: none; margin: 0px;
+}
+QComboBox QAbstractItemView::item {
+    padding: 6px 10px; border-bottom: 1px solid #182030;
+}
+QComboBox QAbstractItemView::item:selected {
+    background-color: #2a4a6a; color: #4fc3f7;
+}
+QComboBox QAbstractItemView::item:hover {
+    background-color: #223755;
 }
 QPushButton {
     background-color: #2a4a6a; color: #4fc3f7; border: none;

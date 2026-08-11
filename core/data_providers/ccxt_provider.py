@@ -95,21 +95,21 @@ def _load_catalog_from_disk():
 _SEPARATOR_SYMBOL = '__SEPARATOR__'
 
 _TOP_PAIRS = [
-    AssetInfo('BTC/USDT', 'Bitcoin', 'Cripto', '2017-08-01'),
-    AssetInfo('ETH/USDT', 'Ethereum', 'Cripto', '2017-08-01'),
-    AssetInfo('BNB/USDT', 'BNB', 'Cripto', '2018-07-01'),
-    AssetInfo('SOL/USDT', 'Solana', 'Cripto', '2020-08-01'),
-    AssetInfo('XRP/USDT', 'Ripple', 'Cripto', '2018-05-01'),
-    AssetInfo('ADA/USDT', 'Cardano', 'Cripto', '2018-04-01'),
-    AssetInfo('DOGE/USDT', 'Dogecoin', 'Cripto', '2019-07-01'),
-    AssetInfo('AVAX/USDT', 'Avalanche', 'Cripto', '2020-09-01'),
-    AssetInfo('DOT/USDT', 'Polkadot', 'Cripto', '2020-08-01'),
-    AssetInfo('MATIC/USDT', 'Polygon', 'Cripto', '2019-04-01'),
-    AssetInfo('LINK/USDT', 'Chainlink', 'Cripto', '2019-01-01'),
-    AssetInfo('UNI/USDT', 'Uniswap', 'Cripto', '2020-09-01'),
-    AssetInfo('ATOM/USDT', 'Cosmos', 'Cripto', '2020-01-01'),
-    AssetInfo('LTC/USDT', 'Litecoin', 'Cripto', '2018-01-01'),
-    AssetInfo('ETH/BTC', 'Ethereum / Bitcoin', 'Cripto', '2017-08-01'),
+    AssetInfo('BTC/USDT', 'Bitcoin', 'Spot Crypto', '2017-08-01'),
+    AssetInfo('ETH/USDT', 'Ethereum', 'Spot Crypto', '2017-08-01'),
+    AssetInfo('BNB/USDT', 'BNB', 'Spot Crypto', '2018-07-01'),
+    AssetInfo('SOL/USDT', 'Solana', 'Spot Crypto', '2020-08-01'),
+    AssetInfo('XRP/USDT', 'Ripple', 'Spot Crypto', '2018-05-01'),
+    AssetInfo('ADA/USDT', 'Cardano', 'Spot Crypto', '2018-04-01'),
+    AssetInfo('DOGE/USDT', 'Dogecoin', 'Spot Crypto', '2019-07-01'),
+    AssetInfo('AVAX/USDT', 'Avalanche', 'Spot Crypto', '2020-09-01'),
+    AssetInfo('DOT/USDT', 'Polkadot', 'Spot Crypto', '2020-08-01'),
+    AssetInfo('MATIC/USDT', 'Polygon', 'Spot Crypto', '2019-04-01'),
+    AssetInfo('LINK/USDT', 'Chainlink', 'Spot Crypto', '2019-01-01'),
+    AssetInfo('UNI/USDT', 'Uniswap', 'Spot Crypto', '2020-09-01'),
+    AssetInfo('ATOM/USDT', 'Cosmos', 'Spot Crypto', '2020-01-01'),
+    AssetInfo('LTC/USDT', 'Litecoin', 'Spot Crypto', '2018-01-01'),
+    AssetInfo('ETH/BTC', 'Ethereum / Bitcoin', 'Spot Crypto', '2017-08-01'),
 ]
 _TOP_SYMBOLS = {a.symbol for a in _TOP_PAIRS}
 
@@ -188,7 +188,7 @@ def _fetch_catalog() -> list:
             if symbol.endswith('/USDT') and market.get('active'):
                 name = market.get('info', {}).get('baseAsset', symbol.split('/')[0])
                 usdt_pairs.append(AssetInfo(
-                    symbol, f'{name} / Tether', 'Cripto', None
+                    symbol, f'{name} / Tether', 'Spot Crypto', None
                 ))
         # Ordenar alfabéticamente
         usdt_pairs.sort(key=lambda a: a.symbol)

@@ -6,7 +6,7 @@ desde linea de comandos. Lee la configuracion de variables de entorno
 y guarda el CSV resultante en la carpeta del activo.
 
 Variables de entorno:
-  DOWNLOAD_PROVIDER  - "dukascopy"  (futuro: "binance", "yfinance")
+  DOWNLOAD_PROVIDER  - "yfinance" (default), "dukascopy", "ccxt", "hyperliquid", "oanda"
   DOWNLOAD_SYMBOL    - Simbolo del activo (ej: "EURUSD", "XAUUSD")
   DOWNLOAD_TF        - Timeframe: "1m", "5m", "15m", "1h", "4h", "1d"
   DOWNLOAD_START     - (opcional) Fecha inicio YYYY-MM-DD. Default: max history
@@ -73,7 +73,7 @@ def _determine_output_path(provider_name: str, category_raw: str, symbol: str,
 
 def main():
     # Leer env vars
-    provider_name = os.environ.get('DOWNLOAD_PROVIDER', 'dukascopy').lower()
+    provider_name = os.environ.get('DOWNLOAD_PROVIDER', 'yfinance').lower()
     symbol = os.environ.get('DOWNLOAD_SYMBOL', '')
     tf = os.environ.get('DOWNLOAD_TF', '1h')
     category_raw = os.environ.get('DOWNLOAD_CATEGORY', '')

@@ -1,0 +1,188 @@
+// ─────────────────────────────────────────────────────────────────────────
+// Runtime del Analytics System para Pine Script v6.
+//
+// Reimplementa los indicadores del Backtester cuya fórmula NO coincide con
+// la del indicador nativo de TradingView. Todo lo que sí coincide se deja en
+// manos de `ta.*` y no aparece aquí.
+//
+// Este bloque lo inserta el emisor (core/codegen/pine.py) dentro del script
+// generado: Pine no tiene includes para un script suelto.
+//
+// NO EDITAR A MANO en el archivo generado: se regenera en cada exportación.
+// ─────────────────────────────────────────────────────────────────────────
+
+// ══════════════ ATR — media SIMPLE del True Range ══════════════
+// El Backtester promedia el TR con una media móvil simple; `ta.atr` usa el
+// suavizado de Wilder (RMA), que reacciona más despacio. La diferencia no es
+// cosmética: el ATR fija la distancia al stop y, con ella, el tamaño de la
+// posición (unidades = riesgo / distancia). Usar ta.atr cambiaría el tamaño
+// de TODAS las operaciones.
+zcsAtr(int periodo) =>
+    ta.sma(ta.tr(true), periodo)
+
+// ══════════════ Bollinger — desviación MUESTRAL ══════════════
+// pandas .std() usa ddof=1 (divide por n-1); `ta.stdev` divide por n salvo
+// que se le pase biased=false. Con periodos cortos la diferencia mueve las
+// bandas lo bastante como para cambiar qué velas disparan la señal.
+zcsBbMedia(float src, int periodo) =>
+    ta.sma(src, periodo)
+
+zcsBbDesv(float src, int periodo) =>
+    ta.stdev(src, periodo, false)
+
+zcsBbSup(float src, int periodo, float desv) =>
+    ta.sma(src, periodo) + desv * ta.stdev(src, periodo, false)
+
+zcsBbInf(float src, int periodo, float desv) =>
+    ta.sma(src, periodo) - desv * ta.stdev(src, periodo, false)
+
+// ══════════════ Efficiency Ratio de Kaufman ══════════════
+// |movimiento neto| / movimiento total sobre retornos LOG, en `periodo`
+// velas. Se calcula sobre log-retornos (no sobre precio) igual que
+// core/metrics.py: sobre precio daría un ER distinto en activos con
+// tendencias largas.
+//
+// El warm-up se rellena con 0.0 — mismo criterio que preparar_contexto. Es
+// deliberado: con el filtro 'er_rango' (ER < 0.3) las velas de calentamiento
+// SÍ pasan el filtro, y descartarlas daría menos operaciones que el backtest.
+zcsEr(int periodo) =>
+    float ret = math.log(close / close[1])
+    float neto = math.abs(math.sum(ret, periodo))
+    float total = math.sum(math.abs(ret), periodo)
+    float er = total > 0 ? neto / total : 0.0
+    na(er) ? 0.0 : er
+
+// ══════════════ KAMA ══════════════
+// Media adaptativa de Kaufman: la constante de suavizado se mueve con el ER,
+// así que acelera en tendencia y se aplana en rango. Pine no trae ta.kama.
+// El primer valor arranca en el propio precio, como calcular_kama_numba.
+zcsKama(int periodoEr, int rapido, int lento) =>
+    float scRapido = 2.0 / (rapido + 1.0)
+    float scLento = 2.0 / (lento + 1.0)
+    float er = zcsEr(periodoEr)
+    float sc = math.pow(er * (scRapido - scLento) + scLento, 2)
+    var float kama = na
+    kama := na(kama[1]) ? close : kama[1] + sc * (close - kama[1])
+    kama
+
+// ══════════════ Percentil rodante (empates a mitad de rango) ══════════════
+// Percentil del valor actual dentro de su propia ventana, contando los
+// empates a MITAD de rango. Sin eso, una serie constante daría percentil 100
+// en todas sus velas —cada valor "supera" a todos sus iguales— y un tramo de
+// volatilidad plana se leería como volatilidad extrema. Con el rango medio da
+// 50. `ta.percentrank` de Pine no hace esto: cuenta solo los estrictamente
+// menores.
+//
+// Devuelve -1 mientras no haya ventana completa, para que ni el corte alto ni
+// el bajo la dejen pasar (mismo mapeo que _mascara_filtros_setup).
+zcsPercentilRodante(float serie, int ventana) =>
+    float salida = -1.0
+    if bar_index >= ventana - 1 and not na(serie)
+        int menores = 0
+        int iguales = 0
+        int total = 0
+        for i = 0 to ventana - 1
+            float v = serie[i]
+            if not na(v)
+                total += 1
+                if v < serie
+                    menores += 1
+                else if v == serie
+                    iguales += 1
+        salida := total > 0 ? 100.0 * (menores + 0.5 * iguales) / total : -1.0
+    salida
+
+// ══════════════ Canal de Donchian ══════════════
+// Desplazado una vela a propósito: si la vela actual formara parte del canal,
+// su propio máximo sería el máximo del canal y jamás podría superarlo.
+zcsDonchianSup(float src, int periodo) =>
+    ta.highest(src, periodo)[1]
+
+zcsDonchianInf(float src, int periodo) =>
+    ta.lowest(src, periodo)[1]
+
+// ══════════════ Estocástico lento ══════════════
+// %K crudo suavizado por SMA y %D como SMA de %K — la combinación que usa
+// core/strategies.py. Se deja explícito en vez de usar ta.stoch directamente
+// para que el suavizado quede a la vista.
+zcsStochK(int periodoK, int suavizadoK) =>
+    ta.sma(ta.stoch(close, high, low, periodoK), suavizadoK)
+
+zcsStochD(int periodoK, int suavizadoK, int periodoD) =>
+    ta.sma(ta.sma(ta.stoch(close, high, low, periodoK), suavizadoK), periodoD)
+
+// ══════════════ Desviación de retornos log ══════════════
+// Base del filtro de volatilidad cuando el método es 'stdev'. Muestral
+// (ddof=1), igual que pandas.
+zcsStdevRet(int periodo) =>
+    ta.stdev(math.log(close / close[1]), periodo, false)
+
+// ══════════════ Parabolic SAR con tendencia explícita ══════════════
+// Devuelve [sar, tendencia] (+1 alcista / -1 bajista). Se reimplementa en vez
+// de usar ta.sar porque la ESTRATEGIA no entra por el nivel del SAR sino por
+// su GIRO, y para saber que ha girado hace falta la tendencia vigente, que
+// ta.sar no expone. Deducirla de «sar < close» falla justo en la vela del
+// giro, que es la única que importa.
+//
+// La tendencia inicial se asume alcista: es la misma suposición arbitraria e
+// inevitable que hace el motor (no hay historia antes de la primera vela) y
+// solo condiciona las velas previas al primer giro.
+zcsSar(float afIni, float afPaso, float afMax) =>
+    var float sarV = na
+    var int tendV = 0
+    var float afV = 0.0
+    var float epV = na
+    if na(sarV)
+        sarV := low
+        tendV := 1
+        afV := afIni
+        epV := high
+    else
+        float nuevo = sarV + afV * (epV - sarV)
+        if tendV > 0
+            // el SAR alcista no puede meterse dentro del rango de las dos
+            // velas previas: si lo hiciera, el giro saltaría por un movimiento
+            // que ya había ocurrido
+            float limite = math.min(low[1], nz(low[2], low[1]))
+            nuevo := math.min(nuevo, limite)
+            if low < nuevo
+                tendV := -1
+                sarV := epV          // al girar, el SAR salta al extremo alcanzado
+                epV := low
+                afV := afIni
+            else
+                sarV := nuevo
+                if high > epV
+                    epV := high
+                    afV := math.min(afV + afPaso, afMax)
+        else
+            float limite = math.max(high[1], nz(high[2], high[1]))
+            nuevo := math.max(nuevo, limite)
+            if high > nuevo
+                tendV := 1
+                sarV := epV
+                epV := high
+                afV := afIni
+            else
+                sarV := nuevo
+                if low < epV
+                    epV := low
+                    afV := math.min(afV + afPaso, afMax)
+    [sarV, tendV]
+
+// ══════════════ Cruces ══════════════
+// Un cruce exige que la vela ANTERIOR estuviera al otro lado: comparar solo
+// el estado actual convertiría una condición de cruce en una de posición y
+// dispararía en cada vela mientras se mantuviera.
+zcsCruzaArriba(float a, float b) =>
+    a[1] <= b[1] and a > b
+
+zcsCruzaAbajo(float a, float b) =>
+    a[1] >= b[1] and a < b
+
+// ══════════════ Tamaño de posición por riesgo ══════════════
+// El Backtester arriesga un % del equity ACTUAL (no del capital inicial) y
+// deriva las unidades de la distancia al stop, así que la exposición puede
+// pasar del 100% sin que eso sea un error.
+zcsUnidadesPorRiesgo(float equity, float riesgoPct, float distancia) =>
+    distancia > 0 ? equity * riesgoPct / distancia : 0.0

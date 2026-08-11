@@ -5,6 +5,7 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
 from PyQt6.QtCore import Qt, pyqtSignal
 from gui.widgets.file_explorer import FileExplorer
 from gui.widgets.console_widget import ConsoleWidget
+from gui.widgets.bombear import bombear_eventos
 from gui.questdb_bootstrap import mostrar_bootstrap_questdb
 from core.config import (get_base_data, LIMPIADOS_DIR, TF_LABELS, TIPO_LABELS,
                           TIPO_MAP, SCRIPTS_DIR, CATEGORIAS_DESCARGA_CONOCIDAS)
@@ -27,6 +28,9 @@ _TIPO_SUGERIDO = {
     'METAL': 'Futuro/Cfd',
 }
 
+_CHEVRON_SVG = os.path.join(os.path.dirname(__file__), '..', 'assets',
+                            'chevron-down.svg').replace('\\', '/')
+
 STYLE_IMPORT = """
 QWidget { background-color: #141e30; }
 QPushButton {
@@ -44,16 +48,33 @@ QPushButton#success:hover { background-color: #1a3a2a; }
 QPushButton#success:pressed { padding-top: 10px; padding-bottom: 6px; }
 QLabel#path { color: #3a5a7a; font-size: 10px; padding: 2px 0; }
 QLabel#title { color: #4fc3f7; font-size: 13px; font-weight: bold; }
-QLineEdit, QComboBox {
+QLineEdit {
     background-color: #1a2a45; color: #c8d6e5; border: none;
     padding: 6px 10px; border-radius: 4px; font-size: 11px; min-width: 90px;
 }
-QComboBox { combobox-popup: 0; }
-QComboBox::drop-down { border: none; background: transparent; width: 20px; }
-QComboBox::down-arrow { border: none; }
+QComboBox {
+    background-color: #111828; font-size: 11px; min-width: 90px;
+    combobox-popup: 0;
+}
+QComboBox::drop-down { border: none; background: transparent; width: 22px; }
+QComboBox::down-arrow {
+    image: url("__CHEVRON__");
+    width: 12px; height: 8px;
+}
+QComboBox::down-arrow:on { }
 QComboBox QAbstractItemView {
-    background-color: #1a2a45; color: #c8d6e5; selection-background-color: #2a4a6a;
+    background-color: #1a2a45; color: #c8d6e5;
+    selection-background-color: #2a4a6a; selection-color: #4fc3f7;
     border: 1px solid #253a60; outline: none; margin: 0px;
+}
+QComboBox QAbstractItemView::item {
+    padding: 6px 10px; border-bottom: 1px solid #182030;
+}
+QComboBox QAbstractItemView::item:selected {
+    background-color: #2a4a6a; color: #4fc3f7;
+}
+QComboBox QAbstractItemView::item:hover {
+    background-color: #223755;
 }
 QFrame#sep { background-color: #253a60; max-height: 1px; }
 """
@@ -63,7 +84,7 @@ class TabImportar(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setStyleSheet(STYLE_IMPORT)
+        self.setStyleSheet(STYLE_IMPORT.replace('__CHEVRON__', _CHEVRON_SVG))
         self._selected_file = None
         self._running_clean = False
         self._base_data = get_base_data()
@@ -164,6 +185,7 @@ class TabImportar(QWidget):
 
         self.splitter.setSizes([350, 600])
         layout.addWidget(self.splitter, 1)
+        bombear_eventos()
 
     def update_base_data(self, path):
         self._base_data = path
@@ -203,6 +225,17 @@ class TabImportar(QWidget):
         self.path_label.setText(os.path.basename(path))
         self.btn_config.setEnabled(True)
         self.btn_delete.setEnabled(True)
+        # Restaurar rf_rate del sidecar si existe
+        info_path = path + '.import_info'
+        if os.path.exists(info_path):
+            try:
+                with open(info_path) as f:
+                    info = json.load(f)
+                rf = info.get('rf_rate')
+                if rf is not None:
+                    self.rf_input.setText(str(rf))
+            except Exception:
+                pass
         etiqueta = _TIPO_SUGERIDO.get(self._detectar_categoria(path))
         if etiqueta:
             self.tipo_input.setCurrentText(etiqueta)
@@ -337,6 +370,15 @@ class TabImportar(QWidget):
             self._running_clean = False
             self._reset_ui()
             self._save_meta()
+            # Guardar sidecar junto al archivo origen para recordar rf_rate
+            info_path = self._selected_file + '.import_info'
+            rf = self._config.get('rf_rate') if self._config else None
+            if rf is not None and self._selected_file:
+                try:
+                    with open(info_path, 'w', encoding='utf-8') as f:
+                        json.dump({'rf_rate': rf}, f)
+                except Exception:
+                    pass
             self.import_completed.emit()
         else:
             self._running_clean = False

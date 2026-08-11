@@ -10,7 +10,11 @@ from gui.widgets.tab_patrones import TabPatrones
 from gui.widgets.analisis_graficos import GraficosAnalisis
 from gui.widgets.analisis_tarjetas import TarjetasKPI
 from gui.widgets.plot_common import icono_ayuda
+from gui.widgets.bombear import bombear_eventos
 from core.config import tf_to_minutes
+
+_CHEVRON_SVG = os.path.join(os.path.dirname(__file__), '..', 'assets',
+                            'chevron-down.svg').replace('\\', '/')
 
 STYLE_ANALISIS = """
 QWidget { background-color: #141e30; }
@@ -29,15 +33,28 @@ QPushButton#periodo_del {
 }
 QPushButton#periodo_del:hover { background-color: #4a2525; }
 QComboBox {
-    background-color: #1a2a45; color: #c8d6e5; border: none;
-    padding: 6px 10px; border-radius: 4px; font-size: 12px; min-width: 140px;
+    background-color: #111828; font-size: 12px; min-width: 140px;
     combobox-popup: 0;
 }
 QComboBox::drop-down { border: none; background: transparent; width: 22px; }
-QComboBox::down-arrow { border: none; }
+QComboBox::down-arrow {
+    image: url("__CHEVRON__");
+    width: 12px; height: 8px;
+}
+QComboBox::down-arrow:on { }
 QComboBox QAbstractItemView {
-    background-color: #1a2a45; color: #c8d6e5; selection-background-color: #2a4a6a;
+    background-color: #1a2a45; color: #c8d6e5;
+    selection-background-color: #2a4a6a; selection-color: #4fc3f7;
     border: 1px solid #253a60; outline: none; margin: 0px;
+}
+QComboBox QAbstractItemView::item {
+    padding: 6px 10px; border-bottom: 1px solid #182030;
+}
+QComboBox QAbstractItemView::item:selected {
+    background-color: #2a4a6a; color: #4fc3f7;
+}
+QComboBox QAbstractItemView::item:hover {
+    background-color: #223755;
 }
 QComboBox QAbstractItemView::item:disabled {
     background-color: #0d1424; color: #3a5a7a;
@@ -600,7 +617,7 @@ class MetricsScroll(QScrollArea):
 class TabAnalisis(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setStyleSheet(STYLE_ANALISIS)
+        self.setStyleSheet(STYLE_ANALISIS.replace('__CHEVRON__', _CHEVRON_SVG))
         self._pdf_path = None
         self._page_map = None
         self._metrics_path = None
@@ -688,6 +705,7 @@ class TabAnalisis(QWidget):
         self.metrics_scroll = MetricsScroll()
         lay_metricas.addWidget(self.metrics_scroll, 1)
         self.inner_tabs.addTab(pagina_metricas, "  Metricas  ")
+        bombear_eventos()
 
         # ── Graficos: nativos si el analisis trae datos, visor PDF si no ──
         # Los informes generados antes de esta version solo tienen el PDF; en
@@ -697,6 +715,7 @@ class TabAnalisis(QWidget):
 
         self.graphs_native = GraficosAnalisis()
         self.graphs_stack.addWidget(self.graphs_native)          # indice 0
+        bombear_eventos()
 
         pagina_pdf = QWidget()
         lay_pdf = QVBoxLayout(pagina_pdf)
@@ -718,6 +737,7 @@ class TabAnalisis(QWidget):
 
         self.patterns_tab = TabPatrones()
         self.inner_tabs.addTab(self.patterns_tab, "  Patrones de velas  ")
+        bombear_eventos()
 
         layout.addWidget(self.inner_tabs, 1)
 

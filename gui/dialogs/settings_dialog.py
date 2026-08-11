@@ -7,7 +7,6 @@ from PyQt6.QtGui import QIcon
 
 from core.config import (
     get_base_data, set_base_data, PROJECT_ROOT,
-    get_finnhub_api_key, set_finnhub_api_key,
 )
 from core.questdb_manager import is_reachable, detener_bundled
 from gui.questdb_bootstrap import mostrar_bootstrap_questdb
@@ -119,23 +118,19 @@ class SettingsDialog(QDialog):
         sep3.setFixedHeight(1)
         layout.addWidget(sep3)
 
-        subtitle_noticias = QLabel("Calendario económico (Finnhub):")
+        subtitle_noticias = QLabel("Calendario económico:")
         subtitle_noticias.setObjectName("subtitle")
         layout.addWidget(subtitle_noticias)
 
-        self.finnhub_key_input = QLineEdit(get_finnhub_api_key())
-        self.finnhub_key_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self.finnhub_key_input.setPlaceholderText("API key gratuita de finnhub.io")
-        layout.addWidget(self.finnhub_key_input)
-
-        desc_noticias = QLabel(
-            " Se usa para el filtro «Evitar noticias» del Constructor y para "
-            "dibujar eventos económicos en Resultados. Gratis en finnhub.io "
-            "(60 peticiones/min, sin tarjeta)."
+        te_prox = QLabel(
+            "Próximamente: el calendario económico está en revisión (sin "
+            "proveedor gratuito fiable). El filtro «Evitar noticias» y las "
+            "líneas de eventos en Resultados volverán cuando se estabilice "
+            "la fuente de datos."
         )
-        desc_noticias.setObjectName("desc")
-        desc_noticias.setWordWrap(True)
-        layout.addWidget(desc_noticias)
+        te_prox.setObjectName("desc")
+        te_prox.setWordWrap(True)
+        layout.addWidget(te_prox)
 
         layout.addStretch()
 
@@ -180,7 +175,6 @@ class SettingsDialog(QDialog):
             self.path_input.setText(path)
 
     def _apply(self):
-        set_finnhub_api_key(self.finnhub_key_input.text())
         path = self.path_input.text().strip()
         if not path:
             return

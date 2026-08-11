@@ -1,17 +1,19 @@
 """
-Calendario económico histórico (Finnhub) para backtesting event-driven.
+Calendario económico histórico (TradingEconomics) para backtesting
+event-driven.
 
-Proveedor gratuito: https://finnhub.io/docs/api/economic-calendar — 60
-peticiones/minuto sin tarjeta de crédito, con eventos históricos y futuros
-(actual/estimado/previo, impacto bajo/medio/alto). No hay filtro por país en
-el endpoint, así que se descarga todo y el filtrado por moneda/impacto ocurre
-más arriba (core/strategies.py), no aquí: este módulo solo sabe "traer
-eventos crudos de un rango de fechas", nada de lógica de setups.
+Proveedor gratuito: https://tradingeconomics.com/api — plan free con ~100
+peticiones/mes (cada mes descargado = 1 petición; la caché mensual en disco
+lo hace viable). Devuelve eventos históricos y futuros con impacto
+High/Medium/Low. No hay filtro por país en el endpoint, así que se descarga
+todo y el filtrado por moneda/impacto ocurre más arriba
+(core/strategies.py), no aquí: este módulo solo sabe "traer eventos crudos
+de un rango de fechas", nada de lógica de setups.
 
-Caché en disco: un fichero JSON por mes calendario bajo BASE_DATA/Noticias/.
-Un mes ya cerrado (su último día es anterior a hoy) es inmutable y nunca se
-vuelve a pedir; el mes en curso siempre se re-descarga porque puede tener
-eventos futuros/no confirmados.
+Caché en disco: un fichero JSON por mes calendario bajo BASE_DATA/Noticias/
+(economico_YYYY-MM.json). Un mes ya cerrado es inmutable y nunca se vuelve a
+pedir; el mes en curso siempre se re-descarga porque puede tener eventos
+futuros/no confirmados.
 """
 
 import json
@@ -25,12 +27,12 @@ import requests
 
 from core.config import get_base_data
 
-FINNHUB_URL = "https://finnhub.io/api/v1/calendar/economic"
-REQUEST_TIMEOUT = 20
-_SLEEP_ENTRE_LLAMADAS = 1.1  # margen holgado frente al límite de 60/min
+TE_URL = "https://api.tradingeconomics.com/calendar"
+REQUEST_TIMEOUT = 30
+_SLEEP_ENTRE_LLAMADAS = 1.1  # margen frente a límites de la API
 
 IMPACTO_RANK = {'bajo': 0, 'medio': 1, 'alto': 2}
-_FINNHUB_IMPACTO_MAP = {'': 'bajo', 'low': 'bajo', 'medium': 'medio', 'high': 'alto'}
+_TE_IMPACTO_MAP = {'High': 'alto', 'Medium': 'medio', 'Low': 'bajo'}
 
 DESCRIPCION_IMPACTO = {
     'alto': (
@@ -51,6 +53,34 @@ DESCRIPCION_IMPACTO = {
         "rutinarias y similares."
     ),
 }
+
+# TradingEconomics devuelve el país por NOMBRE ("United States"); el filtro
+# por moneda (core/strategies.py) compara códigos ISO, así que se mapean los
+# nombres de los países con divisa relevante. Si no se reconoce el nombre se
+# devuelve tal cual (el filtro por moneda simplemente no restringe).
+_PAISES_TE_A_ISO = {
+    'United States': 'US', 'United Kingdom': 'GB', 'Germany': 'DE',
+    'France': 'FR', 'Italy': 'IT', 'Spain': 'ES', 'Japan': 'JP',
+    'China': 'CN', 'Australia': 'AU', 'Canada': 'CA', 'Switzerland': 'CH',
+    'New Zealand': 'NZ', 'Euro Area': 'EU', 'Netherlands': 'NL',
+    'Belgium': 'BE', 'Sweden': 'SE', 'Norway': 'NO', 'Denmark': 'DK',
+    'Austria': 'AT', 'Portugal': 'PT', 'Ireland': 'IE', 'Poland': 'PL',
+    'Russia': 'RU', 'India': 'IN', 'Brazil': 'BR', 'Mexico': 'MX',
+    'South Korea': 'KR', 'Singapore': 'SG', 'Hong Kong': 'HK',
+    'South Africa': 'ZA', 'Turkey': 'TR', 'Indonesia': 'ID',
+    'Thailand': 'TH', 'Malaysia': 'MY', 'Israel': 'IL', 'Argentina': 'AR',
+    'Chile': 'CL', 'Colombia': 'CO', 'Egypt': 'EG', 'Saudi Arabia': 'SA',
+    'Nigeria': 'NG', 'Greece': 'GR', 'Czech Republic': 'CZ',
+    'Hungary': 'HU', 'Romania': 'RO', 'Finland': 'FI', 'Luxembourg': 'LU',
+    'Ukraine': 'UA', 'Taiwan': 'TW', 'Philippines': 'PH',
+}
+
+
+def _pais_a_iso(nombre):
+    if not nombre:
+        return ''
+    return _PAISES_TE_A_ISO.get(str(nombre).strip(), str(nombre).strip())
+
 
 # pares/instrumentos -> monedas relevantes (heurística por nombre; None si no
 # se reconoce nada, en cuyo caso el filtro de noticias solo actúa por
@@ -120,30 +150,62 @@ def _df_vacio():
     })
 
 
-def _fetch_finnhub_mes(anio, mes, api_key):
-    """Una petición al endpoint de Finnhub cubriendo el mes completo."""
+def _fetch_te_mes(anio, mes, api_key):
+    """Una petición al endpoint de TradingEconomics cubriendo el mes completo.
+
+    TradingEconomics devuelve JSON con cada evento: Country (nombre), Event
+    (o Category), Date (ISO) e Importance ('High'/'Medium'/'Low'). Las
+    fechas llegan sin zona horaria explícita: se asumen UTC (aproximado,
+    coherente con el nivel del filtro de noticias).
+    """
     _, ultimo_dia = monthrange(anio, mes)
     desde = date(anio, mes, 1).isoformat()
     hasta = date(anio, mes, ultimo_dia).isoformat()
-    resp = requests.get(
-        FINNHUB_URL,
-        params={'from': desde, 'to': hasta, 'token': api_key},
-        timeout=REQUEST_TIMEOUT,
-    )
+    try:
+        resp = requests.get(
+            TE_URL,
+            params={'c': api_key, 'd1': desde, 'd2': hasta},
+            timeout=REQUEST_TIMEOUT,
+        )
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(
+            f"No se pudo conectar con TradingEconomics: {e.__class__.__name__}") from e
+    if resp.status_code in (401, 403):
+        raise RuntimeError(
+            "La API key de TradingEconomics no es válida (HTTP "
+            f"{resp.status_code}): revísala en Ajustes → Calendario "
+            "económico y copia la key de tu panel de tradingeconomics.com.")
+    if resp.status_code == 429:
+        raise RuntimeError(
+            "Límite de peticiones de TradingEconomics alcanzado (HTTP 429): "
+            "el plan gratuito permite ~100 al mes — espera al mes siguiente "
+            "o usa los meses ya cacheados.")
     resp.raise_for_status()
-    datos = (resp.json() or {}).get('economicCalendar') or []
-    if not datos:
+    try:
+        datos = resp.json()
+    except ValueError as e:
+        raise RuntimeError(
+            f"TradingEconomics devolvió una respuesta no válida: {e}") from e
+    if not isinstance(datos, list) or not datos:
         return _df_vacio()
     filas = []
     for ev in datos:
-        ts_raw = ev.get('time') or ev.get('date')
+        if not isinstance(ev, dict):
+            continue
+        ts_raw = ev.get('Date') or ev.get('date')
         if not ts_raw:
             continue
+        try:
+            ts = pd.to_datetime(ts_raw, utc=True)
+        except (ValueError, TypeError):
+            continue
+        impacto = _TE_IMPACTO_MAP.get(
+            str(ev.get('Importance') or '').strip().capitalize(), 'bajo')
         filas.append({
-            'timestamp': pd.to_datetime(ts_raw, utc=True),
-            'pais': (ev.get('country') or '').upper(),
-            'evento': ev.get('event') or '',
-            'impacto': _FINNHUB_IMPACTO_MAP.get((ev.get('impact') or '').lower(), 'bajo'),
+            'timestamp': ts,
+            'pais': _pais_a_iso(ev.get('Country')),
+            'evento': ev.get('Event') or ev.get('Category') or '',
+            'impacto': impacto,
         })
     return _filas_a_df(filas) if filas else _df_vacio()
 
@@ -163,26 +225,36 @@ def _meses_en_rango(fecha_inicio, fecha_fin):
     return meses
 
 
-def obtener_eventos(fecha_inicio, fecha_fin, api_key=None, impacto_minimo=None):
+def obtener_eventos(fecha_inicio, fecha_fin, api_key=None, impacto_minimo=None,
+                    progress_callback=None):
     """Eventos económicos históricos en [fecha_inicio, fecha_fin] (UTC).
 
     Devuelve un DataFrame con columnas timestamp/pais/evento/impacto. Usa
-    caché mensual en disco y solo llama a Finnhub para meses sin caché
-    válida (el mes en curso siempre se refresca).
+    caché mensual en disco y solo llama a TradingEconomics para meses sin
+    caché válida (el mes en curso siempre se refresca).
+
+    `progress_callback(i, total)` se invoca por cada mes procesado (i
+    empieza en 1), para que el llamador pueda dar feedback de progreso —
+    con rangos largos la descarga de años de eventos puede tardar
+    minutos y sin esto parece que el proceso está congelado.
     """
     if not api_key:
         raise RuntimeError(
-            "Finnhub API key no configurada. Añádela en Ajustes → "
-            "Proveedor de calendario económico.")
+            "API key de TradingEconomics no configurada. Añádela en "
+            "Ajustes → Calendario económico.")
 
+    meses = _meses_en_rango(fecha_inicio, fecha_fin)
+    total_meses = len(meses)
     partes = []
     primero = True
-    for anio, mes in _meses_en_rango(fecha_inicio, fecha_fin):
+    for i, (anio, mes) in enumerate(meses):
+        if progress_callback:
+            progress_callback(i + 1, total_meses)
         df_mes = _cargar_mes_cache(anio, mes)
         if df_mes is None:
             if not primero:
                 time.sleep(_SLEEP_ENTRE_LLAMADAS)
-            df_mes = _fetch_finnhub_mes(anio, mes, api_key)
+            df_mes = _fetch_te_mes(anio, mes, api_key)
             primero = False
             if _mes_es_pasado(anio, mes):
                 _guardar_mes_cache(anio, mes, df_mes)

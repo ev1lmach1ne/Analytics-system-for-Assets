@@ -13,3 +13,6 @@ venv/
 dist/
 cache/
 *.spec
+# Datos personales del usuario (sistemas y favoritos guardados)
+Favoritos/
+Sistemas/

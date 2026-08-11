@@ -7,6 +7,9 @@ from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
 from PyQt6.QtCore import Qt
 from core.connectors import load_connectors, save_connector, delete_connector
 
+_CHEVRON_SVG = os.path.join(os.path.dirname(__file__), '..', 'assets',
+                            'chevron-down.svg').replace('\\', '/')
+
 STYLE = """
 QDialog {
     background-color: #141e30; color: #c8d6e5;
@@ -14,15 +17,39 @@ QDialog {
 QLabel {
     color: #c8d6e5; font-size: 11px;
 }
-QLineEdit, QComboBox {
+QLineEdit {
     background-color: #1a2a45; color: #c8d6e5; border: none;
     padding: 6px 10px; border-radius: 4px; font-size: 11px;
 }
-QComboBox::drop-down { border: none; background: transparent; width: 20px; }
-QComboBox::down-arrow { border: none; }
+QComboBox {
+    background-color: #111828; font-size: 11px;
+    combobox-popup: 0;
+}
+QComboBox::drop-down { border: none; background: transparent; width: 22px; }
+QComboBox::down-arrow {
+    image: url("__CHEVRON__");
+    width: 12px; height: 8px;
+}
+QComboBox::down-arrow:on { }
 QComboBox QAbstractItemView {
-    background-color: #1a2a45; color: #c8d6e5; selection-background-color: #2a4a6a;
-    border: 1px solid #253a60; outline: none;
+    background-color: #1a2a45; color: #c8d6e5;
+    selection-background-color: #2a4a6a; selection-color: #4fc3f7;
+    border: 1px solid #253a60; outline: none; margin: 0px;
+}
+QComboBox QAbstractItemView::item {
+    padding: 6px 10px; border-bottom: 1px solid #182030;
+}
+QComboBox QAbstractItemView::item:selected {
+    background-color: #2a4a6a; color: #4fc3f7;
+}
+QComboBox QAbstractItemView::item:hover {
+    background-color: #223755;
+}
+QComboBox QAbstractItemView::item:disabled {
+    background-color: #0d1424; color: #3a5a7a;
+}
+QComboBox QAbstractItemView::item:disabled:hover {
+    background-color: #0d1424;
 }
 QPushButton {
     background-color: #2a4a6a; color: #4fc3f7; border: none;
@@ -48,7 +75,7 @@ QFrame#sep { background-color: #253a60; max-height: 1px; }
 class ConnectorDialog(QDialog):
     def __init__(self, edit_name=None, parent=None):
         super().__init__(parent)
-        self.setStyleSheet(STYLE)
+        self.setStyleSheet(STYLE.replace('__CHEVRON__', _CHEVRON_SVG))
         self.setWindowTitle("Conector de datos" if not edit_name else f"Editar: {edit_name}")
         self.setMinimumWidth(420)
 

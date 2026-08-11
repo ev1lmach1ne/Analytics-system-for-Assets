@@ -19,8 +19,9 @@ from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QCheckBox,
     QScrollArea, QFrame, QTableWidget, QTableWidgetItem, QHeaderView,
-    QSizePolicy, QPushButton, QButtonGroup, QInputDialog,
+    QSizePolicy, QPushButton, QButtonGroup, QInputDialog, QApplication,
 )
+from gui.widgets.bombear import bombear_eventos
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.patches import Rectangle
@@ -965,15 +966,19 @@ class TabPatrones(QWidget):
         self.tabla.setAlternatingRowColors(True)
         self.tabla.setSortingEnabled(True)
         self._cont_lay.addWidget(self.tabla)
+        bombear_eventos()
 
         self._cards = {}
-        for nombre in PATRONES_INFO:
+        for i, nombre in enumerate(PATRONES_INFO):
+            if i and i % 5 == 0:
+                bombear_eventos()
             card = PatternCard(nombre)
             card.clear_stats()
             card.setVisible(nombre in PATRONES_ORIGINALES)
             self._cards[nombre] = card
             self._cont_lay.addWidget(card)
         self._cont_lay.addStretch()
+        bombear_eventos()
 
         scroll.setWidget(cont)
         root.addWidget(scroll, 1)
@@ -1111,6 +1116,30 @@ class TabPatrones(QWidget):
         if th in self._threads:
             self._threads.remove(th)
         th.deleteLater()
+
+    def _apagar_hilos(self):
+        """Espera a que terminen los escaneos/resamples en vuelo antes de
+        cerrar la ventana (si no, Qt destruiría un QThread vivo → abort).
+        wait() bloqueante: bombear eventos en mitad del cierre corrompe el
+        montón."""
+        while self._threads:
+            th = self._threads[0]
+            # desconectar: una señal encolada entregada en el teardown aborta
+            try:
+                th.computed.disconnect()
+                th.finished.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+            try:
+                th.requestInterruption()
+                th.wait()
+            except Exception:
+                pass
+            self._threads.pop(0)
+            try:
+                th.deleteLater()
+            except Exception:
+                pass
 
     def _aplicar_payload_combos(self, payload):
         self.cmb_er.setEnabled(payload['tiene_er'])

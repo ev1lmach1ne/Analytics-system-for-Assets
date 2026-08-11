@@ -1229,6 +1229,21 @@ def _mascara_filtros_setup(df, filtros, eventos_noticias=None, avisos=None):
     ses = filtros.get('sesion') or {}
     tipo_sesion = ses.get('tipo', 'ninguna')
 
+    # En TF diario o mayor el filtro de sesión por horas es inaplicable:
+    # todas las velas caen a la misma hora del día, así que un rango horario
+    # (o una sesión overnight/Londres/NY) deja 0 velas dentro → 0 señales.
+    # Se ignora el filtro (con aviso) en vez de anular el backtest.
+    _tf_diario = False
+    if tipo_sesion != 'ninguna':
+        try:
+            _ts_int = df['timestamp'].values.astype('datetime64[s]').astype(np.int64)
+            _deltas = np.diff(_ts_int)
+            _tf_diario = bool(len(_deltas)) and float(np.median(_deltas)) >= 86400.0
+        except Exception:
+            _tf_diario = False
+        if _tf_diario:
+            tipo_sesion = 'ninguna'
+
     necesita_er = metodo in METODOS_REGIMEN_ER
     necesita_hurst = metodo in METODOS_REGIMEN_HURST
     necesita_ctx = necesita_er or necesita_hurst or tipo_sesion in ('overnight', 'londres', 'ny')
@@ -1236,6 +1251,10 @@ def _mascara_filtros_setup(df, filtros, eventos_noticias=None, avisos=None):
     def _avisar(texto):
         if avisos is not None and texto not in avisos:
             avisos.append(texto)
+
+    if _tf_diario:
+        _avisar("Filtro de sesión ignorado: el timeframe es diario o mayor, "
+                "no se puede filtrar por horas")
 
     if necesita_ctx:
         close = df['close'].values.astype(np.float64)
@@ -1309,7 +1328,22 @@ def _mascara_filtros_setup(df, filtros, eventos_noticias=None, avisos=None):
             ts_velas = df['timestamp'].values.astype('datetime64[s]').astype(np.int64)
             antes_s = int(noticias.get('minutos_antes', 30)) * 60
             despues_s = int(noticias.get('minutos_despues', 30)) * 60
-            m_noticias = _mascara_evitar_ventanas(ts_velas, ts_ev_f, antes_s, despues_s)
+            # La ventana solo puede bloquear VELAS COMPLETAS (timestamps
+            # discretos). Si es menor que la duración del TF puede caer entre
+            # velas y no bloquear nada — ni siquiera la vela que CONTIENE el
+            # evento. Se expande al TF: bloquear al menos la vela completa que
+            # contiene el evento, y se avisa de la ampliación.
+            _deltas_ts = np.diff(ts_velas)
+            tf_s = int(np.median(_deltas_ts)) if len(_deltas_ts) else 0
+            antes_ef = max(antes_s, tf_s)
+            despues_ef = max(despues_s, tf_s)
+            if tf_s > 0 and (antes_ef > antes_s or despues_ef > despues_s):
+                _avisar(
+                    f"La ventana de noticias ({antes_s // 60}-{despues_s // 60} "
+                    f"min) es menor que el timeframe ({tf_s // 60} min): se "
+                    f"bloqueará al menos la vela completa que contiene el evento")
+            m_noticias = _mascara_evitar_ventanas(
+                ts_velas, ts_ev_f, antes_ef, despues_ef)
             m &= m_noticias
             if noticias.get('cerrar_posiciones'):
                 m_forzar_salida = ~m_noticias
@@ -1968,7 +2002,7 @@ def validar_parciales(parciales):
 def validar_tramos(tramos):
     """Avisos de una lista de tramos de entrada escalonada (vacío = válida).
 
-    Cada «Entrar %» es una porción del RIESGO total del setup, así que la suma
+    Cada «Entrar %» es una porcion del RIESGO total del setup, asi que la suma
     no debería pasar del 100%: por encima, el sistema arriesgaría más de lo
     pretendido (el motor no lo recorta, ver core/backtest)."""
     total = 0.0
@@ -1978,7 +2012,7 @@ def validar_tramos(tramos):
         except (TypeError, ValueError):
             pass
     if total > 100.0 + 1e-9:
-        return [f"Los tramos suman {total:g}% del riesgo: el sistema "
+        return [f"Los promedios suman {total:g}% del riesgo: el sistema "
                 "arriesgaría más de lo pretendido."]
     return []
 

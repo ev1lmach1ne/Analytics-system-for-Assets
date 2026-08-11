@@ -32,6 +32,7 @@ from gui.widgets.plot_common import (
     BarraGrafico, fmt, agregar_crosshair, eje_fechas, FIG_BG, AX_FG, GRID_C,
     VERDE, ROJO, GRIS, AMBAR, AZUL, NARANJA, TEXTO_TENUE, ER_TENDENCIA,
     ER_TRANSICION, ER_RUIDO)
+from gui.widgets.bombear import bombear_eventos
 
 ESTILO = """
 QScrollArea { border: none; background: transparent; }
@@ -833,6 +834,7 @@ class _Seccion(QGroupBox):
         cabecera.addWidget(self.barra)
         lay.addLayout(cabecera)
         lay.addWidget(self.canvas, 1)
+        bombear_eventos()
 
     def eventFilter(self, obj, event):
         # FigureCanvasQTAgg acepta los eventos de rueda (los traduce a
@@ -938,6 +940,7 @@ class GraficosAnalisis(QWidget):
 
         self._paginas = []
         self._construir()
+        bombear_eventos()
 
         # ← / → cambian de pestaña temática desde cualquier punto de la vista.
         # Se usan atajos con contexto WidgetWithChildren en vez de keyPressEvent
@@ -1221,11 +1224,13 @@ class GraficosAnalisis(QWidget):
             _dib_dashboard_natr, alto=560, depende_ventana=True))
         natr.cerrar()
 
-        for titulo, pagina in (("  Resumen  ", resumen), ("  Riesgo  ", riesgo),
+        for i, (titulo, pagina) in enumerate((("  Resumen  ", resumen), ("  Riesgo  ", riesgo),
                                ("  Intradía  ", intradia), ("  Régimen ER  ", regimen),
-                               ("  Dependencia  ", dependencia), ("  NATR  ", natr)):
+                               ("  Dependencia  ", dependencia), ("  NATR  ", natr))):
             self._paginas.append(pagina)
             self.tabs.addTab(pagina, titulo)
+            if i and i % 2 == 0:
+                bombear_eventos()
 
     def _crear_tabla_pares(self):
         cols = ['Horizonte', 'Par', 'NATR base', 'NATR target', 'Ratio', 'Lead-Lag']

@@ -3,13 +3,18 @@ import pandas as pd
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                              QLabel, QLineEdit, QFrame, QTableWidget, QTableWidgetItem,
                              QHeaderView, QMessageBox, QAbstractItemView, QSplitter,
-                              QComboBox, QStackedWidget, QProgressBar, QSizePolicy)
-from PyQt6.QtCore import Qt, pyqtSignal
+                              QComboBox, QStackedWidget, QProgressBar, QSizePolicy,
+                              QApplication)
+from PyQt6.QtCore import Qt, pyqtSignal, QThread
 from gui.widgets.file_explorer import FileExplorer
 from gui.widgets.console_widget import ConsoleWidget
 from gui.widgets.rango_dialog import RangoAnalisisDialog
+from gui.widgets.bombear import bombear_eventos
 
 from core.config import get_base_data, SCRIPTS_DIR, TF_PATTERN
+
+_CHEVRON_SVG = os.path.join(os.path.dirname(__file__), '..', 'assets',
+                            'chevron-down.svg').replace('\\', '/')
 
 STYLE_LIMPIADOS = """
 QWidget { background-color: #141e30; }
@@ -51,15 +56,28 @@ QHeaderView::section {
     padding: 6px 8px; font-weight: bold; font-size: 11px;
 }
 QComboBox {
-    background-color: #1a2a45; color: #c8d6e5; border: none;
-    padding: 6px 10px; border-radius: 4px; font-size: 12px; min-width: 140px;
+    background-color: #111828; font-size: 12px; min-width: 140px;
     combobox-popup: 0;
 }
 QComboBox::drop-down { border: none; background: transparent; width: 22px; }
-QComboBox::down-arrow { border: none; }
+QComboBox::down-arrow {
+    image: url("__CHEVRON__");
+    width: 12px; height: 8px;
+}
+QComboBox::down-arrow:on { }
 QComboBox QAbstractItemView {
-    background-color: #1a2a45; color: #c8d6e5; selection-background-color: #2a4a6a;
+    background-color: #1a2a45; color: #c8d6e5;
+    selection-background-color: #2a4a6a; selection-color: #4fc3f7;
     border: 1px solid #253a60; outline: none; margin: 0px;
+}
+QComboBox QAbstractItemView::item {
+    padding: 6px 10px; border-bottom: 1px solid #182030;
+}
+QComboBox QAbstractItemView::item:selected {
+    background-color: #2a4a6a; color: #4fc3f7;
+}
+QComboBox QAbstractItemView::item:hover {
+    background-color: #223755;
 }
 QLineEdit {
     background-color: #1a2a45; color: #c8d6e5; border: none;
@@ -68,25 +86,56 @@ QLineEdit {
 QFrame#sep { background-color: #253a60; max-height: 1px; }
 """
 
+
+class _ScanAssetsThread(QThread):
+    """Escaneo de Limpiados/ en segundo plano (nombres de activos ordenados)."""
+
+    terminado = pyqtSignal(list)
+
+    def __init__(self, directorio, parent=None):
+        super().__init__(parent)
+        self._directorio = directorio
+
+    def run(self):
+        assets = set()
+        if os.path.isdir(self._directorio):
+            for root, dirs, files in os.walk(self._directorio):
+                if 'Informes' in root:
+                    continue
+                if any(f.endswith('_limpiado.csv') or f.endswith('_limpio.csv')
+                       for f in files):
+                    assets.add(os.path.basename(root))
+        self.terminado.emit(sorted(assets))
+
+
 class TabLimpiados(QWidget):
     analysis_completed = pyqtSignal(str, str, str, str, str)
     file_selected = pyqtSignal(str, str)
 
     def set_analisis_tab(self, tab):
-        self._analisis_tab = tab
+        """Acepta el widget de Análisis o un callable que lo devuelva (la
+        pestaña se construye bajo demanda; puede no existir aún)."""
+        self._analisis_tab_ref = tab
+
+    @property
+    def _analisis_tab(self):
+        ref = getattr(self, '_analisis_tab_ref', None)
+        return ref() if callable(ref) else ref
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setStyleSheet(STYLE_LIMPIADOS)
+        self.setStyleSheet(STYLE_LIMPIADOS.replace('__CHEVRON__', _CHEVRON_SVG))
         self._selected_path = None
         self._selected_nombre = None
         self._selected_tf = '1h'
         self._selected_activo = 'FUTURO'
         self._cached_pdf = None
         self._cached_metrics = None
-        self._analisis_tab = None
+        self._analisis_tab_ref = None
         self._grid_mode = True
         self._rf_rate = 0.0
+        self._scan_thread = None
+        self._scan_done_cb = None
         self._base_data = get_base_data()
         # No usar la constante LIMPIADOS_DIR: se copia al importar el módulo
         # y en el primer arranque eso ocurre antes de que el usuario elija
@@ -200,6 +249,7 @@ class TabLimpiados(QWidget):
 
         splitter.setSizes([250, 300, 300])
         layout.addWidget(splitter, 1)
+        bombear_eventos()
 
         # ── Analyze buttons ──
         btn_row = QHBoxLayout()
@@ -232,8 +282,8 @@ class TabLimpiados(QWidget):
         btn_row.addWidget(self.progress)
         layout.addLayout(btn_row)
 
-        # Initial scan for table mode
-        self._scan_assets()
+        # Initial scan for table mode (en segundo plano para no bloquear el arranque)
+        self._scan_assets_async()
 
     # ── Search filter ──
 
@@ -285,6 +335,10 @@ class TabLimpiados(QWidget):
         self._scan_assets()
 
     def _scan_assets(self):
+        """Escaneo síncrono de activos (para llamadas puntuales)."""
+        self._poblar_activos(self._colectar_activos())
+
+    def _colectar_activos(self):
         assets = set()
         if os.path.isdir(self._limpiados_dir):
             for root, dirs, files in os.walk(self._limpiados_dir):
@@ -293,13 +347,65 @@ class TabLimpiados(QWidget):
                 if any(f.endswith('_limpiado.csv') or f.endswith('_limpio.csv')
                        for f in files):
                     assets.add(os.path.basename(root))
+        return sorted(assets)
+
+    def _poblar_activos(self, assets):
         self.asset_combo.blockSignals(True)
         self.asset_combo.clear()
         self.asset_combo.addItem("-- Seleccionar activo --")
-        for a in sorted(assets):
+        for a in assets:
             self.asset_combo.addItem(a)
         self.asset_combo.blockSignals(False)
         self.asset_table.setRowCount(0)
+
+    def _scan_assets_async(self, done_cb=None):
+        """Escaneo en segundo plano; al terminar rellena el combo. done_cb se
+        llama en el hilo principal (p. ej. para ocultar el overlay)."""
+        self._detener_scan()
+        self._scan_done_cb = done_cb
+        th = _ScanAssetsThread(self._limpiados_dir, parent=self)
+        th.terminado.connect(self._on_scan_terminado)
+        self._scan_thread = th
+        th.start()
+
+    def _detener_scan(self):
+        th = getattr(self, '_scan_thread', None)
+        if th is not None:
+            try:
+                th.requestInterruption()
+                th.wait(150)
+            except Exception:
+                pass
+            self._scan_thread = None
+
+    def _on_scan_terminado(self, assets):
+        self._poblar_activos(assets)
+        self._scan_thread = None
+        cb = self._scan_done_cb
+        self._scan_done_cb = None
+        if cb:
+            try:
+                cb()
+            except Exception:
+                pass
+
+    def _apagar_hilos(self):
+        """Espera a que termine el escaneo en vuelo antes de cerrar (si no,
+        Qt destruiría un QThread vivo → abort del proceso). wait() bloqueante:
+        bombear eventos en mitad del cierre corrompe el montón."""
+        th = getattr(self, '_scan_thread', None)
+        if th is not None:
+            # desconectar: una señal encolada entregada en el teardown aborta
+            try:
+                th.terminado.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+            try:
+                th.requestInterruption()
+                th.wait()
+            except Exception:
+                pass
+            self._scan_thread = None
 
     def _encontrar_carpeta_activo(self, nombre):
         """Localiza la carpeta de un activo dentro de Limpiados, sin asumir

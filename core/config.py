@@ -101,6 +101,17 @@ def set_finnhub_api_key(valor):
     _save_app_config()
 
 
+def get_te_api_key():
+    """API key de TradingEconomics para el calendario económico (plan
+    gratuito, ~100 peticiones/mes)."""
+    return _APP_CONFIG_CACHE.get('te_api_key', '')
+
+
+def set_te_api_key(valor):
+    _APP_CONFIG_CACHE['te_api_key'] = (valor or '').strip()
+    _save_app_config()
+
+
 def get_selector_recientes(clave):
     """Lista de nombres usados recientemente en un selector de tarjetas
     (p.ej. 'plantilla' o 'sistema'), del más reciente al más antiguo. Se
@@ -167,7 +178,13 @@ CATEGORIA_DESCARGA_MAP = {
     'metal': 'METAL',
     'metal-etf': 'METAL-ETF',
     'cripto': 'CRYPTO', 'crypto': 'CRYPTO', 'cryptocurrency': 'CRYPTO',
+    'spot crypto': 'CRYPTO',
+    'crypto perps': 'CRYPTO',
     'perps crypto': 'CRYPTO',
+    'acciones perps': 'ACCION',
+    'commodities perps': 'COMMODITIES',
+    'indices perps': 'INDICE',
+    'fx perps': 'FOREX',
     'indice': 'INDICE', 'indices': 'INDICE', 'index': 'INDICE',
     'accion': 'ACCION', 'acciones': 'ACCION', 'equity': 'ACCION',
     'etf': 'ETF',

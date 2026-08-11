@@ -125,13 +125,13 @@ def _fetch_catalog():
         stocks = []
         for sym, name in sorted(hip3_xyz.items(), key=lambda x: x[1]):
             if name in _COMMODITIES:
-                commodities.append(AssetInfo(sym, name, 'Commodities', None))
+                commodities.append(AssetInfo(sym, name, 'Commodities Perps', None))
             elif name in _INDICES:
-                indices.append(AssetInfo(sym, name, 'Indices', None))
+                indices.append(AssetInfo(sym, name, 'Indices Perps', None))
             elif name in _FX:
-                indices.append(AssetInfo(sym, name, 'FX', None))
+                indices.append(AssetInfo(sym, name, 'FX Perps', None))
             else:
-                stocks.append(AssetInfo(sym, name, 'Acciones', None))
+                stocks.append(AssetInfo(sym, name, 'Acciones Perps', None))
 
         hip3_symbols = set(hip3_xyz.keys())
         all_swaps = [s for s in exchange.markets.values()
@@ -145,30 +145,29 @@ def _fetch_catalog():
                 continue
             if base in ('USDC', 'USDT', 'DAI', 'FDUSD'):
                 continue
-            swap_clean.append(AssetInfo(sym, base, 'Perps Crypto', None))
+            swap_clean.append(AssetInfo(sym, base, 'Crypto Perps', None))
 
         swap_clean.sort(key=lambda a: a.symbol)
 
-        separator = AssetInfo(_SEPARATOR_SYMBOL, '', '', None)
         catalog = []
 
-        if stocks:
-            catalog.append(AssetInfo(_SEPARATOR_SYMBOL, '--- Acciones ---', '', None))
-            catalog.extend(stocks)
-        if indices:
-            catalog.append(AssetInfo(_SEPARATOR_SYMBOL, '--- Indices / FX ---', '', None))
-            catalog.extend(indices)
-        if commodities:
-            catalog.append(AssetInfo(_SEPARATOR_SYMBOL, '--- Materias Primas ---', '', None))
-            catalog.extend(commodities)
         if swap_clean:
-            catalog.append(AssetInfo(_SEPARATOR_SYMBOL, '--- Perps Crypto ---', '', None))
+            catalog.append(AssetInfo(_SEPARATOR_SYMBOL, '--- Crypto Perps ---', '', None))
             top = [a for a in swap_clean if a.symbol in _TOP_SWAP_SYMBOLS]
             rest = [a for a in swap_clean if a.symbol not in _TOP_SWAP_SYMBOLS]
             catalog.extend(top)
             if rest:
-                catalog.append(AssetInfo(_SEPARATOR_SYMBOL, '--- Mas Perps ---', '', None))
+                catalog.append(AssetInfo(_SEPARATOR_SYMBOL, '--- Mas Crypto Perps ---', '', None))
                 catalog.extend(rest)
+        if stocks:
+            catalog.append(AssetInfo(_SEPARATOR_SYMBOL, '--- Acciones Perps ---', '', None))
+            catalog.extend(stocks)
+        if indices:
+            catalog.append(AssetInfo(_SEPARATOR_SYMBOL, '--- Indices / FX Perps ---', '', None))
+            catalog.extend(indices)
+        if commodities:
+            catalog.append(AssetInfo(_SEPARATOR_SYMBOL, '--- Commodities Perps ---', '', None))
+            catalog.extend(commodities)
 
         return catalog
     except Exception:

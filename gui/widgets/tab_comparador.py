@@ -18,6 +18,9 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 
 from gui.widgets.asset_selector import scan_limpiados, RE_LIMPIADO, RE_LIMPIO
 from gui.widgets.file_explorer import FileExplorer
+from gui.widgets.bombear import bombear_eventos
+from gui.widgets.loading_overlay import (mostrar_overlay_tab, ocultar_overlay_tab,
+                                         apagar_overlay_tab)
 
 _RE_SUFIJO_TF = re.compile(r'\s+\d+[smhd](?:\d+[smhd])?$', re.IGNORECASE)
 
@@ -29,6 +32,9 @@ def _nombre_sin_tf(label):
     distintas en correlación/frontera, donde se sigue usando el label
     completo (con TF) tal cual."""
     return _RE_SUFIJO_TF.sub('', label)
+
+_CHEVRON_SVG = os.path.join(os.path.dirname(__file__), '..', 'assets',
+                            'chevron-down.svg').replace('\\', '/')
 
 STYLE_COMPARADOR = """
 QWidget { background-color: #141e30; }
@@ -47,15 +53,28 @@ QPushButton#tf:checked {
     background-color: #2a4a6a; color: #4fc3f7; font-weight: bold;
 }
 QComboBox {
-    background-color: #1a2a45; color: #c8d6e5; border: none;
-    padding: 6px 10px; border-radius: 4px; font-size: 12px; min-width: 200px;
+    background-color: #111828; font-size: 12px; min-width: 200px;
     combobox-popup: 0;
 }
 QComboBox::drop-down { border: none; background: transparent; width: 22px; }
-QComboBox::down-arrow { border: none; }
+QComboBox::down-arrow {
+    image: url("__CHEVRON__");
+    width: 12px; height: 8px;
+}
+QComboBox::down-arrow:on { }
 QComboBox QAbstractItemView {
-    background-color: #1a2a45; color: #c8d6e5; selection-background-color: #2a4a6a;
+    background-color: #1a2a45; color: #c8d6e5;
+    selection-background-color: #2a4a6a; selection-color: #4fc3f7;
     border: 1px solid #253a60; outline: none; margin: 0px;
+}
+QComboBox QAbstractItemView::item {
+    padding: 6px 10px; border-bottom: 1px solid #182030;
+}
+QComboBox QAbstractItemView::item:selected {
+    background-color: #2a4a6a; color: #4fc3f7;
+}
+QComboBox QAbstractItemView::item:hover {
+    background-color: #223755;
 }
 QLineEdit {
     background-color: #1a2a45; color: #c8d6e5; border: none;
@@ -240,6 +259,19 @@ class _AssetLoadThread(QThread):
             self.loaded.emit(self._path, {'error': str(e)})
 
 
+class _ScanLimpiadosThread(QThread):
+    """Escaneo de Limpiados/ en segundo plano (activos ya analizados)."""
+
+    terminado = pyqtSignal(list)
+
+    def run(self):
+        disponibles = []
+        for path, label, ticker, tf in scan_limpiados():
+            if os.path.exists(path + '.analysis.metrics.json'):
+                disponibles.append((path, label, ticker, tf))
+        self.terminado.emit(disponibles)
+
+
 class AssetChip(QFrame):
     removed = pyqtSignal(str)  # path
 
@@ -313,13 +345,18 @@ def _ax_placeholder(ax, texto):
 class TabComparador(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setStyleSheet(STYLE_COMPARADOR)
+        self.setStyleSheet(STYLE_COMPARADOR.replace('__CHEVRON__', _CHEVRON_SVG))
 
         # Estado: orden de adicion define el color de cada activo
         self._assets = {}      # path -> {'label','color','metrics','base' (Series 1h o None),'tf_cache','chip'}
         self._orden = []       # paths en orden de adicion
         self._disponibles = [] # [(path, label, ticker, tf)] analizados no añadidos
         self._threads = {}     # path -> _AssetLoadThread vivo (hasta finished)
+        self._scan_thread = None
+        self._scan_done_cb = None
+        self._cola_carga = []  # activos restaurados que aún no han leído su CSV
+        self._carga_en_curso = False
+        self._carga_iniciada = False
         self._tf = TF_DEFECTO
         self._last_splitter_sizes = [280, 800]
         self._listas = []  # listas preguardadas: [{'nombre','tf','activos'}]
@@ -441,6 +478,7 @@ class TabComparador(QWidget):
         self.tabla.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
         self.panel_tabla.vlay.addWidget(self.tabla, 1)
         grid.addWidget(self.panel_tabla, 0, 0)
+        bombear_eventos()
 
         # 📈 Retorno normalizado (con desplegable de modo)
         self.panel_norm = _Panel("📈 GRÁFICO DE RETORNO NORMALIZADO")
@@ -502,6 +540,7 @@ class TabComparador(QWidget):
         self.explorer.file_chosen.connect(self._on_explorer_file_chosen)
         search_input.textChanged.connect(self.explorer.set_search_text)
         left_lay.addWidget(self.explorer, 1)
+        bombear_eventos()
 
         self._splitter.addWidget(self._left_panel)
 
@@ -546,12 +585,19 @@ class TabComparador(QWidget):
     @_no_crash
     def refresh_available(self):
         """Rellena el combo con los activos analizados que aun no estan añadidos."""
-        self._disponibles = []
+        self._disponibles = self._colectar_disponibles()
+        self._aplicar_disponibles()
+
+    def _colectar_disponibles(self):
+        disponibles = []
         for path, label, ticker, tf in scan_limpiados():
             if path in self._assets:
                 continue
             if os.path.exists(path + '.analysis.metrics.json'):
-                self._disponibles.append((path, label, ticker, tf))
+                disponibles.append((path, label, ticker, tf))
+        return disponibles
+
+    def _aplicar_disponibles(self):
         if hasattr(self, 'explorer'):
             self.explorer.refresh()
         self.combo.blockSignals(True)
@@ -570,6 +616,38 @@ class TabComparador(QWidget):
         if not self._disponibles:
             self.combo.setEditText("")
             self.combo.setPlaceholderText("No hay activos analizados disponibles")
+
+    def refresh_available_async(self, done_cb=None):
+        """Versión en segundo plano de refresh_available; done_cb se llama en
+        el hilo principal al terminar (p. ej. para ocultar el overlay)."""
+        self._detener_scan()
+        self._scan_done_cb = done_cb
+        th = _ScanLimpiadosThread(parent=self)
+        th.terminado.connect(self._on_scan_terminado)
+        self._scan_thread = th
+        th.start()
+
+    def _detener_scan(self):
+        th = getattr(self, '_scan_thread', None)
+        if th is not None:
+            try:
+                th.requestInterruption()
+                th.wait(150)
+            except Exception:
+                pass
+            self._scan_thread = None
+
+    def _on_scan_terminado(self, disponibles):
+        self._disponibles = disponibles
+        self._aplicar_disponibles()
+        self._scan_thread = None
+        cb = self._scan_done_cb
+        self._scan_done_cb = None
+        if cb:
+            try:
+                cb()
+            except Exception:
+                pass
 
     @_no_crash
     def _on_add_clicked(self, _checked=False):
@@ -612,7 +690,7 @@ class TabComparador(QWidget):
         self.add_asset(path, label)
 
     @_no_crash
-    def add_asset(self, path, label):
+    def add_asset(self, path, label, cargar=True):
         if path in self._assets or not os.path.exists(path):
             return
         try:
@@ -631,22 +709,103 @@ class TabComparador(QWidget):
                               'base': None, 'error': None, 'tf_cache': {}, 'chip': chip}
         self._orden.append(path)
 
-        # Carga de la serie en segundo plano. IMPORTANTE: el hilo se parenta a
-        # este widget (ownership C++) y su entrada en _threads solo se retira
-        # en _on_thread_finished — si la ultima referencia Python de un QThread
-        # sin padre muere mientras el hilo aun corre, PyQt destruye el objeto
-        # C++ y el proceso aborta ("QThread: Destroyed while thread is still
-        # running"), que es un crash de app entera, no una excepcion.
+        if cargar:
+            self._lanzar_carga(path)
+        else:
+            # Restaurado desde config: se encola y se lee de UNO EN UNO la
+            # primera vez que se muestra la pestaña (no al arrancar), para no
+            # lanzar N lecturas de CSVs enormes (p.ej. 1m de décadas) en
+            # paralelo — sobrecargan CPU/RAM y dejan hilos vivos al cerrar.
+            self._cola_carga.append(path)
+
+        self.refresh_available()
+        self._refresh_benchmark_combo()
+        self._save_config()
+        self._refresh_all()
+
+    def _lanzar_carga(self, path):
+        """Arranca _AssetLoadThread para path. El hilo se parenta a este widget
+        y se retira de _threads en _on_thread_finished; sin eso, destruir un
+        QThread vivo al cerrar la app aborta el proceso."""
+        mostrar_overlay_tab(self, f"Cargando {os.path.basename(path)}…")
         th = _AssetLoadThread(path, parent=self)
         th.loaded.connect(self._on_series_loaded)
         th.finished.connect(lambda p=path, t=th: self._on_thread_finished(p, t))
         self._threads[path] = th
         th.start()
 
-        self.refresh_available()
-        self._refresh_benchmark_combo()
-        self._save_config()
-        self._refresh_all()
+    def _lanzar_siguiente_carga(self):
+        if self._carga_en_curso or not self._cola_carga:
+            return
+        self._carga_en_curso = True
+        path = self._cola_carga.pop(0)
+        self._lanzar_carga(path)
+
+    def _apagar_hilos(self):
+        """Limpieza antes de cerrar la ventana:
+        - Espera a que terminen las cargas en vuelo (o Qt destruiría un
+          QThread vivo → abort del proceso).
+        - Retira todos los activos/chips: destruir el comparador con activos
+          cargados corrompe el montón en el teardown de Qt y aborta la app.
+        Se espera con wait() BLOQUEANTE (sin bombear eventos: processEvents
+        en mitad del cierre procesa el finished del hilo y pinta el árbol
+        parcialmente destruido → heap corruption)."""
+        self._cola_carga = []
+        while self._threads:
+            path, th = next(iter(self._threads.items()))
+            # Desconectar antes de esperar: si el hilo emite al terminar durante
+            # el wait(), la señal queda encolada y Qt la entrega en el teardown
+            # sobre un árbol ya destruido → abort.
+            try:
+                th.loaded.disconnect()
+                th.finished.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+            try:
+                th.requestInterruption()
+                th.wait()
+            except Exception:
+                pass
+            self._threads.pop(path, None)
+        self._carga_en_curso = False
+        # escaneo del combo (si está en vuelo)
+        sth = getattr(self, '_scan_thread', None)
+        if sth is not None:
+            try:
+                sth.terminado.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+            try:
+                sth.requestInterruption()
+                sth.wait()
+            except Exception:
+                pass
+            self._scan_thread = None
+        # Retirar los chips sin tocar config/refrescos (remove_asset guardaría
+        # el estado y vaciaría el comparador_config.json): destruir el
+        # comparador con activos cargados corrompe el montón en el teardown de
+        # Qt y aborta la app.
+        for p in list(self._orden):
+            info = self._assets.pop(p, None)
+            if info is not None:
+                chip = info.get('chip')
+                if chip is not None:
+                    chip.setParent(None)
+                    chip.deleteLater()
+        self._orden.clear()
+        # vaciar la cola de borrado diferido de los chips ANTES de que Qt
+        # destruya el árbol (deleteLater pendiente en el teardown corrompe el
+        # montón). El hilo ya está parado aquí: este único bombeo es seguro.
+        QApplication.processEvents()
+        apagar_overlay_tab(self)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # La primera vez que se muestra la pestaña se arranca la carga en
+        # cola de los activos restaurados (uno a uno).
+        if not getattr(self, '_carga_iniciada', False):
+            self._carga_iniciada = True
+            self._lanzar_siguiente_carga()
 
     @_no_crash
     def remove_asset(self, path):
@@ -712,6 +871,11 @@ class TabComparador(QWidget):
         if self._threads.get(path) is th:
             self._threads.pop(path, None)
         th.deleteLater()
+        self._carga_en_curso = False
+        self._lanzar_siguiente_carga()
+        # ocultar la rueda de carga cuando no queden cargas en vuelo ni en cola
+        if not self._threads and not self._cola_carga:
+            ocultar_overlay_tab(self)
 
     # ══════════════ listas preguardadas ══════════════
 
@@ -806,7 +970,8 @@ class TabComparador(QWidget):
             self._tf_buttons[tf].setChecked(True)
         for a in cfg.get('activos', []):
             if os.path.exists(a.get('path', '')):
-                self.add_asset(a['path'], a.get('label', os.path.basename(a['path'])))
+                self.add_asset(a['path'], a.get('label', os.path.basename(a['path'])),
+                               cargar=False)
         bench = cfg.get('benchmark')
         if bench and bench in self._assets:
             idx = self.benchmark_combo.findData(bench)
@@ -864,7 +1029,9 @@ class TabComparador(QWidget):
 
     def _refresh_charts(self):
         self._refresh_normalizado()
+        bombear_eventos()
         self._refresh_corr()
+        bombear_eventos()
         self._refresh_scatter()
 
     @_no_crash

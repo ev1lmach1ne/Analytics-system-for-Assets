@@ -118,7 +118,8 @@ aparte en 'entradas', para no contaminar win rate/expectancy/Montecarlo.
 import numpy as np
 from numba import njit
 
-MOTIVOS_SALIDA = {0: 'Señal', 1: 'Stop', 2: 'Take-profit', 3: 'Tiempo', 4: 'Fin datos', 5: 'Parcial'}
+MOTIVOS_SALIDA = {0: 'Señal', 1: 'Stop Loss', 2: 'Take Profit', 3: 'Tiempo',
+                  4: 'Fin datos', 5: 'Parcial'}
 
 # disparador de un tramo de entrada escalonada (ver docstring del módulo)
 TRIGGERS_TRAMO_ENTRADA = {'senal': 0, 'velas': 1, 'retroceso': 2, 'avance': 3, 'cond': 4}

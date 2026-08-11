@@ -187,6 +187,16 @@ def main():
     def _importar_main_window():
         from gui.main_window import MainWindow
         _resultado_import['MainWindow'] = MainWindow
+        # Calentar matplotlib fuera del hilo principal: la primera Figure
+        # inicializa el gestor de fuentes y el backend (1-3 s en equipos
+        # lentos). Hacerlo aquí evita que esa inicialización congele la UI la
+        # primera vez que se construye el Backtester.
+        try:
+            from matplotlib.figure import Figure
+            _fig = Figure(figsize=(1, 1))
+            _fig.add_subplot(111)
+        except Exception:
+            pass
 
     hilo_import = threading.Thread(target=_importar_main_window, daemon=True)
     hilo_import.start()
@@ -207,13 +217,32 @@ def main():
 
     window.show()
 
+    # La ventana aparece ya interactiva; las pestañas aún pendientes se
+    # precargan bajo el overlay de carga (spinner + texto). Si tarda más del
+    # tope, la ventana queda despejada y el resto se carga pestaña a pestaña
+    # en su primera visita.
+    window.precargar_tabs()
+
     from core.config import get_tutorial_visto, set_tutorial_visto
     if not get_tutorial_visto():
         from gui.dialogs.tutorial_dialog import TutorialDialog
         TutorialDialog(window).exec()
         set_tutorial_visto()
 
-    sys.exit(app.exec())
+    rc = app.exec()
+
+    # La ventana ya se cerró (closeEvent → _apagar_hilos esperó a los hilos y
+    # los destruyó), pero quedan eventos encolados y animaciones de fade de los
+    # overlays. Si el intérprete destruye el árbol de Qt con eso pendiente,
+    # aborta (0xC0000409). Se asienta el cierre aquí, con el árbol aún vivo.
+    try:
+        for _ in range(120):
+            app.processEvents()
+            time.sleep(0.01)
+    except Exception:
+        pass
+
+    sys.exit(rc)
 
 if __name__ == "__main__":
     main()
