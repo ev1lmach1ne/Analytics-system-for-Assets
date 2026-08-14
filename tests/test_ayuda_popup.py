@@ -81,8 +81,9 @@ def test_pegado_al_borde_inferior_el_panel_se_abre_hacia_arriba(app, libre):
 
 def test_en_medio_de_la_pantalla_cuelga_del_icono(app, libre):
     """Donde hay sitio no se toca nada: el panel cuelga de la esquina inferior
-    izquierda del icono, que es la posición natural."""
-    cont, icono = _icono_en(libre.center().x(), libre.center().y(), app)
+    izquierda del icono, que es la posición natural. (Icono pegado a la
+    izquierda para que el panel de 420 px quepa sin recortes.)"""
+    cont, icono = _icono_en(libre.left() + 40, libre.center().y(), app)
     popup = _popup_de(icono)
     esperado = icono.mapToGlobal(icono.rect().bottomLeft())
     assert _posicion_popup(icono, popup) == esperado

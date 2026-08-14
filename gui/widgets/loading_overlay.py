@@ -18,10 +18,12 @@ Con barra de progreso:
 El overlay se redimensiona solo cuando la ventana cambia de tamaño. El
 fade in/out replica el del splash de arranque (300ms in / 400ms out).
 """
-from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QLabel, QProgressBar,
+from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QLabel,
                              QGraphicsOpacityEffect)
 from PyQt6.QtCore import (Qt, QTimer, QRectF, QEvent, QPropertyAnimation,
                           QEasingCurve)
+
+from gui.widgets.progress_animada import ProgressBarAnimada
 
 _FADE_IN_MS = 300
 _FADE_OUT_MS = 400
@@ -102,15 +104,11 @@ class LoadingOverlay(QWidget):
             "color: #c8d6e5; font-size: 15px; background: transparent;")
         lay.addWidget(self._label, alignment=Qt.AlignmentFlag.AlignCenter)
 
-        self._barra = QProgressBar(self)
+        self._barra = ProgressBarAnimada(self)
         self._barra.setRange(0, 0)
         self._barra.setFixedWidth(320)
         self._barra.setFixedHeight(8)
         self._barra.setTextVisible(False)
-        self._barra.setStyleSheet(
-            "QProgressBar { background-color: #1a2a45; border: none;"
-            " border-radius: 4px; }"
-            "QProgressBar::chunk { background-color: #4fc3f7; border-radius: 4px; }")
         self._barra.hide()
         lay.addWidget(self._barra, alignment=Qt.AlignmentFlag.AlignCenter)
 

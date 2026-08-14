@@ -632,6 +632,32 @@ def test_montecarlo_sin_trades():
     assert mc['n_sims'] == 0
 
 
+def test_montecarlo_no_es_una_simple_reordenacion():
+    """Una permutación del ORDEN no cambia el capital final (el producto de
+    los factores es conmutativo): si el motor solo reordenara los trades,
+    todos los finales serían idénticos. El bootstrap con reemplazo produce
+    finales distintos, y ese es el contrato del panel."""
+    trades = {'ret_pct': np.array([0.50, -0.25, 0.10, -0.05, 0.20])}
+    mc = montecarlo(trades, 10000.0, n_sims=300, semilla=3)
+    assert mc['finales'].std() > 0
+
+
+def test_montecarlo_prob_negativo_mide_perdida_no_equity_negativa():
+    """'prob_negativo' cuenta finales por debajo del capital INICIAL (perder
+    dinero), no equity negativa: con todos los trades perdedores es 1 aunque
+    la equity nunca llegue a cero, y con todos ganadores es 0."""
+    perdedores = {'ret_pct': np.array([-0.1, -0.2, -0.05, -0.15])}
+    mc1 = montecarlo(perdedores, 10000.0, n_sims=50, semilla=7)
+    assert mc1['prob_negativo'] == pytest.approx(1.0)
+    assert (mc1['finales'] < 10000.0).all()
+    assert (mc1['finales'] > 0).all()   # equity nunca negativa aquí
+
+    ganadores = {'ret_pct': np.array([0.1, 0.2, 0.05, 0.15])}
+    mc2 = montecarlo(ganadores, 10000.0, n_sims=50, semilla=7)
+    assert mc2['prob_negativo'] == pytest.approx(0.0)
+    assert (mc2['finales'] > 10000.0).all()
+
+
 # ══════════════ estrategias ══════════════
 
 def _df_sintetico(closes):
@@ -1040,6 +1066,8 @@ def test_tramo_avance_piramide_con_be_autoajusta_el_stop():
     c = np.full(n, 100.0)
     h[4] = 105.0             # +2R (100 + 2*2) -> dispara el tramo 2 (pirámide)
     o[5] = 104.0             # precio de relleno del tramo 2
+    o[6] = 101.0             # por encima del stop (100.5): no hay gap
+    o[7] = 101.0             # idem: el open no cruza el stop
     l[7] = 100.0             # rompe el stop YA MOVIDO a 100.5 (no el original 98)
     s = _senales_vacias(n)
     s['entradas_long'][1] = True

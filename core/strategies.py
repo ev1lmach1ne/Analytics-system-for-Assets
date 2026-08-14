@@ -1225,7 +1225,9 @@ def _mascara_filtros_setup(df, filtros, eventos_noticias=None, avisos=None):
         m &= np.isin(dow, list(dias))
 
     reg = filtros.get('regimen') or {}
-    metodo = reg.get('metodo', 'ninguno')
+    # Normaliza el identificador antiguo con tilde que guardaban versiones
+    # previas de la GUI: sin esto, 'hurst_reversión' caería en «sin filtro».
+    metodo = _normalizar_metodo_regimen(reg.get('metodo', 'ninguno'))
     ses = filtros.get('sesion') or {}
     tipo_sesion = ses.get('tipo', 'ninguna')
 
@@ -1466,7 +1468,8 @@ def _ordenes_limite_fib(df, entrada, ent_long, ent_short):
 
 # ══════════════ sistemas multi-setup ══════════════
 
-def generar_senales_sistema(df, setups, eventos_noticias=None):
+def generar_senales_sistema(df, setups, eventos_noticias=None,
+                             mascara_entradas=None):
     """Fusiona las señales de una lista de setups en un único juego para el
     motor. setups: [{'plantilla': nombre de ESTRATEGIAS, 'params': {...}},
     ...] (máx. MAX_SETUPS).
@@ -1489,10 +1492,17 @@ def generar_senales_sistema(df, setups, eventos_noticias=None):
     preparar_eventos_noticias(), o None si ningún setup usa el filtro de
     noticias. Se reenvía tal cual a _mascara_filtros_setup por cada setup;
     cada uno aplica su propio umbral de impacto/monedas/ventana.
+    mascara_entradas: bool[n] opcional. True bloquea las entradas y órdenes
+    nuevas de esa vela, pero conserva la vela en la serie para indicadores,
+    salidas y gestión de una posición ya abierta.
     """
     if len(setups) > MAX_SETUPS:
         raise ValueError(f"Máximo {MAX_SETUPS} setups por sistema")
     n = len(df)
+    if mascara_entradas is not None:
+        mascara_entradas = np.asarray(mascara_entradas, dtype=bool)
+        if len(mascara_entradas) != n:
+            raise ValueError("mascara_entradas debe tener una marca por vela")
     out = {'entradas_long': np.zeros(n, dtype=bool),
            'entradas_short': np.zeros(n, dtype=bool),
            'salidas_long': np.zeros(n, dtype=np.int64),
@@ -1517,6 +1527,9 @@ def generar_senales_sistema(df, setups, eventos_noticias=None):
             out['atr'] = s['atr']
         ent_l = np.asarray(s['entradas_long'], dtype=bool)
         ent_s = np.asarray(s['entradas_short'], dtype=bool)
+        if mascara_entradas is not None:
+            ent_l = ent_l & ~mascara_entradas
+            ent_s = ent_s & ~mascara_entradas
         sal_l = np.asarray(s['salidas_long'], dtype=bool)
         sal_s = np.asarray(s['salidas_short'], dtype=bool)
         filtros = setup.get('filtros')
@@ -2004,7 +2017,8 @@ def validar_tramos(tramos):
 
     Cada «Entrar %» es una porcion del RIESGO total del setup, asi que la suma
     no debería pasar del 100%: por encima, el sistema arriesgaría más de lo
-    pretendido (el motor no lo recorta, ver core/backtest)."""
+    pretendido (el motor lo recorta al presupuesto de 'riesgo_pct', ver
+    core/backtest, pero conviene avisarlo)."""
     total = 0.0
     for tramo in (tramos or []):
         try:
@@ -2019,11 +2033,23 @@ def validar_tramos(tramos):
 
 def validar_setup(setup):
     """Todos los avisos de configuración de un setup (vacío = válido)."""
-    return (validar_parciales(setup.get('parciales'))
-            + validar_tramos(setup.get('tramos')))
+    avisos = (validar_parciales(setup.get('parciales'))
+              + validar_tramos(setup.get('tramos')))
+    modo = setup.get('stop_atr_modo', 'fijo')
+    if modo not in ('fijo', 'dinamico_promedio'):
+        avisos.append(f"Modo de stop desconocido: {modo!r}.")
+    return avisos
 
 
 _NOMBRES_DIA_ES = ['Lun', 'Mar', 'Mié', 'Jue', 'Vie', 'Sáb', 'Dom']
+
+
+def _normalizar_metodo_regimen(metodo):
+    """Unifica el identificador antiguo 'hurst_reversión' (con tilde, que
+    guardaban versiones previas de la GUI) al canónico 'hurst_reversion'."""
+    if metodo == 'hurst_reversión':
+        return 'hurst_reversion'
+    return metodo
 
 
 def _desc_filtros(filtros):
@@ -2037,7 +2063,9 @@ def _desc_filtros(filtros):
     if dias:
         lineas.append(f"Día de la semana: solo {', '.join(_NOMBRES_DIA_ES[d] for d in sorted(dias))}")
     reg = filtros.get('regimen') or {}
-    metodo = reg.get('metodo', 'ninguno')
+    # identificador antiguo ('hurst_reversión' con tilde) guardado por
+    # versiones previas de la GUI: se normaliza para no perder el filtro.
+    metodo = _normalizar_metodo_regimen(reg.get('metodo', 'ninguno'))
     if metodo != 'ninguno':
         per = reg.get('periodo') or ventana_regimen_defecto(metodo)
         etiquetas = {
@@ -2197,8 +2225,13 @@ def codigo_setup(setup, indice=0):
     for s_l in sal:
         lineas.append(f"    {s_l}")
     if stop:
-        lineas.append(f"    ADEMÁS: stop-loss a {stop:g}×ATR de la entrada "
-                      f"(contra low/high de cada vela)")
+        if setup.get('stop_atr_modo', 'fijo') == 'dinamico_promedio':
+            lineas.append(f"    ADEMÁS: stop-loss a {stop:g}×ATR del precio medio "
+                          f"de la posición, reanclado tras cada entrada "
+                          f"(contra low/high de cada vela)")
+        else:
+            lineas.append(f"    ADEMÁS: stop-loss a {stop:g}×ATR de la entrada "
+                          f"(contra low/high de cada vela)")
     if tp:
         lineas.append(f"    ADEMÁS: take-profit a {tp:g}R del riesgo")
     if be:
@@ -2271,7 +2304,11 @@ def describir_setup(setup):
     if riesgo is not None:
         partes.append(f"riesgo {riesgo * 100:g}%")
     if stop:
-        partes.append(f"stop {stop:g}×ATR")
+        modo = setup.get('stop_atr_modo', 'fijo')
+        etiqueta_stop = f"stop {stop:g}×ATR"
+        if modo == 'dinamico_promedio':
+            etiqueta_stop += " dinámico"
+        partes.append(etiqueta_stop)
     if setup.get('tp_r'):
         partes.append(f"TP {setup['tp_r']:g}R")
     if setup.get('salida_n_velas'):

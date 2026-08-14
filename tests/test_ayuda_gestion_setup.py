@@ -50,10 +50,15 @@ def _etiqueta_de(widget):
         for fila in range(form.rowCount()):
             item = form.itemAt(fila, QFormLayout.ItemRole.FieldRole)
             campo = item.layout() if item is not None else None
-            if campo is None:
-                continue
-            hijos = (campo.itemAt(i).widget() for i in range(campo.count()))
-            if any(h is widget for h in hijos):
+            if campo is not None:
+                hijos = (campo.itemAt(i).widget() for i in range(campo.count()))
+                if any(h is widget for h in hijos):
+                    item_lbl = form.itemAt(fila, QFormLayout.ItemRole.LabelRole)
+                    return item_lbl.widget() if item_lbl is not None else None
+            campo_widget = item.widget() if item is not None else None
+            if campo_widget is not None and (
+                    campo_widget is widget
+                    or widget in campo_widget.findChildren(type(widget))):
                 item_lbl = form.itemAt(fila, QFormLayout.ItemRole.LabelRole)
                 return item_lbl.widget() if item_lbl is not None else None
     return None
@@ -75,6 +80,32 @@ def test_el_control_tambien_lleva_bocadillo(constructor, attr):
     """Stop Loss y Take Profit no tenían ninguno; el resto sí."""
     assert getattr(constructor, attr).toolTip().strip(), \
         f"{attr} se quedó sin bocadillo en el control"
+
+
+def test_excluir_interpoladas_esta_activado_por_defecto(constructor):
+    assert constructor.chk_excluir_interpoladas.isChecked()
+    assert 'interpoladas' in constructor.chk_excluir_interpoladas.toolTip()
+
+
+def test_modo_stop_esta_a_la_derecha_y_solo_funciona_con_stop(constructor):
+    assert constructor.cmb_stop_modo.parentWidget() is constructor._stop_row
+    assert constructor.sp_stop.value() == 0.0
+    assert not constructor.cmb_stop_modo.isEnabled()
+
+    constructor.sp_stop.setValue(1.0)
+    assert constructor.cmb_stop_modo.isEnabled()
+    constructor.sp_stop.setValue(0.0)
+    assert not constructor.cmb_stop_modo.isEnabled()
+
+
+def test_el_identificador_hurst_de_la_gui_es_el_canonico():
+    """La GUI y el core deben hablar el mismo id para la reversión de Hurst:
+    'hurst_reversion', nunca 'hurst_reversión' (con tilde)."""
+    assert tb._MAPA_REGIMEN['Reversión (Hurst)'] == 'hurst_reversion'
+    assert 'hurst_reversión' not in tb._MAPA_REGIMEN.values()
+    assert 'hurst_reversion' in tb.BANDA_REGIMEN
+    assert 'hurst_reversión' not in tb.BANDA_REGIMEN
+    assert tb._normalizar_metodo_regimen('hurst_reversión') == 'hurst_reversion'
 
 
 def test_el_combo_de_unidad_conserva_su_propia_explicacion(constructor):

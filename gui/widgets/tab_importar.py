@@ -6,9 +6,11 @@ from PyQt6.QtCore import Qt, pyqtSignal
 from gui.widgets.file_explorer import FileExplorer
 from gui.widgets.console_widget import ConsoleWidget
 from gui.widgets.bombear import bombear_eventos
+from gui.widgets import STYLE_ETIQUETA_SIN_CAJA
 from gui.questdb_bootstrap import mostrar_bootstrap_questdb
 from core.config import (get_base_data, LIMPIADOS_DIR, TF_LABELS, TIPO_LABELS,
                           TIPO_MAP, SCRIPTS_DIR, CATEGORIAS_DESCARGA_CONOCIDAS)
+from core.rf_registry import guardar_rf as _guardar_rf_registro
 
 # Categoría de descarga -> etiqueta que se preselecciona en «Tipo». El
 # desplegable es más grueso que las categorías, así que varias caen en la
@@ -27,6 +29,21 @@ _TIPO_SUGERIDO = {
     'COMMODITIES': 'Futuro/Cfd',
     'METAL': 'Futuro/Cfd',
 }
+
+
+def _guardar_rf_sidecar(csv_path, rf):
+    """Sidecar <csv>.import_info con el Rf usado, junto al archivo de origen.
+
+    Se escribe AL INICIAR la importación, no al terminar: así, aunque la
+    limpieza falle o se corte, al volver a seleccionar ese archivo en Importar
+    el campo Rf se restaura con el valor que se intentó usar."""
+    if rf is None or not csv_path:
+        return
+    try:
+        with open(csv_path + '.import_info', 'w', encoding='utf-8') as f:
+            json.dump({'rf_rate': rf}, f)
+    except Exception:
+        pass
 
 _CHEVRON_SVG = os.path.join(os.path.dirname(__file__), '..', 'assets',
                             'chevron-down.svg').replace('\\', '/')
@@ -81,6 +98,7 @@ QFrame#sep { background-color: #253a60; max-height: 1px; }
 
 class TabImportar(QWidget):
     import_completed = pyqtSignal()
+    import_failed = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -105,14 +123,18 @@ class TabImportar(QWidget):
         self.nombre_input.setPlaceholderText("nombre")
         self.nombre_input.setToolTip("Nombre del activo (ej: xauusd)")
         self.nombre_input.setMaximumWidth(120)
-        toolbar.addWidget(QLabel("Nombre:"))
+        lbl_nombre = QLabel("Nombre:")
+        lbl_nombre.setStyleSheet(STYLE_ETIQUETA_SIN_CAJA)
+        toolbar.addWidget(lbl_nombre)
         toolbar.addWidget(self.nombre_input)
 
         self.tf_input = QComboBox()
         self.tf_input.addItems(TF_LABELS)
         self.tf_input.setCurrentText("1h")
         self.tf_input.setToolTip("Timeframe")
-        toolbar.addWidget(QLabel("TF:"))
+        lbl_tf = QLabel("TF:")
+        lbl_tf.setStyleSheet(STYLE_ETIQUETA_SIN_CAJA)
+        toolbar.addWidget(lbl_tf)
         toolbar.addWidget(self.tf_input)
 
         self.tipo_input = QComboBox()
@@ -126,7 +148,9 @@ class TabImportar(QWidget):
         self.rf_input.setText("0")
         self.rf_input.setToolTip("Tasa libre de riesgo anual (%)")
         self.rf_input.setMaximumWidth(55)
-        toolbar.addWidget(QLabel("Rf(%):"))
+        lbl_rf = QLabel("Rf(%):")
+        lbl_rf.setStyleSheet(STYLE_ETIQUETA_SIN_CAJA)
+        toolbar.addWidget(lbl_rf)
         toolbar.addWidget(self.rf_input)
 
         self.btn_config = QPushButton(" Limpiar")
@@ -281,6 +305,19 @@ class TabImportar(QWidget):
         }
 
         self._config = cfg
+        # Recordar el Rf junto al archivo de origen ANTES de lanzar el flujo:
+        # si la limpieza falla o se corta, al re-seleccionar el archivo el Rf
+        # se restaura igualmente (ver _marcar_seleccion).
+        _guardar_rf_sidecar(self._selected_file, rf_val)
+        # Y en el registro por archivo limpio, para que el Limpiador lo
+        # recupere aunque el meta.json del CSV no exista todavía.
+        try:
+            cleaned_path = os.path.join(
+                LIMPIADOS_DIR, cfg.get('categoria', 'OTROS'), cfg['nombre'],
+                f"{cfg['nombre']}_{cfg['tf']}_limpiado.csv")
+            _guardar_rf_registro(LIMPIADOS_DIR, cleaned_path, rf_val)
+        except Exception:
+            pass
         self.btn_config.setEnabled(False)
         self.btn_select.setEnabled(False)
         self.btn_delete.setEnabled(False)
@@ -314,6 +351,10 @@ class TabImportar(QWidget):
             'CONFIG_NOMBRE': cfg['nombre'],
             'CONFIG_TF': cfg['tf'],
             'CONFIG_ACTIVO': cfg['activo'],
+            # preparar_datos.py reescribe sesion_config.json y debe conservar
+            # la categoria deducida de la ruta de origen: el limpiador la usa
+            # para guardar el CSV limpio en su carpeta (FOREX, CRYPTO...).
+            'CONFIG_CATEGORIA': cfg['categoria'],
             'MPLBACKEND': 'Agg',
             'PYTHONIOENCODING': 'utf-8',
         }
@@ -370,20 +411,12 @@ class TabImportar(QWidget):
             self._running_clean = False
             self._reset_ui()
             self._save_meta()
-            # Guardar sidecar junto al archivo origen para recordar rf_rate
-            info_path = self._selected_file + '.import_info'
-            rf = self._config.get('rf_rate') if self._config else None
-            if rf is not None and self._selected_file:
-                try:
-                    with open(info_path, 'w', encoding='utf-8') as f:
-                        json.dump({'rf_rate': rf}, f)
-                except Exception:
-                    pass
             self.import_completed.emit()
         else:
+            fase = 'limpieza' if self._running_clean else 'preparación'
             self._running_clean = False
             self._reset_ui()
-            self.import_completed.emit()
+            self.import_failed.emit(fase)
 
     def _save_meta(self):
         cfg = self._config
@@ -406,10 +439,13 @@ class TabImportar(QWidget):
         }
         meta_path = cleaned_path + '.meta.json'
         try:
+            os.makedirs(os.path.dirname(meta_path), exist_ok=True)
             with open(meta_path, 'w', encoding='utf-8') as f:
                 json.dump(meta, f, indent=2)
         except Exception:
             pass
+        _guardar_rf_registro(LIMPIADOS_DIR, cleaned_path,
+                             cfg.get('rf_rate', 0.0))
 
     def _reset_ui(self):
         self.btn_config.setEnabled(True)

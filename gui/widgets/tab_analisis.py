@@ -1,4 +1,5 @@
 import os, json, re, glob, pickle
+from datetime import datetime
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                              QLabel, QComboBox, QFrame, QFileDialog, QTextBrowser,
                              QTabWidget, QProgressBar, QScrollArea, QSizePolicy,
@@ -11,6 +12,7 @@ from gui.widgets.analisis_graficos import GraficosAnalisis
 from gui.widgets.analisis_tarjetas import TarjetasKPI
 from gui.widgets.plot_common import icono_ayuda
 from gui.widgets.bombear import bombear_eventos
+from gui.widgets import STYLE_ETIQUETA_SIN_CAJA
 from core.config import tf_to_minutes
 
 _CHEVRON_SVG = os.path.join(os.path.dirname(__file__), '..', 'assets',
@@ -645,7 +647,7 @@ class TabAnalisis(QWidget):
         toolbar.addStretch()
 
         lbl_horizon = QLabel("Ventana")
-        lbl_horizon.setStyleSheet("color: #aabbcc; font-size: 11px; font-weight: bold; padding-right: 4px;")
+        lbl_horizon.setStyleSheet(STYLE_ETIQUETA_SIN_CAJA)
         toolbar.addWidget(lbl_horizon)
 
         self.horizon = QComboBox()
@@ -660,7 +662,9 @@ class TabAnalisis(QWidget):
         toolbar.addWidget(self.icono_ventana)
 
         lbl_periodo_combo = QLabel("Periodo")
-        lbl_periodo_combo.setStyleSheet("color: #aabbcc; font-size: 11px; font-weight: bold; padding-right: 4px; padding-left: 12px;")
+        lbl_periodo_combo.setStyleSheet(
+            STYLE_ETIQUETA_SIN_CAJA.replace('padding-right: 6px;',
+                                            'padding-right: 4px; padding-left: 12px;'))
         toolbar.addWidget(lbl_periodo_combo)
 
         self.periodo_combo = QComboBox()
@@ -835,7 +839,13 @@ class TabAnalisis(QWidget):
         self._update_horizon_items(tf)
 
         self._poblar_periodo_combo(pdf_path)
-        self._aplicar_resultado(pdf_path, metrics_path)
+        # Aplicar la selección real del combo (el periodo más largo), no el
+        # PDF recién recibido si no coincide con ella.
+        datos = self.periodo_combo.currentData()
+        if datos:
+            self._aplicar_resultado(*datos)
+        else:
+            self._aplicar_resultado(pdf_path, metrics_path)
 
     def _poblar_periodo_combo(self, pdf_path_actual):
         self.periodo_combo.blockSignals(True)
@@ -850,16 +860,29 @@ class TabAnalisis(QWidget):
                 inicio, fin = m.group(1), m.group(2)
                 metrics_cand = self._csv_path + f'.analysis.{inicio}_to_{fin}.metrics.json'
                 label = f"{inicio} → {fin}"
-                entries.append((label, pdf_cand, metrics_cand if os.path.exists(metrics_cand) else None))
+                entries.append((label, pdf_cand,
+                                metrics_cand if os.path.exists(metrics_cand) else None,
+                                inicio, fin))
 
         if not entries and pdf_path_actual:
-            entries.append(("Actual", pdf_path_actual, self._metrics_path))
+            entries.append(("Actual", pdf_path_actual, self._metrics_path, None, None))
 
+        # Seleccionar siempre el periodo con mayor duración de muestra: es el
+        # que más información aporta y evita quedarse en un rango corto solo
+        # por ser el último analizado.
         selected_idx = 0
-        for i, (label, pdf_cand, metrics_cand) in enumerate(entries):
+        mejor_dias = None
+        for i, (label, pdf_cand, metrics_cand, inicio, fin) in enumerate(entries):
             self.periodo_combo.addItem(label, (pdf_cand, metrics_cand))
-            if pdf_cand == pdf_path_actual:
-                selected_idx = i
+            if inicio and fin:
+                try:
+                    dias = (datetime.strptime(fin, '%Y-%m-%d') -
+                            datetime.strptime(inicio, '%Y-%m-%d')).days
+                except ValueError:
+                    dias = None
+                if dias is not None and (mejor_dias is None or dias > mejor_dias):
+                    mejor_dias = dias
+                    selected_idx = i
 
         if entries:
             self.periodo_combo.setCurrentIndex(selected_idx)

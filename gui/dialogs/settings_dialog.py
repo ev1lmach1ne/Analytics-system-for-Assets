@@ -193,7 +193,11 @@ class SettingsDialog(QDialog):
             set_base_data(path)
             QMessageBox.information(
                 self, "Ruta actualizada",
-                "La nueva ruta se ha guardado.\n"
-                "Los cambios se aplicarán a las próximas operaciones."
+                "La nueva ruta de datos se ha guardado.\n\n"
+                "Se aplicará al REINICIAR la aplicación: hasta entonces las "
+                "pestañas abiertas siguen usando la carpeta anterior, para no "
+                "dejar archivos a medias entre dos rutas.\n\n"
+                "Cierra la aplicación y ábrela de nuevo cuando quieras "
+                "trabajar con la nueva carpeta."
             )
         self.accept()

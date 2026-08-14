@@ -47,33 +47,91 @@ _ACTIVO_A_CATEGORIA = {
 }
 
 
-def _categoria_de_carpeta(asset_dir: str) -> str:
+def _meta_de_carpeta(asset_dir):
     """Lee el primer .meta.json que encuentre dentro de la carpeta del
-    activo y resuelve la categoria de forma determinista.
-
-    Se mira primero 'categoria', que la pestana Importar deduce de la ruta
-    de descarga de origen (p.ej. ccxt/CRYPTO/link_usdt -> CRYPTO): es un
-    dato fino y fiable. Solo si falta o no es una categoria conocida se cae
-    a 'activo', que sale de un desplegable que arranca en Futuro/Cfd y que
-    el usuario puede no haber tocado (ver comentario de _ACTIVO_A_CATEGORIA)."""
+    activo, o None si no hay ninguno legible."""
     try:
         nombres = os.listdir(asset_dir)
     except OSError:
-        return 'OTROS'
+        return None
     for nombre in nombres:
         if not nombre.endswith('.meta.json'):
             continue
         try:
             with open(os.path.join(asset_dir, nombre), encoding='utf-8') as f:
-                meta = json.load(f)
+                return json.load(f)
         except (OSError, json.JSONDecodeError):
             continue
+    return None
+
+
+def _categoria_de_meta(meta):
+    """Categoria segun un .meta.json: primero 'categoria' explicita, que la
+    pestana Importar deduce de la ruta de descarga de origen (p.ej.
+    ccxt/CRYPTO/link_usdt -> CRYPTO): es un dato fino y fiable. Solo si
+    falta o no es una categoria conocida se cae a 'activo', que sale de un
+    desplegable que arranca en Futuro/Cfd y que el usuario puede no haber
+    tocado (ver comentario de _ACTIVO_A_CATEGORIA)."""
+    if not meta:
+        return None
+    categoria = (meta.get('categoria') or '').upper()
+    if categoria in CATEGORIAS_CONOCIDAS and categoria != 'OTROS':
+        return categoria
+    activo = (meta.get('activo') or '').upper()
+    return _ACTIVO_A_CATEGORIA.get(activo)
+
+
+def _categoria_de_carpeta(asset_dir: str) -> str:
+    """Resuelve la categoria de una carpeta de activo de forma determinista."""
+    return _categoria_de_meta(_meta_de_carpeta(asset_dir)) or 'OTROS'
+
+
+def _categoria_de_hermana(nombre):
+    """Categoria de una carpeta hermana ya clasificada (LIMPIADOS_DIR/<cat>/
+    <nombre>) cuyo .meta.json declare una 'categoria' EXPLICITA (no el
+    'activo' grueso).
+
+    Cura el estado que dejaba el bug de sesion_config.json: el CSV limpio
+    terminaba en OTROS (sin meta propio) mientras el .meta.json se escribia
+    en la carpeta de categoria correcta — p.ej. FOREX/eurgbp/...meta.json
+    con OTROS/eurgbp/...csv huerfano. La hermana con categoria explicita es
+    la fuente fiable y sirve para reunir el CSV con su meta."""
+    for cat in sorted(CATEGORIAS_CONOCIDAS):
+        if cat == 'OTROS':
+            continue
+        dir_hermana = os.path.join(LIMPIADOS_DIR, cat, nombre)
+        if not os.path.isdir(dir_hermana):
+            continue
+        for meta_nombre in os.listdir(dir_hermana):
+            if not meta_nombre.endswith('.meta.json'):
+                continue
+            try:
+                with open(os.path.join(dir_hermana, meta_nombre),
+                          encoding='utf-8') as f:
+                    meta = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                continue
+            categoria = (meta.get('categoria') or '').upper()
+            if categoria in CATEGORIAS_CONOCIDAS and categoria != 'OTROS':
+                return categoria
+    return None
+
+
+def _resolver_categoria(asset_dir, nombre):
+    """Categoria de una carpeta de activo sin clasificar, por orden de
+    confianza: 'categoria' explicita de su .meta.json, 'categoria' explicita
+    de una carpeta hermana, y por ultimo el 'activo' del .meta.json local
+    (desplegable de la pestana Importar: grueso y a menudo sin tocar)."""
+    meta = _meta_de_carpeta(asset_dir)
+    if meta:
         categoria = (meta.get('categoria') or '').upper()
         if categoria in CATEGORIAS_CONOCIDAS and categoria != 'OTROS':
             return categoria
-        activo = (meta.get('activo') or '').upper()
-        if activo in _ACTIVO_A_CATEGORIA:
-            return _ACTIVO_A_CATEGORIA[activo]
+    categoria = _categoria_de_hermana(nombre)
+    if categoria is not None:
+        return categoria
+    if meta:
+        return _ACTIVO_A_CATEGORIA.get((meta.get('activo') or '').upper(), 'OTROS')
     return 'OTROS'
 
 
@@ -90,7 +148,7 @@ def _reintentar_otros():
         ruta = os.path.join(otros_dir, nombre)
         if not os.path.isdir(ruta):
             continue
-        categoria = _categoria_de_carpeta(ruta)
+        categoria = _resolver_categoria(ruta, nombre)
         if categoria == 'OTROS':
             omitidas += 1
             continue
@@ -116,7 +174,7 @@ def _reorganizar():
         if nombre in _ENTRADAS_NO_ACTIVO or nombre.upper() in CATEGORIAS_CONOCIDAS:
             omitidas += 1
             continue
-        categoria = _categoria_de_carpeta(ruta)
+        categoria = _resolver_categoria(ruta, nombre)
         destino = os.path.join(LIMPIADOS_DIR, categoria, nombre)
         log(f"  Limpiados/{nombre}  ->  Limpiados/{categoria}/{nombre}")
         try:

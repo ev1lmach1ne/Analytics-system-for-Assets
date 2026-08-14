@@ -3,15 +3,18 @@ import pandas as pd
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                              QLabel, QLineEdit, QFrame, QTableWidget, QTableWidgetItem,
                              QHeaderView, QMessageBox, QAbstractItemView, QSplitter,
-                              QComboBox, QStackedWidget, QProgressBar, QSizePolicy,
-                              QApplication)
+                             QComboBox, QStackedWidget, QSizePolicy,
+                             QApplication)
 from PyQt6.QtCore import Qt, pyqtSignal, QThread
 from gui.widgets.file_explorer import FileExplorer
 from gui.widgets.console_widget import ConsoleWidget
 from gui.widgets.rango_dialog import RangoAnalisisDialog
 from gui.widgets.bombear import bombear_eventos
+from gui.widgets import STYLE_ETIQUETA_SIN_CAJA
+from gui.widgets.progress_animada import ProgressBarAnimada
 
 from core.config import get_base_data, SCRIPTS_DIR, TF_PATTERN
+from core.rf_registry import leer_rf as leer_rf_registro
 
 _CHEVRON_SVG = os.path.join(os.path.dirname(__file__), '..', 'assets',
                             'chevron-down.svg').replace('\\', '/')
@@ -34,18 +37,6 @@ QPushButton#analyze:pressed { padding-top: 10px; padding-bottom: 6px; }
 QPushButton#mode { background-color: #1a2a45; color: #7aaccc; }
 QPushButton#mode:hover { background-color: #2a3a55; }
 QPushButton#mode:pressed { padding-top: 10px; padding-bottom: 6px; }
-QProgressBar {
-    background-color: #1a2a45; border: none;
-    border-radius: 7px; height: 16px; max-width: 120px;
-}
-QProgressBar::chunk {
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                                stop:0 rgba(255,255,255,0.30),
-                                stop:0.4 #6dd5fa,
-                                stop:0.7 #4fc3f7,
-                                stop:1 rgba(0,0,0,0.2));
-    border-radius: 6px;
-}
 QTableWidget {
     background-color: #0d1424; color: #aabbcc; border: 1px solid #253a60;
     gridline-color: #1a2a45; font-size: 11px;
@@ -86,6 +77,11 @@ QLineEdit {
 QFrame#sep { background-color: #253a60; max-height: 1px; }
 """
 
+# Anchos por defecto de los botones de la botonera inferior (se usan solo
+# antes del primer layout; luego se calculan hasta el inicio de la consola).
+_ANCHO_BTN_ANALIZAR = 220
+_ANCHO_BTN_REANALIZAR = 200
+
 
 class _ScanAssetsThread(QThread):
     """Escaneo de Limpiados/ en segundo plano (nombres de activos ordenados)."""
@@ -107,6 +103,31 @@ class _ScanAssetsThread(QThread):
                     assets.add(os.path.basename(root))
         self.terminado.emit(sorted(assets))
 
+
+def _persistir_meta_rf(csv_path, nombre, tf, activo, rf):
+    """Crea o actualiza <csv>.meta.json con la identidad y el Rf usado.
+
+    Lo llama el análisis: aunque un archivo sea legacy (sin meta o con meta
+    antigua), la primera vez que se analiza con un Rf, ese Rf queda guardado
+    y la próxima selección rellena el campo del Limpiador."""
+    if not csv_path:
+        return
+    meta_path = csv_path + '.meta.json'
+    try:
+        meta = {}
+        if os.path.exists(meta_path):
+            with open(meta_path, encoding='utf-8') as f:
+                meta = json.load(f) or {}
+        meta.update({
+            'nombre': nombre or '',
+            'tf': tf or '1h',
+            'activo': activo or 'FUTURO',
+            'rf_rate': rf,
+        })
+        with open(meta_path, 'w', encoding='utf-8') as f:
+            json.dump(meta, f, indent=2)
+    except Exception:
+        pass
 
 class TabLimpiados(QWidget):
     analysis_completed = pyqtSignal(str, str, str, str, str)
@@ -248,6 +269,7 @@ class TabLimpiados(QWidget):
         splitter.addWidget(self.console)
 
         splitter.setSizes([250, 300, 300])
+        splitter.splitterMoved.connect(self._ajustar_boton_analizar)
         layout.addWidget(splitter, 1)
         bombear_eventos()
 
@@ -270,20 +292,54 @@ class TabLimpiados(QWidget):
         self.rf_input.setText("0")
         self.rf_input.setToolTip("Tasa libre de riesgo anual (%)")
         self.rf_input.setMaximumWidth(55)
-        lbl_rf = QLabel("Rf:")
-        lbl_rf.setFixedWidth(16)
+        lbl_rf = QLabel("Risk Free")
+        lbl_rf.setStyleSheet(STYLE_ETIQUETA_SIN_CAJA)
+        lbl_rf.setFixedWidth(lbl_rf.sizeHint().width() + 4)
         btn_row.addWidget(lbl_rf)
         btn_row.addWidget(self.rf_input)
-        self.progress = QProgressBar()
+        self.progress = ProgressBarAnimada()
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
+        self.progress.setTextVisible(False)
+        self.progress.setFixedHeight(24)
         self.progress.setToolTip("Progreso del análisis")
         self.progress.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         btn_row.addWidget(self.progress)
         layout.addLayout(btn_row)
 
+        self._ajustar_boton_analizar()
+
         # Initial scan for table mode (en segundo plano para no bloquear el arranque)
         self._scan_assets_async()
+
+    def _ancho_botones_consola(self):
+        """Anchos de «Analizar»/«Re-analizar» para que el borde derecho de
+        «Re-analizar» coincida con el inicio de la consola (el splitter la
+        sitúa justo encima). Si aún no hay geometría válida, se usan los
+        anchos por defecto."""
+        consola_x = self.console.geometry().x()
+        if consola_x <= 12:
+            return _ANCHO_BTN_ANALIZAR, _ANCHO_BTN_REANALIZAR
+        total = consola_x - 12 - 8
+        ancho_ra = max(140, total * 10 // 21)
+        ancho_a = max(160, total - ancho_ra)
+        return ancho_a, ancho_ra
+
+    def _ajustar_boton_analizar(self):
+        """Con «Re-analizar» oculto, «Analizar» se ensancha hasta ocupar su
+        hueco, de modo que «Risk Free» (y el campo Rf) queden siempre en la
+        misma posición, haya o no análisis previo cacheado."""
+        ancho_a, ancho_ra = self._ancho_botones_consola()
+        if self.btn_reanalyze.isVisible():
+            self.btn_analyze.setFixedWidth(ancho_a)
+            self.btn_reanalyze.setFixedWidth(ancho_ra)
+        else:
+            self.btn_analyze.setFixedWidth(ancho_a + 8 + ancho_ra)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, 'btn_analyze'):
+            self._ajustar_boton_analizar()
 
     # ── Search filter ──
 
@@ -503,6 +559,7 @@ class TabLimpiados(QWidget):
         else:
             self.btn_reanalyze.setVisible(False)
             self.btn_reanalyze.setEnabled(False)
+        self._ajustar_boton_analizar()
 
     def _read_meta(self, path):
         meta_path = path + '.meta.json'
@@ -510,6 +567,7 @@ class TabLimpiados(QWidget):
         tf = None
         activo = 'FUTURO'
 
+        rf_puesto = False
         if os.path.exists(meta_path):
             try:
                 with open(meta_path) as f:
@@ -517,12 +575,23 @@ class TabLimpiados(QWidget):
                 nombre = meta.get('nombre')
                 tf = meta.get('tf')
                 activo = meta.get('activo', 'FUTURO')
-                rf = meta.get('rf_rate', 0.0)
-                self._rf_rate = rf
-                if rf:
+                # Solo se pisa el campo si el meta declara explícitamente el
+                # rf_rate (aunque sea 0.0): un meta antiguo sin la clave no
+                # debe sobrescribir lo que el usuario tuviera escrito.
+                if 'rf_rate' in meta:
+                    rf = meta['rf_rate']
+                    self._rf_rate = rf
                     self.rf_input.setText(str(rf))
+                    rf_puesto = True
             except Exception:
-                self._rf_rate = 0.0
+                pass
+        if not rf_puesto:
+            # Plan B: el registro por archivo que mantiene Importar (cubre
+            # archivos legacy y limpiezas que no llegaron a escribir meta).
+            rf = leer_rf_registro(self._limpiados_dir, path)
+            if rf is not None:
+                self._rf_rate = rf
+                self.rf_input.setText(str(rf))
 
         if not nombre:
             nombre = os.path.basename(os.path.dirname(path))
@@ -594,6 +663,7 @@ class TabLimpiados(QWidget):
                 self.btn_analyze.setEnabled(False)
                 self.btn_reanalyze.setVisible(False)
                 self.btn_reanalyze.setEnabled(False)
+                self._ajustar_boton_analizar()
                 self.preview_table.setVisible(False)
                 self.lbl_info.setText("")
                 self.explorer.set_root_path(self._limpiados_dir)
@@ -635,27 +705,20 @@ class TabLimpiados(QWidget):
         self.btn_delete.setEnabled(False)
         self.btn_reanalyze.setVisible(False)
         self.btn_reanalyze.setEnabled(False)
+        self._ajustar_boton_analizar()
         self.progress.setValue(0)
-
-        # Auto-save .meta.json for legacy files
-        meta_path = self._selected_path + '.meta.json'
-        if not os.path.exists(meta_path):
-            try:
-                with open(meta_path, 'w', encoding='utf-8') as f:
-                    json.dump({
-                        'nombre': self._selected_nombre or '',
-                        'tf': self._selected_tf or '1h',
-                        'activo': self._selected_activo or 'FUTURO',
-                        'rf_rate': 0.0,
-                    }, f, indent=2)
-            except Exception:
-                pass
 
         horizon = self._analisis_tab.current_horizon if self._analisis_tab else 'General'
         try:
             rf_val = float(self.rf_input.text().strip() or '4.5')
         except ValueError:
             rf_val = 4.5
+        # Persistir el Rf (y la identidad) en el .meta.json del CSV limpio:
+        # el campo del Limpiador se rellena en la próxima selección y el
+        # script de análisis lo usa aunque sesion_config.json se sobrescriba.
+        _persistir_meta_rf(
+            self._selected_path, self._selected_nombre, self._selected_tf,
+            self._selected_activo, rf_val)
         cfg = {
             'nombre': self._selected_nombre or '',
             'tf': self._selected_tf or '1h',
@@ -708,6 +771,7 @@ class TabLimpiados(QWidget):
         self._cached_metrics = None
         self.btn_reanalyze.setVisible(False)
         self.btn_reanalyze.setEnabled(False)
+        self._ajustar_boton_analizar()
         self._run_analysis()
 
     def _on_console_finished(self, exit_code):
@@ -779,6 +843,7 @@ class TabLimpiados(QWidget):
                     self._cached_metrics = metrics_cache
                     self.btn_reanalyze.setVisible(True)
                     self.btn_reanalyze.setEnabled(True)
+                    self._ajustar_boton_analizar()
             except Exception as e:
                 import traceback
                 traceback.print_exc()

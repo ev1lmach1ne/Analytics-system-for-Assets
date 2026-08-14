@@ -15,10 +15,11 @@ import traceback
 import numpy as np
 import pandas as pd
 
-from PyQt6.QtCore import Qt, QSize, QPointF, QPoint
+from PyQt6.QtCore import Qt, QSize, QPointF, QPoint, QPropertyAnimation, QEasingCurve
 from PyQt6.QtGui import QIcon, QPixmap, QPainter, QPen, QColor, QPolygonF
-from PyQt6.QtWidgets import (QSizePolicy, QLabel, QDialog, QTabWidget,
-                             QVBoxLayout, QApplication)
+from PyQt6.QtWidgets import (QSizePolicy, QLabel, QDialog, QTabWidget, QVBoxLayout,
+                             QHBoxLayout, QApplication, QWidget, QFrame, QPushButton,
+                             QGraphicsDropShadowEffect)
 
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
@@ -465,50 +466,258 @@ class _PopupAyuda(QDialog):
     Qt.WindowType.Popup).
 
     Con UNA sola sección no se monta la barra de pestañas: una pestaña
-    solitaria se lee como una interfaz a medio hacer."""
+    solitaria se lee como una interfaz a medio hacer.
+
+    El panel es translúcido con esquinas redondeadas, gradiente y halo azul
+    (misma identidad que los diálogos flotantes de la app). El texto SIEMPRE
+    cabe: el popup se dimensiona a la altura completa del contenido y no usa
+    barras de desplazamiento.
+    """
 
     def __init__(self, secciones, parent=None):
         super().__init__(parent, Qt.WindowType.Popup)
-        self.setFixedWidth(360)
+        self._animado_entrada = False
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setFixedWidth(420)
         self.setStyleSheet(
-            "QDialog { background-color: #0d1424; border: 2px solid #253a60;"
-            " border-radius: 6px; }"
-            "QTabWidget::pane { background-color: #0d1424; border: 1px solid #253a60; }"
-            "QTabBar::tab { background-color: #141e30; color: #5a7a9a; padding: 6px 12px;"
-            " border: none; border-right: 1px solid #253a60; font-size: 10px; }"
-            "QTabBar::tab:selected { background-color: #0d1424; color: #4fc3f7;"
-            " font-weight: bold; }"
-            "QLabel { color: #c8d6e5; font-size: 11px; padding: 8px; }")
+            "QDialog { background: transparent; }"
+            "QTabWidget::pane { background-color: transparent; border: none; }"
+            "QTabBar::tab { background-color: transparent; color: #5a7a9a;"
+            " padding: 8px 14px; border: none; font-size: 10px; }"
+            "QTabBar::tab:selected { color: #4fc3f7; font-weight: bold;"
+            " border-bottom: 2px solid #4fc3f7; }"
+            "QLabel { color: #dbe8f5; font-size: 11px; }")
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        if len(secciones) == 1:
-            lbl = QLabel(secciones[0][1])
-            lbl.setWordWrap(True)
-            lbl.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-            lay.addWidget(lbl)
-            return
-        tabs = QTabWidget()
-        tabs.setDocumentMode(True)
-        # Ancho de texto real dentro de la pestaña (fijo=360 menos bordes y
-        # el padding de 8px del QLabel a cada lado).
-        ancho_texto = 360 - 2 - 32
-        alturas = []
-        for titulo, texto in secciones:
+        lay.setContentsMargins(20, 20, 20, 20)
+        # halo azul exterior (anillo tenue) + panel interior con gradiente
+        halo = QFrame(self)
+        halo.setObjectName("haloPopup")
+        halo.setStyleSheet(
+            "QFrame#haloPopup { background-color: rgba(79, 195, 247, 40);"
+            " border-radius: 14px; }")
+        glow = QGraphicsDropShadowEffect(halo)
+        glow.setBlurRadius(18)
+        glow.setColor(QColor(79, 195, 247, 90))
+        glow.setOffset(0, 0)
+        halo.setGraphicsEffect(glow)
+        lay.addWidget(halo)
+        panel = QFrame(halo)
+        panel.setObjectName("panelPopup")
+        panel.setStyleSheet(
+            "QFrame#panelPopup { background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+            " stop:0 #1b2c4a, stop:1 #0d1424); border: 1px solid #2a4a6a;"
+            " border-radius: 12px; }")
+        sombra = QGraphicsDropShadowEffect(panel)
+        sombra.setBlurRadius(18)
+        sombra.setColor(QColor(0, 0, 0, 150))
+        sombra.setOffset(0, 4)
+        panel.setGraphicsEffect(sombra)
+        lay_panel = QVBoxLayout(panel)
+        lay_panel.setContentsMargins(12, 8, 12, 12)
+        lay_panel.setSpacing(0)
+        lay_halo = QVBoxLayout(halo)
+        lay_halo.setContentsMargins(2, 2, 2, 2)
+        lay_halo.addWidget(panel)
+        # ancho de texto real dentro del panel (420 - halos - márgenes)
+        ancho_texto = 420 - 40 - 4 - 24
+        pantalla = QApplication.primaryScreen()
+        altura_max = max(240, (pantalla.availableGeometry().height() - 160)
+                         if pantalla is not None else 240)
+
+        def _label(texto):
             lbl = QLabel(texto)
             lbl.setWordWrap(True)
             lbl.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-            lbl.setFixedWidth(ancho_texto)
+            # aplicar la fuente del QSS antes de medir: si se mide con la
+            # fuente por defecto, la altura sale corta y el texto se recorta
+            lbl.ensurePolished()
+            return lbl
+
+        if len(secciones) == 1:
+            lbl = _label(secciones[0][1])
+            lay_panel.addWidget(lbl)
+            natural = lbl.heightForWidth(ancho_texto) + 24
+            panel.setFixedHeight(min(natural, altura_max))
+            return
+        tabs = QTabWidget()
+        tabs.setDocumentMode(True)
+        alturas = []
+        for titulo, texto in secciones:
+            lbl = _label(texto)
             alturas.append(lbl.heightForWidth(ancho_texto))
             tabs.addTab(lbl, titulo)
-        # Sin QScrollArea: cada pestaña muestra el texto completo. La altura
-        # del panel de pestañas se fija de una vez al máximo que necesita
-        # cualquiera de los 4 textos (+ padding del QLabel y la barra de
-        # pestañas), para que cambiar de pestaña no redimensione el popup en
-        # caliente — QTabWidget solo calcula bien el heightForWidth de la
-        # página VISIBLE, así que recalcular al vuelo al cambiar de pestaña
-        # queda un ciclo de layout por detrás y corta el texto.
-        tabs.setFixedHeight(max(alturas) + 32 + 34)
-        lay.addWidget(tabs)
+        # altura del contenido completo: sin barras de scroll, todo visible.
+        # La altura se fija una vez (máximo de las pestañas + barra) para que
+        # cambiar de pestaña no redimensione el popup en caliente.
+        altura_natural = max(alturas) + 34 + 8
+        tabs.setFixedHeight(min(altura_natural, altura_max))
+        lay_panel.addWidget(tabs)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._animado_entrada:
+            self._animado_entrada = True
+            animar_entrada(self)
+
+
+# ══════════════ paneles flotantes sin marco de Windows ══════════════
+
+def animar_entrada(widget, deslizamiento=8, duracion_ms=180):
+    """Fade-in + deslizamiento sutil al mostrar un panel flotante.
+
+    Las animaciones se guardan como atributos del propio widget para que Qt
+    no las recolecte a mitad de vuelo."""
+    pos_final = widget.pos()
+    fade = QPropertyAnimation(widget, b"windowOpacity", widget)
+    fade.setStartValue(0.0)
+    fade.setEndValue(1.0)
+    fade.setDuration(duracion_ms)
+    fade.setEasingCurve(QEasingCurve.Type.OutCubic)
+    slide = QPropertyAnimation(widget, b"pos", widget)
+    slide.setStartValue(pos_final + QPoint(0, deslizamiento))
+    slide.setEndValue(pos_final)
+    slide.setDuration(duracion_ms)
+    slide.setEasingCurve(QEasingCurve.Type.OutCubic)
+    widget._anim_fade = fade
+    widget._anim_slide = slide
+    fade.start()
+    slide.start()
+
+
+def instalar_arrastre(ventana, widget):
+    """Arrastrar una ventana sin marco desde `widget` (la cabecera)."""
+    datos = {'offset': None}
+
+    def _pressed(event):
+        datos['offset'] = (event.globalPosition().toPoint()
+                           - ventana.frameGeometry().topLeft())
+
+    def _moved(event):
+        if datos['offset'] is not None:
+            ventana.move(event.globalPosition().toPoint() - datos['offset'])
+
+    def _released(event):
+        datos['offset'] = None
+
+    widget.mousePressEvent = _pressed
+    widget.mouseMoveEvent = _moved
+    widget.mouseReleaseEvent = _released
+
+
+class PanelFlotanteDialog(QDialog):
+    """Diálogo sin marco de Windows que se anima (fade + deslizamiento) al
+    mostrarse. Es la base de QuestDB y de la lista completa de trades."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._animado_entrada = False
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._animado_entrada:
+            self._animado_entrada = True
+            animar_entrada(self)
+
+
+def montar_panel_flotante(dlg, titulo, ancho, alto=None, subtitulo='',
+                          boton_cerrar=True):
+    """Monta en `dlg` la estructura de panel flotante: sin marco nativo,
+    translúcido, con cabecera propia (marca + título + subtítulo + ✕) y
+    arrastre desde la cabecera.
+
+    Devuelve (lay_contenido, lbl_subtitulo, halo). `lay_contenido` es donde
+    el llamador coloca su contenido; `lbl_subtitulo` se puede actualizar en
+    vivo; `halo` es el anillo azul exterior (para animarlo si se quiere).
+    """
+    dlg.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
+    dlg.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+    dlg.setFixedWidth(ancho)
+    if alto is not None:
+        dlg.setFixedHeight(alto)
+    dlg.setStyleSheet(
+        "QDialog { background: transparent; }"
+        "QLabel#tituloPanel { color: #4fc3f7; font-size: 13px; font-weight: bold; }"
+        "QLabel#subPanel { color: #5a7a9a; font-size: 11px; }"
+        "QLabel#textoPanel { color: #dbe8f5; font-size: 11px; }"
+        "QPushButton#cerrarPanel { background: transparent; color: #7a90ad;"
+        " border: none; font-size: 15px; font-weight: bold; padding: 0 7px;"
+        " border-radius: 5px; }"
+        "QPushButton#cerrarPanel:hover { color: #e74c3c; background-color: #2a1a1a; }")
+    lay = QVBoxLayout(dlg)
+    lay.setContentsMargins(20, 20, 20, 20)
+    halo = QFrame(dlg)
+    halo.setObjectName("haloPanel")
+    halo.setStyleSheet(
+        "QFrame#haloPanel { background-color: rgba(79, 195, 247, 40);"
+        " border-radius: 14px; }")
+    glow = QGraphicsDropShadowEffect(halo)
+    glow.setBlurRadius(18)
+    glow.setColor(QColor(79, 195, 247, 90))
+    glow.setOffset(0, 0)
+    halo.setGraphicsEffect(glow)
+    lay.addWidget(halo)
+    panel = QFrame(halo)
+    panel.setObjectName("panelFlotante")
+    panel.setStyleSheet(
+        "QFrame#panelFlotante { background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+        " stop:0 #1b2c4a, stop:1 #0d1424); border: 1px solid #2a4a6a;"
+        " border-radius: 12px; }")
+    sombra = QGraphicsDropShadowEffect(panel)
+    sombra.setBlurRadius(18)
+    sombra.setColor(QColor(0, 0, 0, 150))
+    sombra.setOffset(0, 4)
+    panel.setGraphicsEffect(sombra)
+    lay_panel = QVBoxLayout(panel)
+    lay_panel.setContentsMargins(14, 10, 14, 14)
+    lay_panel.setSpacing(10)
+    lay_halo = QVBoxLayout(halo)
+    lay_halo.setContentsMargins(2, 2, 2, 2)
+    lay_halo.addWidget(panel)
+    # cabecera: marca + título + subtítulo + botón de cierre
+    header = QWidget(panel)
+    lay_head = QHBoxLayout(header)
+    lay_head.setContentsMargins(2, 0, 2, 0)
+    lay_head.setSpacing(8)
+    punto = QLabel("●")
+    punto.setStyleSheet("color: #4fc3f7; font-size: 12px;")
+    lay_head.addWidget(punto)
+    col = QVBoxLayout()
+    col.setSpacing(0)
+    col.setContentsMargins(0, 0, 0, 0)
+    lbl_titulo = QLabel(titulo)
+    lbl_titulo.setObjectName("tituloPanel")
+    col.addWidget(lbl_titulo)
+    lbl_sub = QLabel(subtitulo)
+    lbl_sub.setObjectName("subPanel")
+    col.addWidget(lbl_sub)
+    lay_head.addLayout(col, 1)
+    if boton_cerrar:
+        btn_x = QPushButton("✕")
+        btn_x.setObjectName("cerrarPanel")
+        btn_x.setFixedSize(28, 26)
+        btn_x.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_x.clicked.connect(dlg.close)
+        lay_head.addWidget(btn_x)
+    lay_panel.addWidget(header)
+    sep = QFrame(panel)
+    sep.setFixedHeight(1)
+    sep.setStyleSheet("background-color: #253a60; border: none;")
+    lay_panel.addWidget(sep)
+    instalar_arrastre(dlg, header)
+    return lay_panel, lbl_sub, halo
+
+
+def panel_flotante_dialog(titulo, ancho, alto=None, subtitulo='', parent=None,
+                          boton_cerrar=True):
+    """Diálogo flotante sin marco de Windows listo para usar.
+
+    Devuelve (dlg, lay_contenido, lbl_subtitulo, halo). El diálogo se anima
+    solo al mostrarse (fade + deslizamiento)."""
+    dlg = PanelFlotanteDialog(parent)
+    lay, lbl_sub, halo = montar_panel_flotante(
+        dlg, titulo, ancho, alto=alto, subtitulo=subtitulo,
+        boton_cerrar=boton_cerrar)
+    return dlg, lay, lbl_sub, halo
 
 
 def _badge_ayuda(secciones, tooltip=None):
@@ -521,7 +730,9 @@ def _badge_ayuda(secciones, tooltip=None):
     icono.setAlignment(Qt.AlignmentFlag.AlignCenter)
     icono.setStyleSheet(
         "QLabel { background-color: #253a60; color: #8fb3d9; "
-        "border-radius: 8px; font-size: 10px; font-weight: bold; }")
+        "border-radius: 8px; font-size: 10px; font-weight: bold; }"
+        "QLabel:hover { background-color: #3a5a8a; color: #4fc3f7;"
+        " border: 1px solid rgba(79, 195, 247, 120); }")
     icono.setCursor(Qt.CursorShape.PointingHandCursor)
     if tooltip:
         icono.setToolTip(tooltip)
@@ -532,6 +743,9 @@ def _badge_ayuda(secciones, tooltip=None):
         # pese a llevar `icono` como parent en C++.
         icono._popup = popup = _PopupAyuda(secciones, icono)
         popup.move(_posicion_popup(icono, popup))
+        # fade-in: opacidad 0 antes de mostrar para no destellar, y la
+        # animación (fade + deslizamiento) la lanza _PopupAyuda.showEvent
+        popup.setWindowOpacity(0.0)
         popup.show()
     icono.mousePressEvent = _abrir
     return icono
@@ -542,10 +756,10 @@ def _posicion_popup(icono, popup):
     pantalla del icono.
 
     Sin este recorte el popup se ancla a la esquina inferior izquierda del
-    icono y se extiende 360 px hacia la derecha, y eso lo hacía INVISIBLE en
-    los iconos del Backtester: allí van alineados a la derecha de su grupo
-    (`_fila_ayuda`), o sea pegados al borde de la ventana, así que con la
-    ventana maximizada el panel entero caía fuera del monitor. Se abría, pero
+    icono y se extiende hacia la derecha según su ancho, y eso lo hacía
+    INVISIBLE en los iconos del Backtester: allí van alineados a la derecha de
+    su grupo (`_fila_ayuda`), o sea pegados al borde de la ventana, así que con
+    la ventana maximizada el panel entero caía fuera del monitor. Se abría, pero
     no había dónde verlo — se leía como un icono muerto.
 
     Lo mismo por abajo: un icono en la parte baja de una página larga abriría

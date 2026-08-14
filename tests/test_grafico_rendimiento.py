@@ -7,9 +7,12 @@ pasó de ~106 ms a ~30 ms al imponerlos:
 
 1. no se dibujan más velas que píxeles hay para enseñarlas,
 2. los artistas de vela se mutan, no se recrean en cada frame,
-3. varios eventos de ratón seguidos colapsan en un solo frame.
+3. varios eventos de ratón seguidos colapsan en un solo frame (diferido por el
+   timer de frames, ~50 fps máx, para que el scroll muy rápido no acumule
+   trabajo pendiente).
 """
 import os
+import time
 
 import numpy as np
 import pandas as pd
@@ -98,10 +101,14 @@ def test_los_artistas_de_vela_se_reutilizan(widget):
 
 def test_varios_eventos_seguidos_pintan_un_solo_frame(widget, app):
     """El ratón manda eventos más deprisa de lo que se rasteriza un frame:
-    pintarlos todos deja el gráfico por detrás del cursor."""
+    pintarlos todos deja el gráfico por detrás del cursor. Varios eventos
+    seguidos colapsan en UN solo frame —el último—, pintado de forma diferida
+    por el timer de frames (intervalo de 20 ms ≈ 50 fps máx, para que una
+    ráfaga de scroll muy rápida no acumule frames pendientes)."""
     ax = widget._ax_principal
     x = widget._x_full
     ax.set_xlim(x[0], x[5000])
+    widget._sesion_activa = True
     widget._iniciar_sesion_blit()
 
     pintados = []
@@ -112,7 +119,14 @@ def test_varios_eventos_seguidos_pintan_un_solo_frame(widget, app):
             ax.set_xlim(x[i * 10], x[5000 + i * 10])
             widget._solicitar_frame_blit(ax)
         assert pintados == [], "no debe pintarse dentro del propio evento"
-        app.processEvents()
+        # el frame se pinta al disparar el timer de frames (~50 fps máx):
+        # esperar su intervalo procesando eventos, como hace el bucle real de
+        # Qt (bucle con tope para no depender de temporizaciones del sistema)
+        for _ in range(100):
+            app.processEvents()
+            if pintados:
+                break
+            time.sleep(0.01)
         assert len(pintados) == 1
         assert ax.get_xlim()[0] == pytest.approx(x[40]), "pinta la última posición"
     finally:

@@ -137,6 +137,8 @@ Los scripts sueltos de `library/scripts_utiles/` y `library/Backtests/` tienen d
    - `QUESTDB_HOST`, `QUESTDB_PG_PORT`, `QUESTDB_HTTP_PORT`, `QUESTDB_DATABASE`, `QUESTDB_USER`, `QUESTDB_PASSWORD` — conexión a QuestDB. Con los defaults (`localhost`, puertos 18812/19000) la app gestiona su propia instancia.
    - `BASE_DATA` — carpeta donde se guardan los datos limpios e informes. **Opcional**: si no se define, la app pregunta la carpeta en el primer arranque y la recuerda en `config.json`.
 
+> **Cambiar la carpeta de datos desde Ajustes requiere reiniciar la aplicación.** La ruta nueva se guarda en `config.json`, pero se aplica por completo en el siguiente arranque: hasta entonces las pestañas abiertas siguen usando la carpeta anterior para no dejar archivos a medias entre dos rutas.
+
 ## Arranque
 
 Con el **`.exe` portable**, doble clic y ya. Desde el código hay tres vías:
@@ -156,6 +158,18 @@ La app incluye un gestor automático ("QuestDB de bolsillo", `core/questdb_manag
 - La primera vez que uses la pestaña **Importar** o abras **Ajustes**, si no hay un QuestDB accesible en `QUESTDB_HOST`, descarga el binario oficial (con Java embebido) desde GitHub Releases y lo arranca en segundo plano. No requiere permisos de administrador ni Docker.
 - Windows y macOS: automático. **Linux**: instala QuestDB manualmente (https://questdb.io/download/) y configura host/puertos en `.env`.
 - Si apuntas `QUESTDB_HOST` a un servidor remoto, la app usa ese servidor y no instala nada.
+
+## Riesgo y Stop Loss en el backtest
+
+- **Riesgo del setup** (`riesgo_pct`) es el límite de riesgo **nominal** de cada operación: `distancia al stop × volumen`, acotado por `equity × riesgo_pct`. Las comisiones y el slippage se descuentan aparte del resultado y no entran en ese presupuesto.
+- **Stop Loss × ATR** tiene dos modos por setup:
+  - **Fijo**: el stop se ancla a la primera entrada y no se mueve al añadir promedios.
+  - **Dinámico por promedio**: tras cada entrada se reancla al precio medio de la posición con el ATR del momento, sin bajar nunca un stop ya mejorado por Break Even o Trailing.
+- En ambos modos, cada promedio solo consume el riesgo que queda libre; el riesgo nominal total nunca supera el presupuesto del setup.
+- El ATR de una entrada se calcula con la **última vela cerrada** (nunca la vela de entrada, que aún no existe al operar su apertura).
+- **Gaps**: si una vela abre al otro lado del stop, el cierre se llena al precio de apertura (pérdida real por hueco), no al nivel teórico del stop. Un tramo pendiente no se ejecuta si la vela abre atravesando el stop.
+- `Stop Loss = 0` significa "sin stop real": en ese caso no puede garantizarse una pérdida máxima.
+- **Velas interpoladas**: el toggle `Excluir velas interpoladas de las señales` está encendido por defecto. Las velas siguen en la serie para conservar continuidad e indicadores, pero no pueden generar entradas nuevas ni órdenes límite; las salidas y la gestión de posiciones abiertas siguen activas. Al apagarlo, las velas interpoladas se tratan como cualquier otra y vuelven a poder generar señales.
 
 ## Estructura del repo
 

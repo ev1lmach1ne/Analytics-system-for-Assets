@@ -14,6 +14,7 @@ sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 from core.config import CONFIG_PATH, LIMPIADOS_DIR, DB_CONFIG, normalizar_categoria_descarga
 from core.metrics import calcular_umbrales_er, contar_regimen_hurst, hurst_rs_numba, calcular_hurst_array
+from core.questdb_errors import es_columna_inexistente
 
 
 # ----------COLORES-----------
@@ -65,29 +66,47 @@ print("="*50)
 print(f"LIMPIEZA — {TABLA} ({FRECUENCIA})")
 print("="*50)
 
+
 # Conexión
-conn = psycopg2.connect(**DB_CONFIG)
+try:
+    conn = psycopg2.connect(**DB_CONFIG)
+except Exception as e:
+    raise RuntimeError(f"No se pudo conectar con QuestDB para limpiar: {e}") from e
 
 
 # ── [1/7] DESCARGA DE DATOS ──────────────────────────────────────────────────
 print("\n[1/7] Descargando datos...")
 try:
-    df = pd.read_sql(f"""
-        SELECT timestamp, open, high, low, close, volume, spread
-        FROM {TABLA}
-        ORDER BY timestamp ASC
-    """, conn)
-    print(f"      Columna 'spread' detectada en la tabla.")
-except Exception:
-    conn.rollback()
-    df = pd.read_sql(f"""
-        SELECT timestamp, open, high, low, close, volume
-        FROM {TABLA}
-        ORDER BY timestamp ASC
-    """, conn)
-    df['spread'] = 0.0
-    print(f"      Tabla sin columna 'spread' — se rellena con 0.")
-conn.close()
+    try:
+        df = pd.read_sql(f"""
+            SELECT timestamp, open, high, low, close, volume, spread
+            FROM {TABLA}
+            ORDER BY timestamp ASC
+        """, conn)
+        print(f"      Columna 'spread' detectada en la tabla.")
+    except Exception as e:
+        # 42703 = undefined_column: solo este caso justifica reintentar sin
+        # spread. Una tabla inexistente, una caída de red o credenciales
+        # inválidas deben propagarse con su causa real.
+        if not es_columna_inexistente(e):
+            raise RuntimeError(
+                f"No se pudo leer la tabla '{TABLA}' de QuestDB: {e}") from e
+        conn.rollback()
+        try:
+            df = pd.read_sql(f"""
+                SELECT timestamp, open, high, low, close, volume
+                FROM {TABLA}
+                ORDER BY timestamp ASC
+            """, conn)
+        except Exception as e2:
+            raise RuntimeError(
+                f"No se pudo leer la tabla '{TABLA}' sin spread: {e2}") from e2
+        df['spread'] = 0.0
+        print(f"      Tabla sin columna 'spread' — se rellena con 0.")
+finally:
+    conn.close()
+if df.empty:
+    raise RuntimeError(f"La tabla '{TABLA}' no contiene datos para limpiar.")
 print(f"      Filas originales: {len(df)}")
 # endregion
 

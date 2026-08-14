@@ -10,6 +10,11 @@ library/Backtests, que es el más correcto de los scripts históricos):
   misma vela que genera la señal).
 - Stop-loss (si está activo) se comprueba contra el low/high de CADA vela
   mientras la posición está abierta y se ejecuta al precio del stop.
+- Gap sobre el stop: si la vela ABRE al otro lado del stop (o[i] lo cruza),
+  el cierre se llena al OPEN, no al nivel teórico del stop — el mercado se
+  llevó la posición por delante y esa es la pérdida real.
+- Prioridad dentro de una vela: el stop manda sobre los tramos pendientes.
+  Un tramo programado no se ejecuta si la vela abre atravesando el stop.
 - Slippage: encarece la entrada y abarata la salida (en % del precio).
 - Comisión: % del nocional, cobrada en entrada y en salida.
 - Una sola posición a la vez por setup (long o short, sin invertir directo);
@@ -50,6 +55,16 @@ Dimensionamiento por riesgo:
 - La distancia de riesgo es stop_atr * ATR si hay stop; si no hay stop se
   usa 2*ATR como distancia de REFERENCIA solo para dimensionar (documentado:
   sin stop real, una vela adversa grande puede perder más del riesgo teórico).
+- El ATR que se usa al ENTRAR es el de la última vela CERRADA (atr[i-1] al
+  operar el open de i): la vela de entrada todavía no existe en ese momento,
+  y su ATR incluiría datos futuros. El break-even/trailing intra-vela sigue
+  usando el ATR de la vela en curso (solo reaccionan a su propio rango).
+- El presupuesto de riesgo del setup (equity al abrir la posición ×
+  riesgo_pct) se fija en la PRIMERA entrada y cada tramo solo consume el
+  riesgo que queda libre: el riesgo nominal total de la posición (distancia
+  de cada entrada al stop × su volumen) nunca supera ese presupuesto. Si el
+  stop se reancla (modo 'dinamico_promedio'), queda limitado a la distancia
+  que el presupuesto permite sobre el precio medio.
 
 Motivos de salida (columna 'motivo' de cada trade):
 0 = señal contraria/salida, 1 = stop-loss, 2 = take-profit,
@@ -132,6 +147,16 @@ _M_STOP, _M_TP, _M_BE, _M_TRAILING, _M_TIEMPO = range(5)
 # origen del nivel de stop vigente -> índice del mecanismo cuyo 'pct' se aplica
 _ORIGEN_A_MECANISMO = (_M_STOP, _M_BE, _M_TRAILING)
 
+# modo del Stop Loss ×ATR por setup ('stop_atr_modo' en config_por_setup):
+# 'fijo' = el stop se ancla a la primera entrada · 'dinamico_promedio' = se
+# reancla al precio medio de la posición con el ATR del momento tras cada
+# entrada. En ambos modos el riesgo nominal total del setup (distancia al
+# stop × volumen) queda acotado por 'riesgo_pct'.
+_MODO_STOP_FIJO = 0
+_MODO_STOP_DINAMICO = 1
+MODOS_STOP = {'fijo': _MODO_STOP_FIJO,
+              'dinamico_promedio': _MODO_STOP_DINAMICO}
+
 # columnas del array de trades que devuelve _simular_numba
 (_T_IDX_IN, _T_IDX_OUT, _T_DIR, _T_SETUP, _T_PIN, _T_POUT, _T_PNL, _T_MOTIVO,
  _T_EQ_IN, _T_UNIDADES, _T_STOP, _T_PARCIAL) = range(12)
@@ -182,6 +207,86 @@ def _aplicar_gestion_parcial(g_tipo, g_val, dir_pos, stop_precio, precio_ref,
 
 
 @njit(nogil=True)
+def _atr_cerrado(i, atr, precio_fallback):
+    """ATR de la última vela CERRADA (i-1) para las decisiones que se toman
+    al OPEN de la vela i: la vela en curso todavía no existe cuando se
+    dimensiona la entrada, así que usarla (atr[i], que incluye su high/low/
+    close) metería datos futuros en el sizing. La primera vela no tiene
+    anterior: cae al propio ATR o al fallback de precio (borde de la serie,
+    margen despreciable)."""
+    if i > 0:
+        v = atr[i - 1]
+        if v > 0.0:
+            return v
+    v = atr[i]
+    return v if v > 0.0 else precio_fallback
+
+
+@njit(nogil=True)
+def _riesgo_abierto(entradas, n_entradas, idx_ini, dir_pos, stop_precio):
+    """Riesgo nominal ya comprometido por las entradas de la posición en
+    curso: suma de (distancia de cada entrada al stop vigente × unidades).
+    Es la magnitud que acota el presupuesto de 'riesgo_pct' del setup."""
+    riesgo = 0.0
+    for j in range(idx_ini, n_entradas):
+        dist = (entradas[j, _E_PRECIO] - stop_precio) * dir_pos
+        if dist > 0.0:
+            riesgo += entradas[j, _E_UNIDADES] * dist
+    return riesgo
+
+
+@njit(nogil=True)
+def _stop_por_presupuesto(entradas, n_entradas, idx_ini, dir_pos, presupuesto):
+    """Nivel de stop que agota exactamente el presupuesto de riesgo: el mayor
+    (largo) / menor (corto) S tal que el riesgo nominal de TODAS las entradas
+    de la posición (distancia al stop × volumen, aportando solo las entradas
+    que el stop cruza) no supera `presupuesto`.
+
+    El riesgo es lineal a trozos en S con cambios de pendiente en cada precio
+    de entrada, así que la raíz de riesgo(S) = presupuesto se resuelve
+    recorriendo los precios ordenados (máx. 8 tramos: barato)."""
+    m = n_entradas - idx_ini
+    if m <= 0 or presupuesto <= 0.0:
+        return 0.0
+    precios = np.empty(m)
+    unidades = np.empty(m)
+    for j in range(m):
+        precios[j] = entradas[idx_ini + j, _E_PRECIO]
+        unidades[j] = entradas[idx_ini + j, _E_UNIDADES]
+    if dir_pos > 0:
+        for a in range(m):          # largos: de más caro a más barato
+            for b in range(a + 1, m):
+                if precios[b] > precios[a]:
+                    precios[a], precios[b] = precios[b], precios[a]
+                    unidades[a], unidades[b] = unidades[b], unidades[a]
+        cum_u = 0.0
+        cum_up = 0.0
+        for k in range(m):
+            cum_u += unidades[k]
+            cum_up += unidades[k] * precios[k]
+            if k + 1 < m:
+                riesgo_borde = cum_up - precios[k + 1] * cum_u
+                if riesgo_borde > presupuesto:
+                    return (cum_up - presupuesto) / cum_u
+        return (cum_up - presupuesto) / cum_u if cum_u > 0.0 else 0.0
+    for a in range(m):              # cortos: de más barato a más caro
+        for b in range(a + 1, m):
+            if precios[b] < precios[a]:
+                precios[a], precios[b] = precios[b], precios[a]
+                unidades[a], unidades[b] = unidades[b], unidades[a]
+    cum_u = 0.0
+    cum_up = 0.0
+    for k in range(m):
+        cum_u += unidades[k]
+        cum_up += unidades[k] * precios[k]
+        if k + 1 < m:
+            riesgo_borde = precios[k + 1] * cum_u - cum_up
+            if riesgo_borde > presupuesto:
+                return (presupuesto + cum_up) / cum_u
+    return (presupuesto + cum_up) / cum_u if cum_u > 0.0 else 0.0
+
+
+@njit(nogil=True)
 def _simular_numba(o, h, l, c, ent_long, ent_short, sal_long, sal_short,
                    setup_id, atr, riesgos_setup, stops_setup, tps_setup,
                    tiempos_setup, bes_setup, be_uni_setup, trails_setup,
@@ -200,6 +305,7 @@ def _simular_numba(o, h, l, c, ent_long, ent_short, sal_long, sal_short,
                    orden_long_precio, orden_short_precio,
                    cancel_orden_long, cancel_orden_short,
                    vigencia_setup, avance_cancel_setup,
+                   modos_setup,
                    max_trades, max_entradas, max_ordenes,
                    capital_inicial, comision_pct, slippage_pct):
     """Bucle del motor. Devuelve (trades[n,12], n_trades, equity[n],
@@ -238,8 +344,13 @@ def _simular_numba(o, h, l, c, ent_long, ent_short, sal_long, sal_short,
     be_aplicado = False
     # quién movió por última vez el nivel de stop vigente: 0 = el stop original
     # de la entrada, 1 = break-even, 2 = trailing. Decide qué 'pct' se aplica
-    # cuando el precio lo toca (ver _ORIGEN_A_MECANISMO).
     origen_stop = 0
+    # presupuesto de riesgo del setup de la posición en curso (equity al
+    # abrir × riesgo_pct), primera entrada de la posición en el buffer y modo
+    # del stop vigente (ver _MODO_STOP_*)
+    presupuesto = 0.0
+    idx_entradas_pos = 0
+    pos_modo = 0
     # máscara de bits de los mecanismos que ya gastaron su cierre parcial en la
     # posición en curso (ver DISPARO ÚNICO en el docstring del módulo)
     mec_usado = 0
@@ -272,6 +383,12 @@ def _simular_numba(o, h, l, c, ent_long, ent_short, sal_long, sal_short,
         # tenía la posición justo antes de cerrarse — si no, la línea del
         # gráfico se quedaría una vela corta del marcador de cierre.
         cerro_total_en_i = False
+
+        # stop vigente al OPEN de esta vela (antes de salidas, tramos y de la
+        # gestión intra-vela). Es el nivel que un gap de apertura puede cruzar
+        # de verdad: que BE/trailing suban el stop DENTRO de la vela no
+        # convierte retroactivamente su open en un gap.
+        stop_al_open = stop_precio
 
         # ── ejecutar al open lo pendiente ──
         if en_pos and pendiente_salida:
@@ -345,43 +462,82 @@ def _simular_numba(o, h, l, c, ent_long, ent_short, sal_long, sal_short,
         # igual que la apertura inicial de la posición — nunca a un precio
         # sintético intra-vela. ──
         if en_pos and pendiente_tramo:
-            precio_t = o[i] * (1.0 + slippage_pct * dir_pos)
-            ref_atr_t = atr[i] if atr[i] > 0 else o[i] * 0.01
-            if stop_precio > 0.0:
-                dist_t = abs(precio_t - stop_precio)
-            else:
-                dist_t = dist_ref
-            dist_t = max(dist_t, 0.25 * dist_ref)   # nunca por debajo del 25% de la 1ª distancia
-            pct_t = tramo_pct_setup[setup_in, tramo_actual] / 100.0
-            riesgo_t = riesgos_setup[setup_in]
-            u_tramo = (cap * riesgo_t * pct_t) / dist_t if dist_t > 0.0 else 0.0
-            if u_tramo > 0.0 and cap > 0.0:
-                precio_in = (precio_in * unidades + precio_t * u_tramo) / (unidades + u_tramo)
-                unidades += u_tramo
-                unidades_iniciales += u_tramo
-                # recalcular el take-profit desde el nuevo precio medio, con
-                # la misma distancia de referencia (stop_atr o 2×ATR) que usa
-                # el resto del motor para expresar "R"
-                tp_r_s = tps_setup[setup_in]
-                if tp_r_s > 0.0:
-                    dist_tp = stops_setup[setup_in] * ref_atr_t \
-                        if stops_setup[setup_in] > 0.0 else 2.0 * ref_atr_t
-                    tp_precio = precio_in + tp_r_s * dist_tp * dir_pos
-                stop_precio, be_aplicado = _aplicar_gestion_parcial(
-                    tramo_gt_setup[setup_in, tramo_actual],
-                    tramo_gv_setup[setup_in, tramo_actual],
-                    dir_pos, stop_precio, precio_tramo_ant,
-                    setup_in, bes_setup, trails_setup, be_aplicado)
-                precio_tramo_ant = precio_t
-                entradas[n_entradas, _E_IDX] = i
-                entradas[n_entradas, _E_DIR] = dir_pos
-                entradas[n_entradas, _E_SETUP] = setup_in
-                entradas[n_entradas, _E_PRECIO] = precio_t
-                entradas[n_entradas, _E_UNIDADES] = u_tramo
-                entradas[n_entradas, _E_TRAMO] = tramo_actual
-                n_entradas += 1
-            tramo_actual += 1
             pendiente_tramo = False
+            # si la vela abre atravesando el stop, el tramo no llega a
+            # ejecutarse: el mercado ya se llevó la posición por delante y el
+            # cierre por gap se resuelve en el bloque de stop, más abajo
+            gap_adverso = (stop_al_open > 0.0 and
+                           ((dir_pos > 0 and o[i] <= stop_al_open) or
+                            (dir_pos < 0 and o[i] >= stop_al_open)))
+            if not gap_adverso:
+                precio_t = o[i] * (1.0 + slippage_pct * dir_pos)
+                ref_atr_t = _atr_cerrado(i, atr, o[i] * 0.01)
+                if stop_precio > 0.0:
+                    dist_t = abs(precio_t - stop_precio)
+                else:
+                    dist_t = dist_ref
+                dist_t = max(dist_t, 0.25 * dist_ref)   # nunca por debajo del 25% de la 1ª distancia
+                pct_t = tramo_pct_setup[setup_in, tramo_actual] / 100.0
+                riesgo_t = riesgos_setup[setup_in]
+                u_tramo = (cap * riesgo_t * pct_t) / dist_t if dist_t > 0.0 else 0.0
+                # presupuesto del setup: un tramo solo puede consumir el riesgo
+                # que queda libre — el 1% del setup se reparte, nunca se suma
+                if u_tramo > 0.0 and stop_precio > 0.0 and presupuesto > 0.0:
+                    dist_unidad = (precio_t - stop_precio) * dir_pos
+                    if dist_unidad > 0.0:
+                        usado = _riesgo_abierto(entradas, n_entradas,
+                                                idx_entradas_pos, dir_pos,
+                                                stop_precio)
+                        u_max = (presupuesto - usado) / dist_unidad
+                        if u_max < u_tramo:
+                            u_tramo = max(0.0, u_max)
+                if u_tramo > 0.0 and cap > 0.0:
+                    precio_in = (precio_in * unidades + precio_t * u_tramo) / (unidades + u_tramo)
+                    unidades += u_tramo
+                    unidades_iniciales += u_tramo
+                    # recalcular el take-profit desde el nuevo precio medio, con
+                    # la misma distancia de referencia (stop_atr o 2×ATR) que usa
+                    # el resto del motor para expresar "R"
+                    tp_r_s = tps_setup[setup_in]
+                    if tp_r_s > 0.0:
+                        dist_tp = stops_setup[setup_in] * ref_atr_t \
+                            if stops_setup[setup_in] > 0.0 else 2.0 * ref_atr_t
+                        tp_precio = precio_in + tp_r_s * dist_tp * dir_pos
+                    stop_precio, be_aplicado = _aplicar_gestion_parcial(
+                        tramo_gt_setup[setup_in, tramo_actual],
+                        tramo_gv_setup[setup_in, tramo_actual],
+                        dir_pos, stop_precio, precio_tramo_ant,
+                        setup_in, bes_setup, trails_setup, be_aplicado)
+                    precio_tramo_ant = precio_t
+                    entradas[n_entradas, _E_IDX] = i
+                    entradas[n_entradas, _E_DIR] = dir_pos
+                    entradas[n_entradas, _E_SETUP] = setup_in
+                    entradas[n_entradas, _E_PRECIO] = precio_t
+                    entradas[n_entradas, _E_UNIDADES] = u_tramo
+                    entradas[n_entradas, _E_TRAMO] = tramo_actual
+                    n_entradas += 1
+                    # stop dinámico por promedio: se reancla al precio medio de
+                    # la posición con el ATR vigente tras CADA entrada, pero
+                    # nunca más lejos de lo que el presupuesto de riesgo permite
+                    # ni por debajo de un stop ya mejorado por BE/trailing — el
+                    # riesgo configurado manda sobre el ATR y sobre la media.
+                    if pos_modo == _MODO_STOP_DINAMICO and stop_precio > 0.0:
+                        k_stop = stops_setup[setup_in]
+                        if k_stop > 0.0 and unidades > 0.0 and presupuesto > 0.0:
+                            s_cand = precio_in - k_stop * ref_atr_t * dir_pos
+                            s_tope = _stop_por_presupuesto(
+                                entradas, n_entradas, idx_entradas_pos, dir_pos,
+                                presupuesto)
+                            if dir_pos > 0:
+                                s_nuevo = max(s_cand, s_tope)
+                                if origen_stop != 0:
+                                    s_nuevo = max(s_nuevo, stop_precio)
+                            else:
+                                s_nuevo = min(s_cand, s_tope)
+                                if origen_stop != 0:
+                                    s_nuevo = min(s_nuevo, stop_precio)
+                            stop_precio = s_nuevo
+                tramo_actual += 1
 
         # ── resolver la orden límite pendiente ──
         # va ANTES del bloque de apertura para que una orden que se rellena en
@@ -403,7 +559,7 @@ def _simular_numba(o, h, l, c, ent_long, ent_short, sal_long, sal_short,
             # no va a producirse a ese nivel
             avance_r = avance_cancel_setup[orden_setup]
             if (not cancelada) and avance_r > 0.0:
-                ref_atr_o = atr[i] if atr[i] > 0 else orden_precio * 0.01
+                ref_atr_o = _atr_cerrado(i, atr, orden_precio * 0.01)
                 stop_atr_o = stops_setup[orden_setup]
                 dist_o = stop_atr_o * ref_atr_o if stop_atr_o > 0 else 2.0 * ref_atr_o
                 objetivo = orden_precio + avance_r * dist_o * orden_dir
@@ -453,7 +609,7 @@ def _simular_numba(o, h, l, c, ent_long, ent_short, sal_long, sal_short,
             d = pendiente_entrada
             base = precio_fill_pendiente if precio_fill_pendiente > 0.0 else o[i]
             precio = base * (1.0 + slippage_pct * d)
-            ref_atr = atr[i] if atr[i] > 0 else precio * 0.01
+            ref_atr = _atr_cerrado(i, atr, precio * 0.01)
             stop_atr_s = stops_setup[pendiente_setup]
             tp_r_s = tps_setup[pendiente_setup]
             dist = stop_atr_s * ref_atr if stop_atr_s > 0 else 2.0 * ref_atr
@@ -464,6 +620,13 @@ def _simular_numba(o, h, l, c, ent_long, ent_short, sal_long, sal_short,
             pct0 = tramo_pct_setup[pendiente_setup, 0] / 100.0 if n_tram_0 > 0 else 1.0
             if dist > 0 and riesgo > 0 and cap > 0 and pct0 > 0.0:
                 unidades = (cap * riesgo * pct0) / dist
+                # presupuesto del setup: el tamaño nunca puede arriesgar más
+                # de 'riesgo_pct' (p.ej. un pct0 > 100% llegaría a pedirlo)
+                presupuesto = cap * riesgo
+                idx_entradas_pos = n_entradas
+                pos_modo = modos_setup[pendiente_setup]
+                if stop_atr_s > 0.0:
+                    unidades = min(unidades, presupuesto / dist)
                 unidades_iniciales = unidades
                 en_pos = True
                 dir_pos = d
@@ -665,7 +828,17 @@ def _simular_numba(o, h, l, c, ent_long, ent_short, sal_long, sal_short,
             # ── stop / TP / tiempo / fin de datos ──
             salida_precio = 0.0
             motivo = -1
-            if stop_precio > 0.0:
+            if stop_al_open > 0.0:
+                if dir_pos > 0 and o[i] <= stop_al_open:
+                    # gap: la vela abre al otro lado del stop vigente al abrir
+                    # — se llena al open (el mercado se lo llevó), no al nivel
+                    # teórico del stop
+                    salida_precio = o[i]
+                    motivo = 1
+                elif dir_pos < 0 and o[i] >= stop_al_open:
+                    salida_precio = o[i]
+                    motivo = 1
+            if motivo < 0 and stop_precio > 0.0:
                 if dir_pos > 0 and l[i] <= stop_precio:
                     salida_precio = stop_precio
                     motivo = 1
@@ -879,6 +1052,12 @@ def simular(o, h, l, c, senales, config):
     setup, que solo coinciden si el stop está a 1×ATR),
     salidas parciales y entrada escalonada (ver docstring del módulo)
     (riesgo_por_setup: {id: pct} se acepta como forma corta, compat v1).
+    En config_por_setup, 'stop_atr_modo' ('fijo' por defecto) elige cómo se
+    fija el stop ×ATR: 'fijo' lo ancla a la primera entrada y
+    'dinamico_promedio' lo reancla al precio medio de la posición con el ATR
+    del momento tras cada entrada. En ambos modos el riesgo nominal total de
+    la posición (distancia al stop × volumen) queda acotado por
+    equity_al_abrir × riesgo_pct.
     """
     o = np.ascontiguousarray(o, dtype=np.float64)
     h = np.ascontiguousarray(h, dtype=np.float64)
@@ -964,6 +1143,16 @@ def simular(o, h, l, c, senales, config):
             vigencias[sid] = int(cfg_s['limite_vigencia_velas'])
         if 'limite_cancelar_avance_r' in cfg_s:
             avances_cancel[sid] = float(cfg_s['limite_cancelar_avance_r'])
+
+    # modo del Stop Loss ×ATR por setup: 'fijo' (defecto, compatibilidad
+    # total con configs antiguas sin la clave) o 'dinamico_promedio'
+    modos = np.zeros(64, dtype=np.int64)
+    for sid, cfg_s in cfg_por_setup.items():
+        sid = int(sid)
+        if not 0 <= sid < 64:
+            continue
+        modos[sid] = MODOS_STOP.get(cfg_s.get('stop_atr_modo') or 'fijo',
+                                    _MODO_STOP_FIJO)
 
     # ── salidas parciales ──
     max_parc = 8
@@ -1180,6 +1369,7 @@ def simular(o, h, l, c, senales, config):
         _mascara_salida(senales.get('cancelar_orden_short',
                                     np.zeros(n, dtype=np.int64))),
         vigencias, avances_cancel,
+        modos,
         max_trades, max_entradas, max_ordenes,
         float(config.get('capital_inicial', 10000.0)),
         float(config.get('comision_pct', 0.0005)),
@@ -1700,13 +1890,16 @@ def walk_forward(o, h, l, c, senales, config, n_ventanas=5,
 
 def montecarlo(trades, capital_inicial, n_sims=1000, semilla=None,
                umbral_ruina=0.5):
-    """Remuestreo del ORDEN de los trades (permutación con reemplazo /
-    bootstrap de ret_pct): distribución de equity final y de max drawdown si
-    los mismos trades hubieran llegado en otro orden u otra muestra.
+    """Bootstrap con reemplazo de los trades (resampling de ret_pct): en cada
+    simulación se extrae con reemplazo una muestra del MISMO tamaño que la
+    secuencia real, así que un trade puede repetirse y otro omitirse — no es
+    una simple reordenación. Se obtiene la distribución de equity final y de
+    max drawdown que esos trades habrían producido en otra muestra.
 
     Devuelve percentiles 5/50/95 de la curva, histogramas de retorno final
-    y max DD, probabilidad de acabar en negativo y de 'ruina' (equity por
-    debajo de umbral_ruina * capital inicial en algún momento).
+    y max DD, la probabilidad de terminar por DEBAJO del capital inicial
+    (perder dinero, no «equity negativa») y la de 'ruina' (equity por debajo
+    de umbral_ruina * capital inicial en algún momento).
     """
     ret = np.asarray(trades['ret_pct'], dtype=np.float64)
     n_tr = len(ret)

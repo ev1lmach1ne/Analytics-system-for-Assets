@@ -146,3 +146,53 @@ Archivos nuevos/modificados: `tests/test_indicadores.py` (nuevo),
 `tests/test_config_anualizacion.py` (nuevo), `tests/test_backtest.py`
 (ampliado), `core/config.py` (+`velas_por_anio`), `gui/widgets/tab_backtest.py`
 (`_velas_por_anio` ahora recibe la ruta del CSV y usa la clase de activo).
+
+---
+
+## Actualización posterior — stop ATR por setup (fijo / dinámico), ATR causal y gaps
+
+Fecha: 2026-08-13. Cambios sobre `core/backtest.py`, `core/strategies.py`,
+`core/optimizer.py`, `core/codegen/*`, `gui/widgets/tab_backtest.py` y tests.
+
+### 1. Modo del Stop Loss ×ATR por setup
+
+- Nueva clave `stop_atr_modo` en `config_por_setup` (`'fijo'` por defecto).
+- **Fijo**: comportamiento histórico — el stop se ancla a la primera entrada.
+- **Dinámico por promedio**: tras cada entrada, el stop se reancla al precio
+  medio ponderado de la posición con el ATR del momento.
+- En ambos modos, el presupuesto de riesgo (`equity al abrir × riesgo_pct`)
+  es el límite absoluto: cada tramo solo consume el riesgo que queda libre, y
+  el stop dinámico queda limitado por el presupuesto (`_stop_por_presupuesto`,
+  que resuelve la raíz exacta de `riesgo(S) = presupuesto` por tramos de
+  precio). El riesgo nominal (distancia al stop × volumen, con slippage de
+  entrada ya incluido en los precios) nunca supera el presupuesto.
+- El stop dinámico **no rebaja** un stop ya mejorado por Break Even o Trailing
+  (`origen_stop != 0`): para largos se mantiene el nivel más alto, para cortos
+  el más bajo.
+- El presupuesto es **nominal**: comisión y slippage se descuentan del
+  resultado pero no reservan presupuesto (decisión explícita). Un gap también
+  puede producir una pérdida superior al nominal.
+
+### 2. ATR causal
+
+- El ATR de una entrada se toma de la última vela **cerrada** (`_atr_cerrado`:
+  `atr[i-1]` al operar el open de `i`), nunca de la vela de entrada. Elimina el
+  look-ahead del sizing/stop en tiempo real.
+- Pendiente: el `bfill()` del ATR de estrategias sigue rellenando las primeras
+  velas con un ATR calculado con datos futuros (solo afecta al warm-up).
+
+### 3. Gaps y prioridad stop/tramo
+
+- Si una vela abre al otro lado del stop vigente **al abrir**, el cierre se
+  llena al `open` (pérdida real por hueco), no al nivel teórico del stop.
+- Un tramo pendiente no se ejecuta si la vela abre atravesando el stop
+  (el stop tiene prioridad absoluta sobre los tramos).
+- El gap se evalúa contra el stop vigente al abrir la vela, no contra un stop
+  movido por BE/trailing dentro de esa misma vela.
+
+### 4. Cobertura
+
+Tests nuevos en `tests/test_stop_atr_modo.py` (causalidad, ambos modos,
+largos/cortos, recorte de presupuesto, gap al open sin ejecutar el tramo,
+stop dinámico que respeta BE) y ajuste del escenario de pirámide en
+`tests/test_backtest.py`. Suite completa: 853 tests en verde.

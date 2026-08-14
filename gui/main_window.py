@@ -1,8 +1,11 @@
 import time
+import ctypes
+import ctypes.wintypes
 from PyQt6.QtWidgets import (QMainWindow, QTabWidget, QWidget, QVBoxLayout,
                              QLabel, QPushButton, QHBoxLayout, QFrame, QSizePolicy,
                              QApplication)
-from PyQt6.QtCore import Qt, QPoint, pyqtSignal, QTimer
+from PyQt6.QtCore import (Qt, QPoint, QRect, pyqtSignal, QTimer,
+                          QPropertyAnimation, QEasingCurve, QEvent)
 from PyQt6.QtGui import QFont, QPixmap
 from gui.widgets.tab_descargar import TabDescargar
 from gui.widgets.tab_importar import TabImportar
@@ -11,6 +14,7 @@ from gui.widgets.tab_limpiados import TabLimpiados
 from gui.widgets.tab_comparador import TabComparador
 from gui.widgets.tab_backtest import TabBacktest
 from gui.widgets.loading_overlay import LoadingOverlay
+from gui.widgets.bombear import bombear_eventos
 
 STYLE = """
 QMainWindow, QWidget { background-color: #111828; color: #c8d6e5; }
@@ -31,6 +35,23 @@ QFrame#status { background-color: #0d1424; border-top: 1px solid #1a2a45; paddin
 # Si la precarga supera este tiempo, la ventana queda interactiva y el resto de
 # pestañas se construyen en su primera visita (con overlay breve).
 PRECARGA_TOPE_MS = 3500
+
+
+# LRESULT (HWND, UINT, WPARAM, LPARAM) — firma del WndProc de Win32.
+_WNDPROC = ctypes.WINFUNCTYPE(
+    ctypes.c_longlong, ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_longlong)
+
+
+class _APPBARDATA(ctypes.Structure):
+    """Estructura APPBARDATA de Win32, para localizar la barra de tareas."""
+    _fields_ = [
+        ("cbSize", ctypes.wintypes.DWORD),
+        ("hWnd", ctypes.wintypes.HWND),
+        ("uCallbackMessage", ctypes.wintypes.UINT),
+        ("uEdge", ctypes.wintypes.UINT),
+        ("rc", ctypes.wintypes.RECT),
+        ("lParam", ctypes.c_long),
+    ]
 
 
 class TabPlaceholder(QWidget):
@@ -83,7 +104,7 @@ class HeaderBar(QFrame):
         subtitle.setStyleSheet("color: #3a5a7a; font-size: 11px;")
         subtitle.setContentsMargins(6, 0, 0, 0)
 
-        version = QLabel("v0.6.8")
+        version = QLabel("v0.7.0")
         version.setStyleSheet("color: #2a4a6a; font-size: 10px; padding-left: 8px;")
 
         layout.addWidget(title)
@@ -152,7 +173,11 @@ class HeaderBar(QFrame):
 
     def _on_minimize(self):
         if self._parent:
-            self._parent.showMinimized()
+            animar = getattr(self._parent, '_animar_minimizar', None)
+            if callable(animar):
+                animar()
+            else:
+                self._parent.showMinimized()
 
     def _on_maximize(self):
         if self._parent:
@@ -200,7 +225,7 @@ class StatusBar(QFrame):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Analytics System for Assets v0.6.8")
+        self.setWindowTitle("Analytics System for Assets v0.7.0")
         # 1400x900 como tamaño deseado, recortado al área visible de la
         # pantalla (en portátiles pequeños 1400x900 no cabe) y centrado.
         disp = QApplication.primaryScreen().availableGeometry()
@@ -210,8 +235,17 @@ class MainWindow(QMainWindow):
         y = disp.y() + (disp.height() - alto) // 2
         self.setGeometry(x, y, ancho, alto)
         self.setStyleSheet(STYLE)
-        self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowMinimizeButtonHint
+            | Qt.WindowType.WindowMaximizeButtonHint
+        )
         self._drag_offset = QPoint()
+        self._anim = None
+        self._geometry_normal = None
+        self._minimizar_era_maximizada = False
+        self._hook_cb = None
+        self._hook_original = None
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -269,18 +303,24 @@ class MainWindow(QMainWindow):
         self.tab_descargar = TabDescargar()
         self._real_tabs[0] = self.tab_descargar
         self.tabs.addTab(self.tab_descargar, self._tab_titles[0])
+        # Este constructor se ejecuta aún con el splash visible (app.py) y
+        # sin bombeo externo: procesar eventos aquí evita que Windows marque
+        # la ventana "No responde" si la construcción se alarga.
+        bombear_eventos()
         for idx in range(1, 6):
             ph = TabPlaceholder(self._tab_labels[idx])
             self._placeholders[idx] = ph
             self.tabs.addTab(ph, self._tab_titles[idx])
 
         self.tabs.currentChanged.connect(self._on_tab_changed)
+        bombear_eventos()
 
     # ── Construcción perezosa de pestañas ──────────────────────────────
 
     def _wire_tab(self, idx, widget):
         if idx == 1:
             widget.import_completed.connect(self._on_import_completed)
+            widget.import_failed.connect(self._on_import_failed)
         elif idx == 2:
             widget.analysis_completed.connect(self._on_analysis_completed)
             widget.file_selected.connect(self._on_file_selected)
@@ -317,7 +357,7 @@ class MainWindow(QMainWindow):
                 self.overlay.begin(f"Preparando {self._tab_labels[idx]}…")
             elif mantener_overlay:
                 self.overlay.set_text(f"Preparando {self._tab_labels[idx]}…")
-            QApplication.processEvents()
+            bombear_eventos()
 
             widget = cls()
             self._real_tabs[idx] = widget
@@ -344,7 +384,7 @@ class MainWindow(QMainWindow):
             # Fuerza el layout/pintado del tab mientras el overlay aún cubre la
             # ventana: así la primera pintada pesada (p. ej. Backtester) no se
             # ve como un parpadeo/tirona al destaparla.
-            QApplication.processEvents()
+            bombear_eventos()
             try:
                 if not mantener_overlay and inicio_overlay:
                     self.overlay.end()
@@ -449,6 +489,9 @@ class MainWindow(QMainWindow):
             import traceback
             traceback.print_exc()
 
+    def _on_import_failed(self, fase):
+        self.set_status(f"Importación fallida durante {fase}; revisa la consola")
+
     def _on_analysis_completed(self, *args):
         try:
             self._get_tab(3).load_results(*args)
@@ -483,13 +526,196 @@ class MainWindow(QMainWindow):
         dlg.exec()
         after = get_base_data()
         if after != before:
-            for idx in (0, 1, 2):
-                tab = self._real_tabs.get(idx)
-                if tab is not None and hasattr(tab, 'update_base_data'):
-                    tab.update_base_data(after)
-            self.set_status(f"Ruta de datos: {after}")
+            # La carpeta de datos solo se aplica por completo en el próximo
+            # arranque: varios módulos importan las rutas como constantes y
+            # los procesos ya lanzados no se reconfiguran. Actualizar solo
+            # algunas pestañas dejaba la sesión a medias (p.ej. el meta.json
+            # en una carpeta y el CSV limpio en otra).
+            self.set_status(
+                f"Ruta de datos cambiada a: {after} — reinicia la aplicación "
+                f"para aplicarla en todas las pestañas")
+
+    def changeEvent(self, event):
+        if event.type() == QEvent.Type.WindowStateChange:
+            header = getattr(self, 'header', None)
+            if header is not None:
+                header.btn_max.setText("❐" if self.isMaximized() else "□")
+            if self.windowState() & Qt.WindowState.WindowMinimized:
+                if event.oldState() & Qt.WindowState.WindowMaximized:
+                    self._minimizar_era_maximizada = True
+                    self._geometry_normal = None
+                elif self._geometry_normal is None:
+                    # Ruta externa (p. ej. Win+M): sin animación previa, el
+                    # rect normal todavía es el actual.
+                    self._geometry_normal = self.geometry()
+        super().changeEvent(event)
+
+    # ── Animación de minimizar/restaurar (como las apps nativas) ──────
+
+    # La ventana es frameless, así que DWM no siempre reproduce la animación
+    # de minimizar de Windows. Se reproduce el mismo efecto por nuestra cuenta:
+    # la ventana se desliza y encoge hacia su botón de la barra de tareas.
+    #
+    # Para cubrir el clic en la barra de tareas hay que interceptar el
+    # WM_SYSCOMMAND (SC_MINIMIZE/SC_RESTORE) que envía el shell. NO se puede
+    # hacer con nativeEvent de PyQt6: en esta combinación (PyQt6 6.11 +
+    # Python 3.14) sobrescribir QWidget.nativeEvent o instalar un filtro nativo
+    # provoca un access violation en QtCore al mostrar la ventana. En su lugar
+    # se subclasifica la ventana Win32 (SetWindowLongPtrW/GWLP_WNDPROC) y se
+    # reenvía todo al WndProc original de Qt salvo los dos comandos.
+
+    def showEvent(self, event):
+        self._instalar_hook_wndproc()
+        super().showEvent(event)
+
+    def _instalar_hook_wndproc(self):
+        if self._hook_cb is not None:
+            return
+        self._hook_error = None
+        try:
+            hwnd = int(self.winId())
+            if not hwnd:
+                self._hook_error = "sin hwnd"
+                return
+            user32 = ctypes.windll.user32
+            user32.GetWindowLongPtrW.restype = ctypes.c_longlong
+            user32.SetWindowLongPtrW.restype = ctypes.c_longlong
+            direccion = user32.GetWindowLongPtrW(hwnd, -4)  # GWLP_WNDPROC
+            if not direccion:
+                self._hook_error = "wndproc original 0"
+                return
+            self._hook_original = _WNDPROC(direccion)
+
+            def _proc(hwnd_, msg, wparam, lparam):
+                try:
+                    if msg == 0x0112:  # WM_SYSCOMMAND
+                        cmd = wparam & 0xFFF0
+                        if cmd == 0xF020:  # SC_MINIMIZE (clic barra de tareas)
+                            self._animar_minimizar()
+                            return 0
+                        if cmd == 0xF120:  # SC_RESTORE (clic en minimizada)
+                            self._animar_restaurar()
+                            return 0
+                except Exception:
+                    pass
+                return self._hook_original(hwnd_, msg, wparam, lparam)
+
+            self._hook_cb = _WNDPROC(_proc)
+            user32.SetWindowLongPtrW(hwnd, -4,
+                                     ctypes.cast(self._hook_cb, ctypes.c_void_p))
+        except Exception as e:
+            self._hook_cb = None
+            self._hook_original = None
+            self._hook_error = repr(e)
+
+    def _desinstalar_hook_wndproc(self):
+        if self._hook_cb is None:
+            return
+        try:
+            hwnd = int(self.winId())
+            if hwnd:
+                user32 = ctypes.windll.user32
+                user32.SetWindowLongPtrW.restype = ctypes.c_longlong
+                user32.SetWindowLongPtrW(
+                    hwnd, -4, ctypes.cast(self._hook_original, ctypes.c_void_p))
+        except Exception:
+            pass
+        self._hook_cb = None
+        self._hook_original = None
+
+    def _recto_icono_tarea(self):
+        """Rectángulo aproximado del botón de esta app en la barra de tareas."""
+        ancho = max(140, self.width() // 10)
+        alto = max(32, self.height() // 12)
+        try:
+            data = _APPBARDATA()
+            data.cbSize = ctypes.sizeof(_APPBARDATA)
+            # ABM_GETTASKBARPOS = 5; devuelve el rect y el borde (uEdge:
+            # 0=izquierda, 1=arriba, 2=derecha, 3=abajo) de la barra.
+            if ctypes.windll.shell32.SHAppBarMessage(0x00000005, ctypes.byref(data)):
+                tb = data.rc
+                cx = self.geometry().center().x()
+                cy = self.geometry().center().y()
+                if data.uEdge == 3:      # barra abajo
+                    return QRect(max(tb.left, min(cx - ancho // 2, tb.right - ancho)),
+                                 tb.top - alto, ancho, alto)
+                if data.uEdge == 1:      # barra arriba
+                    return QRect(max(tb.left, min(cx - ancho // 2, tb.right - ancho)),
+                                 tb.bottom, ancho, alto)
+                if data.uEdge == 2:      # barra derecha
+                    return QRect(tb.left - ancho,
+                                 max(tb.top, min(cy - alto // 2, tb.bottom - alto)),
+                                 ancho, alto)
+                return QRect(tb.right,          # barra izquierda
+                             max(tb.top, min(cy - alto // 2, tb.bottom - alto)),
+                             ancho, alto)
+        except Exception:
+            pass
+        disp = QApplication.primaryScreen().availableGeometry()
+        cx = self.geometry().center().x()
+        return QRect(cx - ancho // 2, disp.y() + disp.height() - alto, ancho, alto)
+
+    def _animar_minimizar(self):
+        if self._anim is not None and self._anim.state() == QPropertyAnimation.State.Running:
+            return
+        if self.windowState() & Qt.WindowState.WindowMinimized:
+            return
+        if self.isMaximized():
+            # Desde maximizado no hay rectángulo que deslizar: minimizar directo.
+            self._geometry_normal = None
+            self.showMinimized()
+            return
+        self._geometry_normal = self.geometry()
+        self._anim = QPropertyAnimation(self, b"geometry", self)
+        self._anim.setDuration(200)
+        self._anim.setStartValue(self.geometry())
+        self._anim.setEndValue(self._recto_icono_tarea())
+        self._anim.setEasingCurve(QEasingCurve.Type.InCubic)
+        self._anim.finished.connect(self._terminar_minimizado)
+        self._anim.start()
+
+    def _terminar_minimizado(self):
+        self._anim = None
+        self.showMinimized()
+
+    def _animar_restaurar(self):
+        anim, self._anim = self._anim, None
+        if anim is not None:
+            try:
+                anim.stop()
+            except Exception:
+                pass
+            anim.deleteLater()
+        era_max = self._minimizar_era_maximizada
+        self._minimizar_era_maximizada = False
+        if era_max:
+            if self.windowState() & Qt.WindowState.WindowMinimized:
+                self.showMaximized()
+            self._geometry_normal = None
+            return
+        fue_minimizada = bool(self.windowState() & Qt.WindowState.WindowMinimized)
+        if fue_minimizada:
+            self.showNormal()
+        if (not fue_minimizada or not self._geometry_normal
+                or not self._geometry_normal.isValid()):
+            return
+        inicio = self._recto_icono_tarea()
+        self.setGeometry(inicio)
+        self._anim = QPropertyAnimation(self, b"geometry", self)
+        self._anim.setDuration(220)
+        self._anim.setStartValue(inicio)
+        self._anim.setEndValue(self._geometry_normal)
+        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._anim.finished.connect(self._fin_restaurado)
+        self._anim.start()
+
+    def _fin_restaurado(self):
+        self._anim = None
+        self._geometry_normal = None
 
     def closeEvent(self, event):
+        # Devolver el WndProc original a Qt antes de que destruya la ventana.
+        self._desinstalar_hook_wndproc()
         # apaga la QuestDB local solo si la arrancamos nosotros en esta
         # sesión — nunca toca una que el usuario ya tuviera corriendo
         from core.questdb_manager import detener_bundled

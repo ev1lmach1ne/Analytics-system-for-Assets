@@ -15,9 +15,10 @@ import os
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                               QLabel, QLineEdit, QComboBox, QListWidget,
                               QListWidgetItem, QFrame, QGroupBox, QButtonGroup,
-                              QRadioButton, QProgressBar, QDateEdit, QCheckBox)
+                              QRadioButton, QDateEdit, QCheckBox)
 from PyQt6.QtCore import Qt, pyqtSignal, QDate, QThread, QTimer
 from gui.widgets.console_widget import ConsoleWidget
+from gui.widgets.progress_animada import ProgressBarAnimada
 from core.config import SCRIPTS_DIR
 from core.data_providers.dukascopy_provider import DukascopyProvider
 from core.data_providers.yfinance_provider import YFinanceProvider
@@ -88,11 +89,6 @@ QListWidget::item { padding: 6px 10px; border-bottom: 1px solid #182030; }
 QListWidget::item:selected { background-color: #2a4a6a; color: #4fc3f7; }
 QListWidget::item:hover { background-color: #1a2a45; }
 QFrame#sep { background-color: #253a60; max-height: 1px; }
-QProgressBar {
-    background-color: #1a2a45; border: none; border-radius: 4px;
-    text-align: center; color: #c8d6e5; font-size: 10px; max-height: 18px;
-}
-QProgressBar::chunk { background-color: #4fc3f7; border-radius: 4px; }
 QLabel#providerInfo {
     background-color: #0d1a2a; color: #8a9ab0;
     padding: 6px 10px; border-radius: 4px; font-size: 10px;
@@ -342,8 +338,9 @@ class TabDescargar(QWidget):
         right_panel.addLayout(btn_layout)
 
         # Barra de progreso
-        self.progress = QProgressBar()
+        self.progress = ProgressBarAnimada()
         self.progress.setValue(0)
+        self.progress.setFixedHeight(18)
         self.progress.setVisible(False)
         right_panel.addWidget(self.progress)
 
@@ -372,6 +369,12 @@ class TabDescargar(QWidget):
         # (tambien reclasifica lo que haya quedado en OTROS anteriormente).
         self._reorg_thread = _ReorganizarCategoriasThread(self)
         self._reorg_thread.start()
+
+        # Este constructor se ejecuta con el splash aún visible (MainWindow
+        # se construye antes de cerrarlo): bombear para que Windows no marque
+        # la app "No responde" si la carga del catálogo se alarga.
+        from gui.widgets.bombear import bombear_eventos
+        bombear_eventos()
 
     # --- Catalogo -------------------------------------------------------------
 

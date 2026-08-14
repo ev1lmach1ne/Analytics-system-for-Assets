@@ -624,6 +624,7 @@ def plan_gestion(setup, params):
     return {
         'riesgo_pct': float(setup.get('riesgo_pct', 0.01)),
         'stop_atr': float(setup.get('stop_atr', 0.0)),
+        'stop_atr_modo': setup.get('stop_atr_modo', 'fijo'),
         'tp_r': float(setup.get('tp_r', 0.0)),
         'be_atr': float(setup.get('be_atr', 0.0)),
         'be_unidad': 'r' if setup.get('be_unidad') == 'r' else 'atr',

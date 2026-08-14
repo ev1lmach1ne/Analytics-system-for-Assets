@@ -235,8 +235,10 @@ def _aplanar_subdirectorio_unico(carpeta):
 
 def _env_puertos():
     env = dict(os.environ)
-    env['QDB_HTTP_BIND_TO'] = f'0.0.0.0:{QUESTDB_HTTP_PORT}'
-    env['QDB_PG_NET_BIND_TO'] = f'0.0.0.0:{QUESTDB_PG_PORT}'
+    # La instancia automática es local; no debe exponerse a la LAN con las
+    # credenciales de desarrollo. Una QuestDB remota no pasa por este proceso.
+    env['QDB_HTTP_BIND_TO'] = f'127.0.0.1:{QUESTDB_HTTP_PORT}'
+    env['QDB_PG_NET_BIND_TO'] = f'127.0.0.1:{QUESTDB_PG_PORT}'
     env['QDB_LINE_TCP_ENABLED'] = 'false'   # protocolo ILP-TCP: este proyecto no lo usa
     return env
 
@@ -390,8 +392,9 @@ def ensure_running(progress_cb=None, timeout_arranque=20):
     mensaje = "QuestDB no respondió a tiempo tras arrancarla"
     # en Mac, questdb.sh ya devolvió éxito con solo lanzar el proceso — si
     # luego el servidor se cae durante el boot, el motivo real solo queda en
-    # su propio log, no en la salida de questdb.sh
-    if platform.system() == 'Darwin':
+    # su propio log, no en la salida de questdb.sh. En Windows pasa igual con
+    # el proceso java lanzado directamente.
+    if platform.system() in ('Windows', 'Darwin'):
         tail = _ultimo_log_questdb(_carpeta_datos())
         if tail:
             mensaje += f"\n\nÚltimas líneas del log de QuestDB:\n{tail}"

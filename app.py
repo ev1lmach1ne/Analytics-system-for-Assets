@@ -127,9 +127,20 @@ def main():
     except Exception:
         pass
 
+    # Desactiva las "ventanas fantasma" de Windows: si el hilo de la UI se
+    # bloquea unos segundos durante el arranque (construcción de la ventana,
+    # precarga de pestañas), Windows deja de dibujar copias grises de las
+    # ventanas. La app ya comunica el estado de carga con su propio splash y
+    # overlay con spinner, así que las copias "No responde" solo estorban.
+    try:
+        ctypes.windll.user32.DisableProcessWindowsGhosting()
+    except Exception:
+        pass
+
     from PyQt6.QtCore import Qt
-    from PyQt6.QtWidgets import QApplication, QSplashScreen
-    from PyQt6.QtGui import QIcon, QPalette, QColor, QPixmap
+    from PyQt6.QtWidgets import QApplication, QWidget
+    from PyQt6.QtGui import (QIcon, QPalette, QColor, QPixmap, QImage,
+                             QRegion, QPainter)
 
     # QtWebEngineWidgets debe importarse antes de crear QApplication
     try:
@@ -159,12 +170,70 @@ def main():
     if not _ensure_config():
         sys.exit(0)
 
-    # Splash screen con fade-in mientras carga la app
+    # Splash de arranque: ventana recortada con la FORMA EXACTA del icono
+    # (máscara de región a partir del canal alpha), sin translucidez ni capas
+    # DWM. QSplashScreen usa una ventana en capas (alpha por píxel) que en
+    # algunos equipos/multi-monitor se compone mal y pinta un cuadrado gris
+    # alrededor del logo; una máscara de región es recorte Win32 clásico:
+    # fuera del icono no existe ventana, no puede verse ningún cuadrado.
+    def _region_alpha(pixmap):
+        """QRegion con la silueta del icono (píxeles con alpha > umbral)."""
+        img = pixmap.toImage().convertToFormat(QImage.Format.Format_ARGB32)
+        region = QRegion()
+        w, h = img.width(), img.height()
+        for y in range(h):
+            x = 0
+            while x < w:
+                while x < w and img.pixelColor(x, y).alpha() < 10:
+                    x += 1
+                ini = x
+                while x < w and img.pixelColor(x, y).alpha() >= 10:
+                    x += 1
+                if x > ini:
+                    region |= QRegion(ini, y, x - ini, 1)
+        return region
+
+    def _premezclar_fondo(pixmap):
+        """Pixmap opaco: el icono pintado sobre el azul oscuro de la app, para
+        que los bordes suavizados del logo no se fundan con el fondo gris del
+        escritorio ni dejen halo."""
+        base = QPixmap(pixmap.size())
+        base.fill(QColor("#0d1424"))
+        p = QPainter(base)
+        p.drawPixmap(0, 0, pixmap)
+        p.end()
+        return base
+
+    class _Splash(QWidget):
+        def __init__(self, pixmap):
+            super().__init__()
+            self.setWindowFlags(Qt.WindowType.FramelessWindowHint
+                                | Qt.WindowType.WindowStaysOnTopHint
+                                | Qt.WindowType.Tool)
+            self.setFixedSize(pixmap.size())
+            self._px = _premezclar_fondo(pixmap)
+            self.setMask(_region_alpha(pixmap))
+            self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+            self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+
+        def paintEvent(self, event):
+            p = QPainter(self)
+            p.drawPixmap(0, 0, self._px)
+            p.end()
+
+        def centrar(self):
+            disp = QApplication.primaryScreen().availableGeometry()
+            self.move(disp.center().x() - self.width() // 2,
+                      disp.center().y() - self.height() // 2)
+
     # Usamos pixmap(256,256) para obtener la mejor resolución del .ico
     splash_px = app_icon.pixmap(256, 256).scaled(300, 300,
         Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-    splash = QSplashScreen(splash_px)
-    splash.setWindowFlags(Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.FramelessWindowHint)
+    splash = _Splash(splash_px)
+    splash.centrar()
+    # Fade in del logo. Es opacidad UNIFORME de ventana (capa simple de
+    # Windows), no alpha por píxel: segura combinada con la máscara y sin
+    # los artefactos del QSplashScreen translúcido.
     splash.setWindowOpacity(0.0)
     splash.show()
     for i in range(1, 11):
@@ -208,7 +277,7 @@ def main():
     window = _resultado_import['MainWindow']()
     window.setWindowIcon(app_icon)
 
-    # Fade out del splash — luego mostramos la ventana
+    # Fade out del logo y cierre, luego mostramos la ventana.
     for i in range(10, -1, -1):
         splash.setWindowOpacity(i / 10.0)
         app.processEvents()
@@ -216,6 +285,12 @@ def main():
     splash.close()
 
     window.show()
+    # Dejar que la ventana complete su PRIMER pintado (incluida la aplicación
+    # de la hoja de estilos) antes de empezar la precarga de pestañas: sin
+    # esto, la zona central puede mostrarse en blanco/gris durante la carga
+    # y verse como una copia fantasma de la ventana.
+    for _ in range(4):
+        app.processEvents()
 
     # La ventana aparece ya interactiva; las pestañas aún pendientes se
     # precargan bajo el overlay de carga (spinner + texto). Si tarda más del

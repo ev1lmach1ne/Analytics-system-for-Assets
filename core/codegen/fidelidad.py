@@ -174,18 +174,40 @@ CARACTERISTICAS = {
     },
     'atr_de_la_vela_de_entrada': {
         'etiqueta': 'ATR de dimensionamiento tomado de la vela de entrada',
-        'motivo_comun': "El motor entra en la APERTURA de la vela i pero "
-                        "dimensiona con atr[i], que incluye el máximo, el "
-                        "mínimo y el cierre de esa misma vela (core/backtest.py, "
-                        "bloque de ejecución al open). En vivo esos datos aún "
-                        "no existen en el momento de entrar, así que el código "
-                        "generado usa el ATR de la última vela CERRADA.",
+        'motivo_comun': "El motor entra en la APERTURA de la vela i y "
+                        "dimensiona con el ATR de la última vela CERRADA "
+                        "(atr[i-1], ver core/backtest._atr_cerrado) — igual "
+                        "que el código generado. Solo difiere en el borde: "
+                        "cuando aún no hay vela anterior, el motor cae al ATR "
+                        "de la propia vela de entrada o al fallback del 1% del "
+                        "precio, mientras que el código generado espera a tener "
+                        "una vela cerrada.",
         'consecuencia': {
             NIVEL_APROXIMADO:
-                "El tamaño de la posición y la distancia del stop saldrán algo "
-                "distintos a los del backtest en cada operación. La diferencia "
-                "es pequeña salvo en cambios bruscos de volatilidad, pero es "
-                "sistemática: no se compensa con el tiempo.",
+                "Las primeras operaciones de la serie (antes de que exista un "
+                "ATR válido de vela cerrada) pueden dimensionarse con una "
+                "volatilidad algo distinta a la del código generado. Del resto "
+                "de la serie, el tamaño y el stop coinciden.",
+        },
+    },
+    'stop_atr_dinamico': {
+        'etiqueta': 'Stop ×ATR dinámico por precio medio',
+        'motivos': {
+            'mt4': "El runtime del EA fija el stop de cada entrada con su "
+                   "propio ATR y no reancla un stop compartido al precio medio "
+                   "de la posición cuando se añaden promedios.",
+            'mt5': "El runtime del EA fija el stop de cada entrada con su "
+                   "propio ATR y no reancla un stop compartido al precio medio "
+                   "de la posición cuando se añaden promedios.",
+            'tradingview': "La estrategia generada fija el stop al entrar y no "
+                           "lo reancla al precio medio cuando se añaden "
+                           "promedios.",
+        },
+        'consecuencia': {
+            NIVEL_OMITIDO:
+                "El código se genera con el stop FIJO de la primera entrada: "
+                "con promedios, el stop real operará distinto (más lejos o "
+                "más cerca) que el del backtest.",
         },
     },
     'slippage_en_ticks': {
@@ -357,6 +379,7 @@ CAPACIDADES = {
         'relleno_open_siguiente': NIVEL_APROXIMADO,
         'redondeo_lotes': NIVEL_APROXIMADO,
         'atr_de_la_vela_de_entrada': NIVEL_APROXIMADO,
+        'stop_atr_dinamico': NIVEL_OMITIDO,
         **_PENDIENTES_NUCLEO,
     },
     'mt5': {
@@ -368,6 +391,7 @@ CAPACIDADES = {
         'relleno_open_siguiente': NIVEL_APROXIMADO,
         'redondeo_lotes': NIVEL_APROXIMADO,
         'atr_de_la_vela_de_entrada': NIVEL_APROXIMADO,
+        'stop_atr_dinamico': NIVEL_OMITIDO,
         'cuenta_netting': NIVEL_APROXIMADO,
         **_PENDIENTES_NUCLEO,
     },
@@ -379,6 +403,7 @@ CAPACIDADES = {
         'hurst': NIVEL_OMITIDO,          # aquí NO es pendiente: no cabe
         'relleno_open_siguiente': NIVEL_EXACTO,
         'atr_de_la_vela_de_entrada': NIVEL_APROXIMADO,
+        'stop_atr_dinamico': NIVEL_OMITIDO,
         'slippage_en_ticks': NIVEL_APROXIMADO,
         **_PENDIENTES_NUCLEO,
     },
@@ -470,6 +495,11 @@ def _caracteristicas_usadas(ir_st):
     if gestion['mecanismos']:
         nombres = ", ".join(sorted(gestion['mecanismos']))
         usadas.append(('mecanismos_parciales', nombres))
+
+    if (gestion.get('stop_atr_modo') == 'dinamico_promedio'
+            and gestion['stop_atr'] > 0.0):
+        usadas.append(('stop_atr_dinamico',
+                       f"stop {gestion['stop_atr']:g}×ATR sobre el precio medio"))
 
     if ir_st['patrones'] or ir_st['plantilla'] == 'Patrones de velas':
         usadas.append(('patrones_velas',

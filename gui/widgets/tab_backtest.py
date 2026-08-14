@@ -47,7 +47,7 @@ from PyQt6.QtWidgets import (
     QCheckBox, QScrollArea, QFrame, QTableWidget, QTableWidgetItem,
     QHeaderView, QPushButton, QSplitter, QLineEdit, QSpinBox, QDoubleSpinBox,
     QSlider, QListWidget, QListWidgetItem, QTabWidget, QFormLayout, QGroupBox,
-    QInputDialog, QDateEdit, QSizePolicy, QApplication, QDialog, QProgressBar,
+    QInputDialog, QDateEdit, QSizePolicy, QApplication, QDialog,
     QButtonGroup, QStyledItemDelegate, QStyle, QStackedWidget, QMenu,
     QMessageBox, QRadioButton, QToolButton, QGraphicsOpacityEffect,
 )
@@ -97,6 +97,7 @@ from core.candle_patterns import detectar_patrones
 from core.data_providers import economic_calendar
 from gui.widgets.file_explorer import FileExplorer
 from gui.widgets.bombear import bombear_eventos
+from gui.widgets.progress_animada import ProgressBarAnimada
 from gui.widgets.loading_overlay import (mostrar_overlay_tab, ocultar_overlay_tab,
                                          apagar_overlay_tab)
 from gui.widgets.tf_common import TF_LABELS, parsear_tf_custom, regla_de_tf
@@ -104,8 +105,24 @@ from gui.widgets.lwc_chart import LwcChart, WEBENGINE_OK
 from gui.widgets.plot_common import (
     icono_ayuda as _icono_ayuda_popup,
     icono_ayuda_texto as _icono_ayuda_texto,
+    panel_flotante_dialog as _panel_flotante_dialog,
     eje_fechas_ordinal,
 )
+
+# fuente del sistema, la misma pila que Lightweight Charts en Windows
+# (Segoe UI -> Trebuchet MS -> la por defecto de matplotlib si no están).
+# rcParams es global: toda la app comparte el mismo criterio tipográfico.
+import matplotlib as _mpl
+from matplotlib import font_manager as _font_manager
+try:
+    _fuentes_instaladas = {f.name for f in _font_manager.fontManager.ttflist}
+except Exception:
+    _fuentes_instaladas = set()
+for _familia_lwc in ('Segoe UI', 'Trebuchet MS', 'Verdana'):
+    if _familia_lwc in _fuentes_instaladas:
+        _mpl.rcParams['font.family'] = [_familia_lwc] + list(
+            _mpl.rcParams['font.family'])
+        break
 
 FIG_BG = '#0d1424'
 AX_FG = '#c8d6e5'
@@ -115,6 +132,13 @@ ROJO = '#e74c3c'
 GRIS = '#5a7a9a'
 AMBAR = '#f1c40f'
 AZUL = '#4fc3f7'
+
+# cruceta y último precio con la apariencia por defecto de Lightweight Charts
+# (la vista moderna), para que la clásica se lea igual: líneas de cruceta
+# #758696 semitransparentes y etiquetas con fondo #4c525e y texto blanco
+CRUCETA_COLOR = '#758696'
+CRUCETA_BG = '#4c525e'
+CRUCETA_TX = '#ffffff'
 
 # flechas de operaciones: tonos más saturados que las velas (VERDE/ROJO de
 # arriba) para que los marcadores no se camuflen sobre cuerpos del mismo color.
@@ -182,7 +206,7 @@ BANDA_REGIMEN = {
     'er_tendencia': (UMBRAL_ER_TENDENCIA, 1.0),
     'er_rango': (0.0, UMBRAL_ER_RUIDO),
     'hurst_tendencia': (UMBRAL_HURST_TENDENCIA, 1.0),
-    'hurst_reversión': (0.0, UMBRAL_HURST_REVERSION),
+    'hurst_reversion': (0.0, UMBRAL_HURST_REVERSION),
 }
 
 MODOS_WFA = [
@@ -463,7 +487,8 @@ def _style_ax(ax):
     ax.tick_params(colors=AX_FG, labelsize=7)
     for spine in ax.spines.values():
         spine.set_edgecolor(GRID_C)
-    ax.grid(True, alpha=0.25, color=GRID_C, linewidth=0.5)
+    # grid sólido como Lightweight Charts (mismo #253a60, sin atenuar)
+    ax.grid(True, alpha=1.0, color=GRID_C, linewidth=0.8)
 
 
 def _fmt(v, dec=2, sufijo=''):
@@ -472,6 +497,21 @@ def _fmt(v, dec=2, sufijo=''):
     if v == float('inf'):
         return '∞'
     return f"{v:.{dec}f}{sufijo}"
+
+
+def _fmt_precio(v):
+    """Formato del badge de último precio: decimales según la magnitud,
+    como el formateador de la escala de Lightweight Charts."""
+    av = abs(v)
+    if av >= 100:
+        dec = 2
+    elif av >= 1:
+        dec = 4
+    elif av >= 0.01:
+        dec = 4
+    else:
+        dec = 6
+    return f"{v:,.{dec}f}"
 
 
 def _marcar_niveles_eje(ax, niveles):
@@ -506,9 +546,12 @@ def _marcar_niveles_eje(ax, niveles):
 
 def _decimar_ohlc(x, o, h, l, c, x0, x1, max_velas=2500):
     """Recorta a la ventana visible [x0, x1] y, si hay más de max_velas
-    puntos, los agrega en bloques (open=primero, high=max, low=min,
-    close=último) para que el nº de artistas dibujados quede acotado sin
-    importar la resolución total de la serie ni el nivel de zoom."""
+    puntos, dibuja una vela REAL de cada `paso` (submuestreo, no agregación
+    en bloques): la vela que se ve de lejos es la MISMA que se ve de cerca —
+    al hacer zoom solo aparecen las intermedias, ninguna cambia de color ni
+    de forma. (La agregación por bloques creaba velas sintéticas cuyo
+    open/high/low/close no era el de ninguna vela real, y el gráfico parecía
+    enseñar "otras velas" según el zoom.)"""
     i0, i1 = np.searchsorted(x, [x0, x1])
     i0 = max(i0 - 1, 0)
     i1 = min(i1 + 1, len(x))
@@ -519,22 +562,8 @@ def _decimar_ohlc(x, o, h, l, c, x0, x1, max_velas=2500):
     if n <= max_velas:
         return xs, os_, hs, ls, cs
     paso = int(np.ceil(n / max_velas))
-    n_bins = int(np.ceil(n / paso))
-    pad = n_bins * paso - n
-    if pad:
-        xs = np.pad(xs, (0, pad), mode='edge')
-        os_ = np.pad(os_, (0, pad), mode='edge')
-        hs = np.pad(hs, (0, pad), mode='edge')
-        ls = np.pad(ls, (0, pad), mode='edge')
-        cs = np.pad(cs, (0, pad), mode='edge')
-    idx_starts = np.arange(0, n_bins * paso, paso)
-    idx_ends = idx_starts + paso - 1
-    x_bin = xs[idx_starts]
-    o_bin = os_[idx_starts]
-    h_bin = np.maximum.reduceat(hs, idx_starts)
-    l_bin = np.minimum.reduceat(ls, idx_starts)
-    c_bin = cs[idx_ends]
-    return x_bin, o_bin, h_bin, l_bin, c_bin
+    idx = np.arange(0, n, paso)
+    return xs[idx], os_[idx], hs[idx], ls[idx], cs[idx]
 
 
 def _cargar_ohlc(csv_path, regla_resample=None):
@@ -542,7 +571,8 @@ def _cargar_ohlc(csv_path, regla_resample=None):
     lo reagrega a una temporalidad más gruesa (misma agregación que
     tab_patrones._ResampleThread). Compartido por _BacktestThread y
     _OptimizerThread."""
-    cols = ['timestamp', 'open', 'high', 'low', 'close']
+    cols = ['timestamp', 'open', 'high', 'low', 'close',
+            'interpolado', 'anomalia']
     try:
         df = pd.read_csv(csv_path, usecols=cols, engine='pyarrow')
     except (ImportError, ValueError):
@@ -550,9 +580,17 @@ def _cargar_ohlc(csv_path, regla_resample=None):
     df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
     df = df.dropna(subset=['timestamp', 'close']).sort_values('timestamp')
     df = df.reset_index(drop=True)
+    for nombre in ('interpolado', 'anomalia'):
+        if nombre not in df.columns:
+            df[nombre] = 0
+        else:
+            df[nombre] = (pd.to_numeric(df[nombre], errors='coerce')
+                          .fillna(0).astype(np.int8))
     if regla_resample:
-        agg = {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'}
-        df = (df.set_index('timestamp')[['open', 'high', 'low', 'close']]
+        agg = {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last',
+               'interpolado': 'max', 'anomalia': 'max'}
+        df = (df.set_index('timestamp')[
+                ['open', 'high', 'low', 'close', 'interpolado', 'anomalia']]
                 .resample(regla_resample).agg(agg)
                 .dropna(subset=['close'])
                 .reset_index())
@@ -646,7 +684,7 @@ class _BacktestThread(QThread):
 
     def __init__(self, csv_path, setups, config_global, pct_oos,
                  wfa_activo, wfa_ventanas, codigo='', tf_label=None,
-                 regla_resample=None, parent=None):
+                 regla_resample=None, excluir_interpoladas=False, parent=None):
         super().__init__(parent)
         self._csv = csv_path
         self._setups = setups
@@ -657,6 +695,7 @@ class _BacktestThread(QThread):
         self._codigo = codigo
         self._tf_label = tf_label
         self._regla_resample = regla_resample
+        self._excluir_interpoladas = bool(excluir_interpoladas)
 
     def run(self):
         try:
@@ -691,11 +730,17 @@ class _BacktestThread(QThread):
                     eventos_prep = preparar_eventos_noticias(df_eventos)
                     setups_senales = _resolver_monedas_noticias(self._setups, self._csv)
 
-            senales = generar_senales_sistema(df, setups_senales, eventos_prep)
+            mascara_interpoladas = None
+            if self._excluir_interpoladas:
+                mascara_interpoladas = df['interpolado'].to_numpy(dtype=bool)
+            senales = generar_senales_sistema(
+                df, setups_senales, eventos_prep,
+                mascara_entradas=mascara_interpoladas)
             self.progreso.emit(40, 100)
 
             # config del motor: cuenta global + riesgo/stop/TP/tiempo por setup
             config = dict(self._cfg_global)
+            config['excluir_interpoladas'] = self._excluir_interpoladas
             config_por_setup = {}
             for k, setup in enumerate(self._setups):
                 salida_n = int(setup.get('salida_n_velas', 0))
@@ -704,6 +749,7 @@ class _BacktestThread(QThread):
                 config_por_setup[k] = {
                     'riesgo_pct': float(setup.get('riesgo_pct', 0.01)),
                     'stop_atr': float(setup.get('stop_atr', 0.0)),
+                    'stop_atr_modo': setup.get('stop_atr_modo', 'fijo'),
                     'tp_r': float(setup.get('tp_r', 0.0)),
                     'salida_n_velas': salida_n,
                     'be_atr': float(setup.get('be_atr', 0.0)),
@@ -861,7 +907,7 @@ class _OptimizerThread(QThread):
 
     def __init__(self, csv_path, setup_base, sweep_params, sweep_riesgo,
                  config_global, pct_oos, metrica, tf_label=None,
-                 regla_resample=None, parent=None):
+                 regla_resample=None, excluir_interpoladas=False, parent=None):
         super().__init__(parent)
         self._csv = csv_path
         self._setup_base = setup_base
@@ -872,6 +918,7 @@ class _OptimizerThread(QThread):
         self._metrica = metrica
         self._tf_label = tf_label
         self._regla_resample = regla_resample
+        self._excluir_interpoladas = bool(excluir_interpoladas)
 
     def run(self):
         try:
@@ -890,6 +937,9 @@ class _OptimizerThread(QThread):
             velas_anio = _velas_por_anio(df, self._csv)
             setup_base = self._setup_base
             eventos_prep = None
+            mascara_interpoladas = None
+            if self._excluir_interpoladas:
+                mascara_interpoladas = df['interpolado'].to_numpy(dtype=bool)
             avisos_noticias = []
             if _algun_setup_usa_noticias([setup_base]):
                 try:
@@ -911,7 +961,8 @@ class _OptimizerThread(QThread):
                 self._cfg_global, self._pct_oos, metrica=self._metrica,
                 velas_por_anio=velas_anio,
                 progreso_cb=lambda i, total: self.progreso.emit(i, total),
-                eventos_noticias=eventos_prep)
+                eventos_noticias=eventos_prep,
+                mascara_entradas=mascara_interpoladas)
             self.terminado.emit({
                 'resultados': resultados,
                 'metrica': self._metrica,
@@ -1773,7 +1824,8 @@ class EditorCondiciones(QGroupBox):
 def _setup_por_defecto(plantilla='Cruce de medias'):
     s = {'nombre': 'Setup 1', 'plantilla': plantilla,
          'params': params_por_defecto(plantilla),
-         'riesgo_pct': 0.01, 'stop_atr': 2.0, 'tp_r': 0.0,
+         'riesgo_pct': 0.01, 'stop_atr': 2.0, 'stop_atr_modo': 'fijo',
+         'tp_r': 0.0,
          'salida_n_velas': 0, 'edge': False,
          'be_atr': 0.0, 'be_unidad': 'atr', 'trailing_atr': 0.0,
          # la salida implícita de la plantilla, explícita y editable: 100% a
@@ -1793,8 +1845,21 @@ def _setup_por_defecto(plantilla='Cruce de medias'):
 _MAPA_REGIMEN = {
     'Ninguno': 'ninguno', 'Tendencia (ER)': 'er_tendencia',
     'Rango (ER)': 'er_rango', 'Tendencia (Hurst)': 'hurst_tendencia',
-    'Reversión (Hurst)': 'hurst_reversión',
+    'Reversión (Hurst)': 'hurst_reversion',
 }
+_MAPA_REGIMEN_INV = {v: k for k, v in _MAPA_REGIMEN.items()}
+
+
+def _normalizar_metodo_regimen(metodo):
+    """Unifica identificadores antiguos al canónico del core.
+
+    Versiones previas guardaban la reversión de Hurst como 'hurst_reversión'
+    (con tilde), pero core/strategies.py solo reconoce 'hurst_reversion'.
+    Sin esta migración, un setup guardado con la tilde cargaba como «Ninguno»
+    y el filtro se perdía en silencio."""
+    if metodo == 'hurst_reversión':
+        return 'hurst_reversion'
+    return metodo
 # La entrada por orden límite está terminada en el motor pero aún no se abre al
 # uso: se lista en gris y no se puede elegir (ver _bloquear_entrada_limite).
 _ETIQUETA_LIMITE_FIB = 'Límite en nivel Fibonacci (próximamente)'
@@ -1814,7 +1879,6 @@ _MAPA_SESION = {
     'Ninguna': 'ninguna', 'Overnight': 'overnight', 'Londres': 'londres',
     'NY': 'ny', 'Personalizada': 'personalizada',
 }
-_MAPA_REGIMEN_INV = {v: k for k, v in _MAPA_REGIMEN.items()}
 _MAPA_VOLATILIDAD_INV = {v: k for k, v in _MAPA_VOLATILIDAD.items()}
 _MAPA_SESION_INV = {v: k for k, v in _MAPA_SESION.items()}
 _MAPA_IMPACTO_NOTICIAS = {'Bajo': 'bajo', 'Medio': 'medio', 'Alto': 'alto'}
@@ -1838,6 +1902,13 @@ _MAPA_DIRECCION_INV = {v: k for k, v in _MAPA_DIRECCION.items()}
 # esta opción (ver core/backtest, 'be_unidad').
 _MAPA_BE_UNIDAD = {'× ATR': 'atr', 'R': 'r'}
 _MAPA_BE_UNIDAD_INV = {v: k for k, v in _MAPA_BE_UNIDAD.items()}
+
+# modo del Stop Loss ×ATR del setup (setup['stop_atr_modo']): 'fijo' ancla el
+# stop a la primera entrada; 'dinamico_promedio' lo reancla al precio medio
+# de la posición con el ATR del momento tras cada entrada (ver core/backtest).
+_MAPA_STOP_MODO = {'Fijo': 'fijo',
+                   'Dinámico por promedio': 'dinamico_promedio'}
+_MAPA_STOP_MODO_INV = {v: k for k, v in _MAPA_STOP_MODO.items()}
 
 _ROL_MECANISMO = 'mecanismo_salida'
 # la clave del mecanismo va en la celda 0 para localizar su fila sin depender
@@ -2288,6 +2359,24 @@ class OptimizadorWidget(QWidget):
         lay.addWidget(grp_tf)
         bombear_eventos()
 
+        # ── calidad de datos ──
+        grp_calidad = QGroupBox("Calidad de datos")
+        lay_calidad = QVBoxLayout(grp_calidad)
+        self.chk_excluir_interpoladas = QCheckBox(
+            "Excluir velas interpoladas de las señales")
+        self.chk_excluir_interpoladas.setChecked(True)
+        self.chk_excluir_interpoladas.setToolTip(
+            "Activado por defecto: las velas marcadas como interpoladas no "
+            "pueden generar entradas nuevas ni órdenes límite. Se mantienen "
+            "en la serie para conservar la continuidad temporal, y las "
+            "salidas y la gestión de una posición ya abierta siguen "
+            "funcionando.\n\n"
+            "Al desactivarlo, las velas interpoladas se tratan como "
+            "cualquier otra y vuelven a poder generar señales.")
+        lay_calidad.addWidget(self.chk_excluir_interpoladas)
+        lay.addWidget(grp_calidad)
+        bombear_eventos()
+
         # ── selector de sistema (predeterminados / guardados / nuevo) ──
         grp_sel = QGroupBox("Sistema")
         lay_sel = QVBoxLayout(grp_sel)
@@ -2571,9 +2660,25 @@ class OptimizadorWidget(QWidget):
         self.sp_stop.setDecimals(1)
         self.sp_stop.setValue(2.0)
         self.sp_stop.setSpecialValueText("Sin Stop Loss")
+        self.sp_stop.setToolTip(
+            "Distancia del Stop Loss en multiplos del ATR. 0 = sin stop real.")
         self.sp_stop.valueChanged.connect(self._guardar_setup_actual)
+        self.sp_stop.valueChanged.connect(self._actualizar_modo_stop_habilitado)
+        self.cmb_stop_modo = QComboBox()
+        self.cmb_stop_modo.addItems(list(_MAPA_STOP_MODO))
+        self.cmb_stop_modo.setToolTip(
+            "Modo del Stop Loss × ATR. Fijo ancla el stop a la primera "
+            "entrada; Dinámico por promedio lo reancla al precio medio tras "
+            "cada entrada. Solo se puede usar con un Stop Loss configurado.")
+        self.cmb_stop_modo.currentTextChanged.connect(self._guardar_setup_actual)
+        fila_stop = QHBoxLayout()
+        fila_stop.setContentsMargins(0, 0, 0, 0)
+        fila_stop.addWidget(self.sp_stop, 1)
+        fila_stop.addWidget(self.cmb_stop_modo)
+        self._stop_row = QWidget()
+        self._stop_row.setLayout(fila_stop)
         _fila_con_ayuda(
-            f_set, "Stop Loss (× ATR):", self.sp_stop,
+            f_set, "Stop Loss (× ATR):", self._stop_row,
             "Dónde se corta la pérdida: la operación se cierra si el precio\n"
             "va en contra esta distancia, medida en múltiplos del ATR (la\n"
             "volatilidad típica de la vela).\n"
@@ -2815,7 +2920,7 @@ class OptimizadorWidget(QWidget):
         f_set.addRow(grp_parciales)
 
         # etiquetas de stop/TP: se oscurecen junto al campo en modo edge
-        self._lbl_stop = f_set.labelForField(self.sp_stop)
+        self._lbl_stop = f_set.labelForField(self._stop_row)
         self._lbl_tp = f_set.labelForField(self.sp_tp)
 
         # ── filtros de entrada del setup (no afectan a las salidas) ──
@@ -3082,7 +3187,7 @@ class OptimizadorWidget(QWidget):
         self.lbl_estado.setObjectName("estado")
         lay.addWidget(self.lbl_estado)
 
-        self.progreso = QProgressBar()
+        self.progreso = ProgressBarAnimada()
         self.progreso.setRange(0, 0)
         self.progreso.setTextVisible(False)
         self.progreso.setFixedHeight(6)
@@ -3501,6 +3606,8 @@ class OptimizadorWidget(QWidget):
             self._rebuild_params(s['plantilla'], s['params'])
             self.sp_riesgo.setValue(s['riesgo_pct'] * 100.0)
             self.sp_stop.setValue(s['stop_atr'])
+            self.cmb_stop_modo.setCurrentText(
+                _MAPA_STOP_MODO_INV.get(s.get('stop_atr_modo', 'fijo'), 'Fijo'))
             self.sp_tp.setValue(s['tp_r'])
             self.sp_tiempo.setValue(s['salida_n_velas'])
             self.sp_be.setValue(s.get('be_atr', 0.0))
@@ -3547,12 +3654,16 @@ class OptimizadorWidget(QWidget):
                 self.editor_reglas.cargar_reglas(s['params'].get('reglas'))
             filtros = s.get('filtros') or _filtros_por_defecto()
             self._actualizar_dias_checkboxes()
+            # Normalizar el identificador del régimen: setups guardados por
+            # versiones antiguas pueden traer 'hurst_reversión' con tilde.
+            metodo_regimen = _normalizar_metodo_regimen(
+                (filtros.get('regimen') or {}).get('metodo', 'ninguno'))
             self.cmb_regimen.setCurrentText(
-                _MAPA_REGIMEN_INV.get(filtros.get('regimen', {}).get('metodo', 'ninguno'), 'Ninguno'))
+                _MAPA_REGIMEN_INV.get(metodo_regimen, 'Ninguno'))
             _reg_guardado = filtros.get('regimen', {}) or {}
             self.sp_regimen_periodo.setValue(
                 _reg_guardado.get('periodo')
-                or ventana_regimen_defecto(_reg_guardado.get('metodo', 'ninguno')))
+                or ventana_regimen_defecto(metodo_regimen))
             volatilidad = filtros.get('volatilidad') or {}
             self.cmb_volatilidad.setCurrentText(
                 _MAPA_VOLATILIDAD_INV.get(volatilidad.get('metodo', 'ninguno'), 'Ninguna'))
@@ -3743,6 +3854,12 @@ class OptimizadorWidget(QWidget):
             p['reglas'] = self.editor_reglas.reglas()
         return p
 
+    def _actualizar_modo_stop_habilitado(self, *_):
+        """El modo solo tiene efecto cuando existe un stop ATR real."""
+        if hasattr(self, 'cmb_stop_modo'):
+            self.cmb_stop_modo.setEnabled(
+                self.sp_stop.value() > 0.0 and not self.btn_edge.isChecked())
+
     def _bloquear_stop_tp(self, bloquear):
         """Oscurece (deshabilita) los campos de stop/TP/BE/trailing y sus
         etiquetas — el estilo :disabled de STYLE_BACKTEST los pinta apagados."""
@@ -3750,6 +3867,7 @@ class OptimizadorWidget(QWidget):
                   self._lbl_stop, self._lbl_tp):
             if w is not None:
                 w.setEnabled(not bloquear)
+        self._actualizar_modo_stop_habilitado()
 
     @_no_crash
     def _on_edge_toggled(self, on):
@@ -4785,6 +4903,7 @@ class OptimizadorWidget(QWidget):
             'condiciones_entrada': copy.deepcopy(
                 (s.get('filtros') or {}).get('condiciones_entrada', [])),
             'stop_atr': s.get('stop_atr'),
+            'stop_atr_modo': s.get('stop_atr_modo'),
             'tp_r': s.get('tp_r'),
             'salida_n_velas': s.get('salida_n_velas'),
             'be_atr': s.get('be_atr'),
@@ -4797,6 +4916,7 @@ class OptimizadorWidget(QWidget):
         s['params'] = self._leer_params_widgets(s['plantilla'])
         s['riesgo_pct'] = self.sp_riesgo.value() / 100.0
         s['stop_atr'] = self.sp_stop.value()
+        s['stop_atr_modo'] = _MAPA_STOP_MODO[self.cmb_stop_modo.currentText()]
         s['tp_r'] = self.sp_tp.value()
         s['salida_n_velas'] = self.sp_tiempo.value()
         s['be_atr'] = self.sp_be.value()
@@ -4851,6 +4971,7 @@ class OptimizadorWidget(QWidget):
             'parciales': s['parciales'], 'tramos': s['tramos'],
             'condiciones_entrada': s['filtros']['condiciones_entrada'],
             'stop_atr': s.get('stop_atr'),
+            'stop_atr_modo': s.get('stop_atr_modo'),
             'tp_r': s.get('tp_r'),
             'salida_n_velas': s.get('salida_n_velas'),
             'be_atr': s.get('be_atr'),
@@ -4900,6 +5021,10 @@ class OptimizadorWidget(QWidget):
             elif clave == 'be_unidad':
                 s['be_unidad'] = valor
                 self.cmb_be_unidad.setCurrentText(_MAPA_BE_UNIDAD_INV.get(valor, '× ATR'))
+            elif clave == 'stop_atr_modo':
+                s['stop_atr_modo'] = valor
+                self.cmb_stop_modo.setCurrentText(
+                    _MAPA_STOP_MODO_INV.get(valor, 'Fijo'))
             elif clave == 'direccion_param':
                 s.setdefault('params', {})['direccion'] = valor
                 tipo_w = self._param_widgets.get('direccion')
@@ -5616,6 +5741,16 @@ def _wfa_filtrado(wfa, resultado, velas_por_anio=None):
     return ventanas
 
 
+def _fijar_altura_tabla(tabla):
+    """Fija la altura de una tabla para que muestre TODAS sus filas a la vez,
+    sin barra de scroll vertical (mismo patrón que la tabla de WFA)."""
+    tabla.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    alto_filas = sum(tabla.rowHeight(r) for r in range(tabla.rowCount()))
+    tabla.setFixedHeight(
+        tabla.horizontalHeader().height() + alto_filas
+        + 2 * tabla.frameWidth() + 2)
+
+
 def render_tabla_metricas(tabla, metricas, claves, tf=None, nota_curva=None):
     """Rellena una tabla de métricas de 4 columnas: nombre + 3 tramos.
 
@@ -5913,7 +6048,7 @@ def render_montecarlo(dst, mc, capital, max_dd_base=None, retorno_base=None):
         return
     dst.grp_mc.setVisible(True)
     dst.lbl_mc.setText(
-        f"Prob. de acabar en negativo: {mc['prob_negativo'] * 100:.1f}%   ·   "
+        f"Prob. de terminar por debajo del capital inicial (pérdida): {mc['prob_negativo'] * 100:.1f}%   ·   "
         f"Prob. de ruina (equity < 50% del inicial): {mc['prob_ruina'] * 100:.1f}%   ·   "
         f"Retorno mediano: {(np.median(mc['finales']) / capital - 1) * 100:+.1f}%   ·   "
         f"Max DD mediano: {np.median(mc['max_dds']):.1f}%")
@@ -6357,6 +6492,9 @@ class ResultadosWidget(QWidget):
         self._art_stop_track = None
         self._art_entrada_track = None
         self._art_zona_riesgo = None
+        # último precio (línea + badge en la escala derecha), como LWC/TradingView
+        self._art_ultimo_precio = None
+        self._lbl_ultimo_precio = None
         self._art_fijos_dinamicos = []
         self._art_overlays_extra = []
         self._art_osciladores = []
@@ -6384,17 +6522,35 @@ class ResultadosWidget(QWidget):
 
         # estado de blitting (pan/zoom fluido) — ver _iniciar_sesion_blit
         self._blit_bg = None
+        # sesión de blit activa (arrastre o ráfaga de scroll) y velas/overlays
+        # pendientes de redibujar: el redibujado se difiere a
+        # _pintar_frame_pendiente para que una ráfaga de eventos haga UN solo
+        # redibujado por ciclo de eventos en vez de uno por evento de ratón
+        # (ver _on_scroll / _on_xlim_changed)
+        self._sesion_activa = False
+        self._datos_sucios = False
         self._scroll_timer = QTimer(self)
         self._scroll_timer.setSingleShot(True)
         self._scroll_timer.timeout.connect(self._finalizar_blit)
         # coalescencia de frames de arrastre: el ratón manda eventos más
         # deprisa de lo que se rasteriza un frame, así que se pinta uno solo
-        # por vuelta del bucle de eventos (ver _solicitar_frame_blit)
+        # por vuelta del bucle de eventos (ver _solicitar_frame_blit). El
+        # intervalo de 20 ms (≈50 fps máx) evita que una ráfaga de scroll muy
+        # rápida acumule frames pendientes: los eventos intermedios solo
+        # mueven el xlim (~0,15 ms) y el gráfico pinta siempre el estado más
+        # reciente, sin quedarse atrás del cursor.
         self._ax_frame_pendiente = None
         self._timer_frame = QTimer(self)
         self._timer_frame.setSingleShot(True)
-        self._timer_frame.setInterval(0)
+        self._timer_frame.setInterval(20)
         self._timer_frame.timeout.connect(self._pintar_frame_pendiente)
+        # zoom con rueda animado (easing hacia el objetivo, como LWC):
+        # _zoom_target es el xlim destino de la ráfaga y _timer_zoom lo
+        # interpola tick a tick (ver _on_scroll / _avanzar_zoom)
+        self._zoom_target = None
+        self._timer_zoom = QTimer(self)
+        self._timer_zoom.setInterval(16)
+        self._timer_zoom.timeout.connect(self._avanzar_zoom)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -6459,10 +6615,9 @@ class ResultadosWidget(QWidget):
         self.tabla_metricas.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.tabla_metricas.verticalHeader().setVisible(False)
         self.tabla_metricas.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.tabla_metricas.setFixedHeight(
-            self.tabla_metricas.horizontalHeader().height()
-            + self.tabla_metricas.verticalHeader().length()
-            + 2 * self.tabla_metricas.frameWidth() + 2)
+        # sin barra de scroll: la altura se fija tras rellenar (ver
+        # _fijar_altura_tabla en _pintar_graficos), todo visible de golpe
+        self.tabla_metricas.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         lay.addWidget(self.tabla_metricas)
 
         # gráfico principal: log-return + flechas + IS/OOS
@@ -6652,7 +6807,8 @@ class ResultadosWidget(QWidget):
         self.tabla_setups.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.tabla_setups.verticalHeader().setVisible(False)
         self.tabla_setups.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.tabla_setups.setMaximumHeight(160)
+        # sin barra de scroll: la altura se fija tras rellenar, todo visible
+        self.tabla_setups.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         lay_ms.addWidget(self.tabla_setups)
         self.grp_setups.setVisible(False)
         lay.addWidget(self.grp_setups)
@@ -6741,26 +6897,24 @@ class ResultadosWidget(QWidget):
         lay.addWidget(self.grp_wfa)
 
         # Montecarlo
-        self.grp_mc = QGroupBox("Montecarlo (1000 remuestreos del orden de los trades)")
+        self.grp_mc = QGroupBox("Montecarlo (1000 remuestreos con reemplazo de los trades)")
         lay_mc = QVBoxLayout(self.grp_mc)
         lay_mc.insertLayout(0, _fila_ayuda_popup(
-            "Se toma la secuencia real de trades del backtest y se reordena "
-            "aleatoriamente miles de veces —mismos trades, distinto orden— "
-            "recalculando la curva de equity resultante en cada reordenación.",
-            "El panel izquierdo es el abanico de esas curvas (percentiles 5/50/95); "
-            "el central, la distribución de retorno final; el derecho, la del máximo "
-            "drawdown. Como el backtest real es una sola secuencia entre las muchas "
-            "posibles, esto separa qué parte del resultado depende del orden en que "
-            "llegaron los trades (azar) de lo atribuible a la estrategia.",
-            "Sirve para estimar el rango plausible de resultados a esperar en el "
-            "futuro, no solo el número puntual que dio el backtest, y para leer la "
-            "probabilidad de acabar en negativo o en ruina.",
-            "Las cifras sobre el gráfico (\"Prob. de acabar en negativo\", \"Prob. de "
-            "ruina\", retorno y Max DD medianos) resumen el riesgo real de la "
-            "estrategia más allá del resultado único del backtest; una banda p5-p95 "
-            "muy ancha en el panel izquierdo indica que el resultado final es muy "
-            "sensible al orden de los trades (alta varianza), mientras que una banda "
-            "estrecha indica un resultado robusto frente al azar del orden."))
+            "Bootstrap con reemplazo sobre los trades del backtest: en cada "
+            "simulación se extrae al azar una muestra del mismo tamaño —un "
+            "trade puede repetirse y otro omitirse— y se recalcula la curva "
+            "de equity.",
+            "El panel izquierdo es el abanico de curvas (percentiles 5/50/95); "
+            "el central, la distribución de retorno final; el derecho, la del "
+            "máximo drawdown. Separa qué parte del resultado depende del azar "
+            "de la muestra de lo atribuible a la estrategia.",
+            "Para estimar el rango plausible de resultados futuros, no solo el "
+            "número puntual del backtest, y leer la probabilidad de pérdida "
+            "(quedar por debajo del capital inicial) o de ruina.",
+            "Las cifras (prob. de pérdida, prob. de ruina, retorno y Max DD "
+            "medianos) resumen el riesgo más allá del resultado único. Una "
+            "banda p5-p95 muy ancha indica alta sensibilidad a la muestra; "
+            "una estrecha, resultado robusto."))
         self.lbl_mc = QLabel("")
         self.lbl_mc.setObjectName("campo")
         lay_mc.addWidget(self.lbl_mc)
@@ -6985,6 +7139,9 @@ class ResultadosWidget(QWidget):
         render_tabla_metricas(self.tabla_metricas, met_tabla, claves,
                               p.get('tf'), nota)
         render_tabla_setups(self.tabla_setups, self.grp_setups, self._payload)
+        # altura a contenido completo: sin barra de scroll, todo visible
+        _fijar_altura_tabla(self.tabla_metricas)
+        _fijar_altura_tabla(self.tabla_setups)
         self._lbl_equity.setText(
             f"Curva de Equity — solo {lado} (cierres realizados)" if lado
             else "Curva de Equity (IS vs OOS)")
@@ -7006,6 +7163,7 @@ class ResultadosWidget(QWidget):
             self._llenar_tabla_trades(self.tabla_trades, payload)
             if self._dlg_trades is not None:
                 self._llenar_tabla_trades(self._dlg_trades.tabla, payload)
+                self._actualizar_contador_trades()
             bombear_eventos()
             self._dibujar_principal()
             bombear_eventos()
@@ -7432,10 +7590,22 @@ class ResultadosWidget(QWidget):
         if len(xb) == 0:
             self._descartar_artistas_datos()
             return
+        # rango Y del slice COMPLETO visible, no solo de la muestra dibujada:
+        # con el submuestreo, un spike que cae entre velas muestreadas queda
+        # fuera de la muestra y haría saltar la escala al acercarse a él
+        j0, j1 = np.searchsorted(self._x_full, [x0, x1])
+        j0 = max(j0 - 1, 0)
+        j1 = min(j1 + 1, len(self._x_full))
+        if j1 <= j0:
+            j1 = min(j0 + 1, len(self._x_full))
 
         if self._modo_grafico == 'velas':
             colores = np.where(cb >= ob, VERDE, ROJO)
-            ancho = np.median(np.diff(xb)) * 0.7 if len(xb) > 1 else 0.7
+            # ancho proporcional al espaciado entre velas (como LWC/TradingView):
+            # el cuerpo crece y se ensancha con el zoom, siempre ~70% de la
+            # separación, así las velas se ven estables y sin huecos crecientes
+            espaciado = float(np.median(np.diff(xb))) if len(xb) > 1 else 1.0
+            ancho = espaciado * 0.7
             half = ancho / 2.0
             yb = np.minimum(ob, cb)
             yt = np.maximum(ob, cb)
@@ -7456,20 +7626,42 @@ class ResultadosWidget(QWidget):
                 cuerpos.set_edgecolor(colores)
             else:
                 self._crear_artistas_datos(ax, segs, verts, colores, xb, cb)
-            y_lo, y_hi = float(np.min(lb)), float(np.max(hb))
+            y_lo = float(np.min(self._l_full[j0:j1]))
+            y_hi = float(np.max(self._h_full[j0:j1]))
         else:
             if len(self._art_datos) == 1:
                 self._art_datos[0].set_data(xb, cb)
             else:
                 self._crear_artistas_datos(ax, None, None, None, xb, cb)
-            y_lo, y_hi = float(np.min(cb)), float(np.max(cb))
+            y_lo = float(np.min(self._c_full[j0:j1]))
+            y_hi = float(np.max(self._c_full[j0:j1]))
 
         if not self._y_manual:
             pad = (y_hi - y_lo) * 0.05 or 1.0
             ax.set_ylim(y_lo - pad, y_hi + pad)
+        self._actualizar_ultimo_precio(ax)
+
+    def _actualizar_ultimo_precio(self, ax):
+        """Reubica el badge del último precio dentro del rango visible del eje
+        (pegado al borde si el precio queda fuera, como TradingView/LWC)."""
+        lbl = getattr(self, '_lbl_ultimo_precio', None)
+        if lbl is None or self._c_full is None or not len(self._c_full):
+            return
+        ultimo = float(self._c_full[-1])
+        ylo, yhi = ax.get_ylim()
+        lbl.xy = (1, float(np.clip(ultimo, min(ylo, yhi), max(ylo, yhi))))
+        lbl.set_text(_fmt_precio(ultimo))
 
     def _on_xlim_changed(self, ax):
         if self._actualizando_xlim:
+            return
+        if self._sesion_activa:
+            # durante un arrastre/ráfaga de scroll: solo marcar los datos como
+            # sucios y pedir frame — el redibujado real ocurre UNA vez por
+            # ciclo de eventos en _pintar_frame_pendiente, no por evento de
+            # ratón (un trackpad manda decenas de eventos por gesto)
+            self._datos_sucios = True
+            self._solicitar_frame_blit(ax)
             return
         self._actualizando_xlim = True
         try:
@@ -7613,6 +7805,10 @@ class ResultadosWidget(QWidget):
         # empieza un gesto: la cruceta se retira (como en TradingView) para no
         # dejar su posición congelada mientras el gráfico se mueve debajo
         self._ocultar_cruceta(repintar=False)
+        # si quedaba un zoom con rueda a medias, se interrumpe: el arrastre
+        # toma el control directo del xlim
+        self._timer_zoom.stop()
+        self._zoom_target = None
         if zona.startswith('resize_panel:'):
             idx = int(zona.split(':')[1])
             if event.dblclick:
@@ -7637,6 +7833,7 @@ class ResultadosWidget(QWidget):
             self._drag_modo = zona
             self._drag_inicio = (event.x, event.y)
             self._drag_lim0 = ax_panel.get_ylim()
+            self._sesion_activa = True
             self._iniciar_sesion_blit()
             return
         if zona.startswith('pan:'):
@@ -7653,6 +7850,7 @@ class ResultadosWidget(QWidget):
             self._drag_modo = zona
             self._drag_inicio = (event.x, event.y)
             self._drag_lim0 = (ax.get_xlim(), ax_panel.get_ylim())
+            self._sesion_activa = True
             self._iniciar_sesion_blit()
             self.canvas.setCursor(Qt.CursorShape.ClosedHandCursor)
             return
@@ -7662,6 +7860,7 @@ class ResultadosWidget(QWidget):
             self._redibujar_datos(ax)
             self.canvas.draw_idle()
             return
+        self._sesion_activa = True
         self._iniciar_sesion_blit()
         self._drag_modo = zona
         self._drag_inicio = (event.x, event.y)
@@ -7851,24 +8050,51 @@ class ResultadosWidget(QWidget):
 
     @_no_crash
     def _on_scroll(self, event):
-        """Rueda del ratón: zoom temporal (eje X) anclado bajo el cursor.
-        Una ráfaga de scroll (varios ticks seguidos, típico de trackpads de
-        precisión) se trata como una única sesión de blit: se abre en el
-        primer tick y se cierra ~180ms después del último vía QTimer, para
-        no abrir/cerrar sesión (con su draw() síncrono) en cada tick."""
+        """Rueda del ratón: zoom temporal (eje X) anclado bajo el cursor y
+        ANIMADO hacia el objetivo con easing (como LWC): los ticks de una
+        ráfaga solo re-anclan el destino y _timer_zoom lo interpola tick a
+        tick, pintando a través del pipeline de frames diferidos. La sesión
+        de blit NO se abre aquí: su draw() síncrono de captura del fondo
+        cuesta ~20 ms, así que se abre de forma diferida en
+        _pintar_frame_pendiente cuando llega el primer frame. Se cierra ~350
+        ms después del último tick vía QTimer."""
         ax = getattr(self, '_ax_principal', None)
         if ax is None:
             return
-        if self._blit_bg is None:
-            self._iniciar_sesion_blit()
+        self._sesion_activa = True
         lo, hi = ax.get_xlim()
         ancla = event.xdata if event.xdata is not None else (lo + hi) / 2.0
         subir = (event.step > 0) if getattr(event, 'step', 0) else (event.button == 'up')
         factor = 0.85 if subir else 1.0 / 0.85
-        ax.set_xlim(ancla + (lo - ancla) * factor, ancla + (hi - ancla) * factor)
+        self._zoom_target = (ancla + (lo - ancla) * factor,
+                             ancla + (hi - ancla) * factor)
+        if not self._timer_zoom.isActive():
+            self._timer_zoom.start()
+        self._solicitar_frame_blit(ax)
+        self._scroll_timer.start(350)
+
+    def _avanzar_zoom(self):
+        """Un paso de la animación de zoom: acerca el xlim actual al objetivo
+        con easing exponencial; al quedar suficientemente cerca, ajusta el
+        objetivo exacto y se detiene."""
+        ax = getattr(self, '_ax_principal', None)
+        if ax is None or self._zoom_target is None:
+            self._timer_zoom.stop()
+            return
+        lo, hi = ax.get_xlim()
+        t_lo, t_hi = self._zoom_target
+        d_lo, d_hi = t_lo - lo, t_hi - hi
+        if (t_hi - t_lo) <= 0:
+            self._timer_zoom.stop()
+            return
+        if max(abs(d_lo), abs(d_hi)) < (t_hi - t_lo) * 1e-4:
+            # prácticamente en el objetivo: ajustar exacto y terminar
+            ax.set_xlim(t_lo, t_hi)
+            self._timer_zoom.stop()
+        else:
+            ax.set_xlim(lo + d_lo * 0.35, hi + d_hi * 0.35)
         self._sync_dateedits(*ax.get_xlim())
         self._solicitar_frame_blit(ax)
-        self._scroll_timer.start(180)
 
     # ── cruceta de hover (estilo TradingView) ──
     #
@@ -7894,20 +8120,21 @@ class ResultadosWidget(QWidget):
         if not self._paneles:
             return
         for _kind, axx in self._paneles:
-            v = axx.axvline(0, color=AX_FG, linewidth=0.7, alpha=0.55,
-                            linestyle=(0, (4, 3)), zorder=95,
-                            visible=False, animated=True)
-            h = axx.axhline(0, color=AX_FG, linewidth=0.7, alpha=0.55,
-                            linestyle=(0, (4, 3)), zorder=95,
-                            visible=False, animated=True)
+            # líneas sólidas y etiquetas como la cruceta de Lightweight Charts:
+            # #758696 semitransparente y fondo #4c525e con texto blanco
+            v = axx.axvline(0, color=CRUCETA_COLOR, linewidth=1.0, alpha=0.5,
+                            zorder=95, visible=False, animated=True)
+            h = axx.axhline(0, color=CRUCETA_COLOR, linewidth=1.0, alpha=0.5,
+                            zorder=95, visible=False, animated=True)
             # la franja de números está a la derecha en todos los paneles
             # (yaxis.tick_right), así que la etiqueta sale por x=1 en fracción
             # de ejes y sigue al ratón en Y en coordenadas de datos
             lbl_y = axx.annotate(
                 "", xy=(1, 0), xycoords=('axes fraction', 'data'),
                 xytext=(5, 0), textcoords='offset points',
-                ha='left', va='center', fontsize=6.5, color=FIG_BG,
-                bbox=dict(boxstyle='round,pad=0.25', fc=AX_FG, ec=AX_FG),
+                ha='left', va='center', fontsize=7, color=CRUCETA_TX,
+                bbox=dict(boxstyle='round,pad=0.3', fc=CRUCETA_BG,
+                          ec=CRUCETA_BG),
                 zorder=102, annotation_clip=False, visible=False,
                 animated=True)
             self._cruceta_v.append(v)
@@ -7920,8 +8147,8 @@ class ResultadosWidget(QWidget):
         self._cruceta_lbl_x = ax_ultimo.annotate(
             "", xy=(0, 0), xycoords=('data', 'axes fraction'),
             xytext=(0, -5), textcoords='offset points',
-            ha='center', va='top', fontsize=6.5, color=FIG_BG,
-            bbox=dict(boxstyle='round,pad=0.25', fc=AX_FG, ec=AX_FG),
+            ha='center', va='top', fontsize=7, color=CRUCETA_TX,
+            bbox=dict(boxstyle='round,pad=0.3', fc=CRUCETA_BG, ec=CRUCETA_BG),
             zorder=102, annotation_clip=False, visible=False, animated=True)
         self._art_cruceta.append(self._cruceta_lbl_x)
 
@@ -8050,9 +8277,10 @@ class ResultadosWidget(QWidget):
                         self._scatter_nivel_compra, self._scatter_nivel_venta,
                         self._scatter_nivel_tramo_compra,
                         self._scatter_nivel_tramo_venta,
-                        self._art_trayecto, self._art_salida_cuadros,
-                        self._art_salida_segmentos, self._art_stop_track,
-                        self._art_entrada_track, self._art_zona_riesgo)
+                         self._art_trayecto, self._art_salida_cuadros,
+                         self._art_salida_segmentos, self._art_stop_track,
+                         self._art_entrada_track, self._art_zona_riesgo,
+                         self._art_ultimo_precio, self._lbl_ultimo_precio)
             if a is not None]
 
     def _yaxis_panel_arrastrado(self):
@@ -8130,7 +8358,24 @@ class ResultadosWidget(QWidget):
     def _pintar_frame_pendiente(self):
         ax = self._ax_frame_pendiente
         self._ax_frame_pendiente = None
-        if ax is not None:
+        if ax is None:
+            return
+        # el redibujado de velas/overlays se difiere a este punto (una vez por
+        # ciclo de eventos, ver _on_xlim_changed) para que una ráfaga de
+        # scroll no redibuje por cada evento de ratón; también se abre aquí,
+        # de forma diferida, la sesión de blit del scroll (su draw() síncrono
+        # de captura del fondo solo paga cuando llega el primer frame)
+        if self._datos_sucios:
+            self._datos_sucios = False
+            self._redibujar_datos(ax)
+        if self._blit_bg is None:
+            if self._sesion_activa:
+                # _iniciar_sesion_blit captura el fondo y pinta ya el primer
+                # frame con los datos recién redibujados
+                self._iniciar_sesion_blit()
+            else:
+                self.canvas.draw_idle()
+        else:
             self._pintar_frame_blit(ax)
 
     def _finalizar_blit(self):
@@ -8139,8 +8384,29 @@ class ResultadosWidget(QWidget):
         (una sola vez, no por frame)."""
         # un frame pendiente pintaría por blitting con el fondo ya descartado
         self._timer_frame.stop()
+        self._timer_zoom.stop()
+        ax = self._ax_frame_pendiente
         self._ax_frame_pendiente = None
         self._blit_bg = None
+        self._sesion_activa = False
+        # si el zoom animado quedó a medias, ajustar el objetivo exacto antes
+        # del draw final (set_xlim dispara _on_xlim_changed, que ya redibuja)
+        if self._zoom_target is not None:
+            if ax is None:
+                ax = getattr(self, '_ax_principal', None)
+            if ax is not None:
+                ax.set_xlim(*self._zoom_target)
+            self._zoom_target = None
+        # si el último redibujado quedó pendiente (p. ej. soltar el ratón
+        # antes de que dispare el timer de frames), ejecutarlo ANTES del draw
+        # final: sin esto, el draw_idle pintaría las velas del xlim ANTERIOR
+        # (la misma serie repetida en cualquier ventana de zoom)
+        if self._datos_sucios:
+            if ax is None:
+                ax = getattr(self, '_ax_principal', None)
+            if ax is not None:
+                self._redibujar_datos(ax)
+        self._datos_sucios = False
         self.canvas.draw_idle()
 
     def _on_resize_canvas(self, event):
@@ -8288,9 +8554,10 @@ class ResultadosWidget(QWidget):
         # plot_common): con date2num, los tramos sin mercado —fin de semana,
         # festivos, cierres de sesión— ocupaban su hueco en el eje y la serie
         # salía a peine. Además el hueco aparecía y desaparecía según el zoom,
-        # porque al alejar _decimar_ohlc agrega velas en bloques y el ancho
-        # (mediana de np.diff) crecía hasta taparlo. Con el índice, la
-        # separación entre velas es 1 en todo momento y a cualquier zoom.
+        # porque al alejar _decimar_ohlc submuestrea (o antes, agregaba en
+        # bloques) y el ancho (mediana de np.diff) crecía hasta taparlo. Con
+        # el índice, la separación entre velas es 1 en todo momento y a
+        # cualquier zoom.
         # ts se conserva aparte: es lo que traduce índice -> fecha en las
         # etiquetas del eje, la cruceta y los QDateEdit de rango.
         self._ts_full = ts
@@ -8330,6 +8597,14 @@ class ResultadosWidget(QWidget):
                 paneles_spec.append((kind, datos))
 
         self.fig.clear()
+        # la figura se reconstruye entera: cualquier fondo de blit cacheado
+        # pertenece a la figura anterior y restaurarlo pintaría "fantasmas"
+        # (velas duplicadas) sobre la nueva si una sesión sigue abierta
+        self._blit_bg = None
+        # el repintado completo fija el xlim que le pasen: cualquier zoom con
+        # rueda a medias queda cancelado
+        self._timer_zoom.stop()
+        self._zoom_target = None
         n_osc = len(paneles_spec)
         gs = self.fig.add_gridspec(1 + n_osc, 1)
         ax = self.fig.add_subplot(gs[0, 0])
@@ -8397,6 +8672,22 @@ class ResultadosWidget(QWidget):
             # de crear: sin fijarla aquí, matplotlib la autoescalaría a TODA la
             # serie y el gráfico daría un salto al encender o apagar una capa.
             ax.set_ylim(*ylim)
+
+        # último precio, como LWC/TradingView: línea discontinua en el último
+        # close + badge en la escala derecha. Creados aquí (fig.clear() los
+        # destruye); el badge se reposiciona en cada _redibujar_datos y ambos
+        # van en _artistas_dinamicos() para repintarse en cada frame de blit.
+        ultimo = float(self._c_full[-1])
+        self._art_ultimo_precio = ax.axhline(
+            ultimo, color=GRIS, linewidth=1.0, linestyle='--', alpha=0.55,
+            zorder=2.0)
+        self._lbl_ultimo_precio = ax.annotate(
+            "", xy=(1, ultimo), xycoords=('axes fraction', 'data'),
+            xytext=(-2, 0), textcoords='offset points',
+            ha='right', va='center', fontsize=7, color=CRUCETA_TX,
+            bbox=dict(boxstyle='round,pad=0.3', fc=CRUCETA_BG, ec=CRUCETA_BG),
+            zorder=102, annotation_clip=False)
+        self._actualizar_ultimo_precio(ax)
 
         n_tr = len(tr['pnl'])
         mask_vis = self._trades_visibles(*ax.get_xlim())
@@ -8898,10 +9189,9 @@ class ResultadosWidget(QWidget):
     @_no_crash
     def _abrir_lista_completa(self):
         if self._dlg_trades is None:
-            dlg = QDialog(self)
-            dlg.setWindowTitle("Trades — lista completa")
-            dlg.resize(900, 600)
-            dlg_lay = QVBoxLayout(dlg)
+            dlg, dlg_lay, lbl_sub, _halo = _panel_flotante_dialog(
+                'Trades — lista completa', 900, alto=600,
+                subtitulo='', parent=self, boton_cerrar=True)
             tabla = QTableWidget(0, 13)
             tabla.setHorizontalHeaderLabels(
                 ['Entrada', 'Salida', 'Dir', 'Setup', 'P. entrada', 'P. salida',
@@ -8919,13 +9209,22 @@ class ResultadosWidget(QWidget):
                 lambda c, t=tabla: self._ordenar_tabla_trades(t, c))
             tabla.cellClicked.connect(self._centrar_trade)
             dlg_lay.addWidget(tabla)
-            dlg.tabla = tabla
             self._dlg_trades = dlg
-        if self._payload is not None:
-            self._llenar_tabla_trades(self._dlg_trades.tabla, self._payload)
+            self._dlg_trades.tabla = tabla
+            self._dlg_trades.lbl_sub = lbl_sub
+            self._llenar_tabla_trades(tabla, self._payload)
+            self._actualizar_contador_trades()
         self._dlg_trades.show()
         self._dlg_trades.raise_()
         self._dlg_trades.activateWindow()
+
+    def _actualizar_contador_trades(self):
+        """Subtítulo de la ventana de lista completa: nº de operaciones."""
+        dlg = self._dlg_trades
+        if dlg is None or dlg.lbl_sub is None:
+            return
+        n = dlg.tabla.rowCount()
+        dlg.lbl_sub.setText(f"{n:,} operaciones".replace(',', '.'))
 
     def _dibujar_equity(self, payload):
         bombear_eventos()
@@ -9607,7 +9906,7 @@ class ComparativaWidget(QWidget):
         self.lbl_resumen.setObjectName("titulo")
         root.addWidget(self.lbl_resumen)
 
-        self.progreso = QProgressBar()
+        self.progreso = ProgressBarAnimada()
         self.progreso.setRange(0, 100)
         self.progreso.setTextVisible(True)
         self.progreso.setFixedHeight(10)
@@ -10285,6 +10584,7 @@ class TabBacktest(QWidget):
             codigo=opt.codigo_actual(),
             tf_label=tf_label,
             regla_resample=regla_resample,
+            excluir_interpoladas=opt.chk_excluir_interpoladas.isChecked(),
             parent=self,
         )
         th.computed.connect(self._on_done)
@@ -10369,7 +10669,9 @@ class TabBacktest(QWidget):
         th = _OptimizerThread(
             opt.csv_path, setup, sweep_params, sweep_riesgo,
             opt.config_global(), opt.slider_oos.value() / 100.0, metrica,
-            tf_label=tf_label, regla_resample=regla_resample, parent=self,
+            tf_label=tf_label, regla_resample=regla_resample,
+            excluir_interpoladas=opt.chk_excluir_interpoladas.isChecked(),
+            parent=self,
         )
         th.progreso.connect(self._on_optimizacion_progreso)
         th.progreso.connect(opt._overlay_set_progreso)

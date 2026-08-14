@@ -62,6 +62,7 @@ _ACTIVADORES = {
     'relleno_open_siguiente': _setup,
     'redondeo_lotes': _setup,
     'atr_de_la_vela_de_entrada': _setup,
+    'stop_atr_dinamico': lambda: _setup(stop_atr_modo='dinamico_promedio'),
     'slippage_en_ticks': _setup,
     'tramos_escalonados': lambda: _setup(
         tramos=[{'pct': 60.0, 'trigger': 'senal'},

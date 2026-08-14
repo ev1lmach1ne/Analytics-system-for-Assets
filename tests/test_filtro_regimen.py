@@ -19,6 +19,7 @@ from core.strategies import (
     UMBRAL_ER_TENDENCIA, UMBRAL_ER_RUIDO, UMBRAL_HURST_TENDENCIA,
     VENTANA_ER_DEFECTO, VENTANA_HURST_DEFECTO, VENTANA_HURST_MINIMA,
     ventana_regimen_defecto, _filtros_por_defecto,
+    _normalizar_metodo_regimen,
 )
 
 N = 3000
@@ -125,6 +126,29 @@ def test_ventana_por_defecto_segun_metodo():
     assert ventana_regimen_defecto('hurst_reversion') == VENTANA_HURST_DEFECTO
     assert VENTANA_ER_DEFECTO == 10, "el valor de Kaufman para el ER del AMA"
     assert _filtros_por_defecto()['regimen']['periodo'] == VENTANA_ER_DEFECTO
+
+
+def test_el_identificador_antiguo_con_tilde_se_normaliza():
+    """La GUI guardaba 'hurst_reversión' (con tilde); el core solo conoce
+    'hurst_reversion'. El alias debe normalizarse en el motor, el
+    pseudocódigo y la carga de setups."""
+    assert _normalizar_metodo_regimen('hurst_reversión') == 'hurst_reversion'
+    assert _normalizar_metodo_regimen('hurst_reversion') == 'hurst_reversion'
+    assert _normalizar_metodo_regimen('er_tendencia') == 'er_tendencia'
+    assert _normalizar_metodo_regimen(None) is None
+
+
+def test_el_motor_aplica_el_filtro_hurst_con_el_identificador_antiguo(df):
+    """Un setup guardado por una versión antigua con 'hurst_reversión' debe
+    seguir filtrando (y no caer en silencio a «sin filtro»)."""
+    con_canonico, avisos_c = _correr(
+        df, {'metodo': 'hurst_reversion', 'periodo': VENTANA_HURST_DEFECTO})
+    con_antiguo, avisos_a = _correr(
+        df, {'metodo': 'hurst_reversión', 'periodo': VENTANA_HURST_DEFECTO})
+    assert avisos_c == []
+    assert avisos_a == []
+    assert len(con_canonico) == len(con_antiguo)
+    assert len(con_antiguo) < len(_correr(df)[0])
 
 
 def test_patrones_conserva_sus_umbrales_adaptativos():

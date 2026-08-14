@@ -14,12 +14,13 @@ import os
 
 import numpy as np
 import pandas as pd
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QPropertyAnimation, QEasingCurve
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QCheckBox,
     QScrollArea, QFrame, QTableWidget, QTableWidgetItem, QHeaderView,
     QSizePolicy, QPushButton, QButtonGroup, QInputDialog, QApplication,
+    QGraphicsOpacityEffect,
 )
 from gui.widgets.bombear import bombear_eventos
 from matplotlib.figure import Figure
@@ -91,9 +92,17 @@ _ALPHA_MIN, _ALPHA_MAX = 0.35, 0.95
 # de desviación ~0, cuya barra sería de altura cero y por tanto invisible.
 _FRAC_PLANA = 0.015
 
+# Fade del combo de sesión al deshabilitarlo en TF >= 1d (mismos tiempos que
+# el fade del Backtester y el del arranque de la app).
+_FADE_IN_MS = 300
+_FADE_OUT_MS = 400
+
 STYLE_PATRONES = """
 QComboBox {
     min-width: 105px;
+}
+QComboBox:disabled {
+    background-color: #0d1220; color: #33465e; border: 1px solid #1b2840;
 }
 QFrame#card {
     background-color: #141e30;
@@ -1176,6 +1185,21 @@ class TabPatrones(QWidget):
                                    else "No aplica a temporalidades de 1 día o más")
         if not intradia:
             self.cmb_sesion.setCurrentIndex(0)  # Globex
+        # Oscurecer el combo al deshabilitarlo (mismo fade que el Backtester):
+        # la regla QComboBox:disabled lo apaga y la opacidad lo atenúa.
+        if not hasattr(self, '_efecto_sesion'):
+            self._efecto_sesion = QGraphicsOpacityEffect(self.cmb_sesion)
+            self.cmb_sesion.setGraphicsEffect(self._efecto_sesion)
+            self._anim_sesion = QPropertyAnimation(
+                self._efecto_sesion, b"opacity", self)
+        self._anim_sesion.stop()
+        objetivo = 0.45 if not intradia else 1.0
+        self._anim_sesion.setDuration(_FADE_OUT_MS if not intradia else _FADE_IN_MS)
+        self._anim_sesion.setStartValue(self._efecto_sesion.opacity())
+        self._anim_sesion.setEndValue(objetivo)
+        self._anim_sesion.setEasingCurve(
+            QEasingCurve.Type.InCubic if not intradia else QEasingCurve.Type.OutCubic)
+        self._anim_sesion.start()
 
     @_no_crash
     def _on_scan_done(self, path, payload):

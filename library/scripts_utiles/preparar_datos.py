@@ -1,15 +1,15 @@
 import pandas as pd
 import numpy as np
 import requests
-import psycopg2
 import json
 from pathlib import Path
 import os
 import csv
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
-from core.config import CONFIG_PATH, QUESTDB_HOST, QUESTDB_HTTP_PORT, DB_CONFIG
+from core.config import CONFIG_PATH, QUESTDB_HOST, QUESTDB_HTTP_PORT
 from core.parsing import parse_columna_flexible
+from core.questdb_errors import filas_en_tabla
 import re
 
 # tkinter/customtkinter se importan DENTRO de las ramas interactivas, no aquí:
@@ -24,6 +24,7 @@ import re
 sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
 CSV_INPUT = os.environ.get('CSV_INPUT', '')
+
 
 # ── 1. FILE DIALOG (skip if CSV_INPUT env is set) ──
 if not CSV_INPUT:
@@ -47,7 +48,9 @@ if CONFIG_SKIP:
     NOMBRE_ACTIVO = os.environ.get('CONFIG_NOMBRE', 'xauusd')
     TIMEFRAME     = os.environ.get('CONFIG_TF', '1h')
     TIPO_ACTIVO   = os.environ.get('CONFIG_ACTIVO', 'FUTURO')
+    CATEGORIA     = os.environ.get('CONFIG_CATEGORIA', '')
 else:
+    CATEGORIA = ''
     import customtkinter as ctk
     SEL_NOMBRE  = ['']
     SEL_TIPO    = [0]  # 0=Futuro, 1=Stock, 2=Crypto
@@ -258,9 +261,25 @@ else:
         TIMEFRAME = TF_LABELS[SEL_TF[0]]
 
 # ── 3. SESSION CONFIG ───────────────────────────────
+# 'categoria' la aporta la pestaña Importar (CONFIG_CATEGORIA): hay que
+# conservarla al reescribir la config, porque limpieza_datos_er.py la usa
+# para guardar el CSV limpio en la carpeta de su categoría. Antes se
+# machacaba la config solo con nombre/tf/activo y el limpiador, sin
+# categoría, mandaba todo a OTROS (mientras el meta.json sí iba a la
+# carpeta correcta). Si no llega por entorno, se respeta la que ya hubiera
+# en la config previa (lanzamientos sueltos desde CLI).
+if not CATEGORIA and os.path.exists(CONFIG_PATH):
+    try:
+        with open(CONFIG_PATH, encoding='utf-8') as f:
+            CATEGORIA = (json.load(f) or {}).get('categoria', '')
+    except Exception:
+        CATEGORIA = ''
+_sesion_cfg = {'nombre': NOMBRE_ACTIVO, 'tf': TIMEFRAME, 'activo': TIPO_ACTIVO}
+if CATEGORIA:
+    _sesion_cfg['categoria'] = CATEGORIA
 os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
 with open(CONFIG_PATH, 'w') as f:
-    json.dump({'nombre': NOMBRE_ACTIVO, 'tf': TIMEFRAME, 'activo': TIPO_ACTIVO}, f)
+    json.dump(_sesion_cfg, f)
 print(f"✅ Config guardada: {CONFIG_PATH}")
 
 # ── 4. PROCESSING ───────────────────────────────────
@@ -380,14 +399,13 @@ try:
         print("      Todas las celdas numéricas se parsearon correctamente.")
 
     # ── Comprobación de overwrite: ¿la tabla destino ya tiene datos? ──
-    filas_existentes = 0
-    try:
-        _conn_chk = psycopg2.connect(**DB_CONFIG)
-        _chk = pd.read_sql(f"SELECT count(*) AS n FROM {TABLA_DESTINO}", _conn_chk)
-        _conn_chk.close()
-        filas_existentes = int(_chk['n'].iloc[0])
-    except Exception:
-        filas_existentes = 0  # tabla inexistente o no consultable → se trata como vacía
+    # Se consulta por HTTP /exec, la vía NATIVA de QuestDB (la misma que usa
+    # la subida). El wire protocol PostgreSQL de QuestDB no devuelve SQLSTATE
+    # de forma fiable para "tabla inexistente", y antes cualquier error se
+    # tragaba como "tabla vacía", ocultando QuestDB caída o credenciales
+    # inválidas.
+    filas_existentes = filas_en_tabla(
+        QUESTDB_HOST, QUESTDB_HTTP_PORT, TABLA_DESTINO)
 
     proceder_subida = True
     if filas_existentes > 0:
@@ -396,7 +414,8 @@ try:
             respuesta = input("   ¿Sobrescribir todos los datos existentes? [s/N]: ").strip().lower()
             proceder_subida = respuesta in ('s', 'si', 'sí', 'y', 'yes')
             if not proceder_subida:
-                print("⚠️  Subida cancelada por el usuario. El CSV preparado ya está guardado en disco.")
+                raise RuntimeError(
+                    "Subida cancelada por el usuario; no se inicia la limpieza.")
         else:
             print(f"⚠️  La tabla '{TABLA_DESTINO}' ya existe con {filas_existentes:,} filas — "
                   f"se sobrescribirá automáticamente (modo no interactivo).")
@@ -405,12 +424,16 @@ try:
         csv_buffer = df.to_csv(index=False, encoding='utf-8')
         cols_schema = ','.join([f'{c}:INT' if c == 'volume' else f'{c}:DOUBLE' for c in df.columns if c != 'timestamp'])
         url = f"http://{QUESTDB_HOST}:{QUESTDB_HTTP_PORT}/imp?name={TABLA_DESTINO}&overwrite=true&types=timestamp:TIMESTAMP,{cols_schema}"
-        resp = requests.post(url, files={'data': ('data.csv', csv_buffer.encode('utf-8'), 'text/csv')}, timeout=120)
-        if resp.status_code == 200:
-            print(f"      ↳ {resp.text.strip()}")
-            print(f"✅ Subida completada — {len(df):,} filas en {TABLA_DESTINO}")
-        else:
-            print(f"⚠️  HTTP {resp.status_code}: {resp.text.strip()}")
+        resp = requests.post(
+            url,
+            files={'data': ('data.csv', csv_buffer.encode('utf-8'), 'text/csv')},
+            timeout=120)
+        if not 200 <= resp.status_code < 300:
+            raise RuntimeError(
+                f"QuestDB respondió HTTP {resp.status_code}: {resp.text.strip()}")
+        print(f"      ↳ {resp.text.strip()}")
+        print(f"✅ Subida completada — {len(df):,} filas en {TABLA_DESTINO}")
 except Exception as e:
     print(f"⚠️  Error al subir a QuestDB: {e}")
-    print("   El archivo preparado se ha guardado igualmente.")
+    print("   El archivo preparado se ha guardado, pero la importación ha fallado.")
+    sys.exit(4)

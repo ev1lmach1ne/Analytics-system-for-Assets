@@ -5,6 +5,39 @@ import subprocess
 import pytest
 
 import core.questdb_manager as qm
+from core.questdb_errors import (es_columna_inexistente,
+                                 es_tabla_inexistente, pgcode)
+
+
+class _PgError(Exception):
+    def __init__(self, code):
+        super().__init__(code)
+        self.pgcode = code
+
+
+def test_errores_questdb_distinguen_tabla_columna_y_conexion():
+    tabla = _PgError('42P01')
+    columna = _PgError('42703')
+    conexion = _PgError('28P01')
+    assert pgcode(tabla) == '42P01'
+    assert es_tabla_inexistente(tabla)
+    assert not es_tabla_inexistente(conexion)
+    assert es_columna_inexistente(columna)
+    assert not es_columna_inexistente(tabla)
+
+
+def test_error_questdb_envuelto_conserva_su_codigo():
+    envuelto = Exception('pandas wrapper')
+    envuelto.orig = _PgError('42P01')
+    assert es_tabla_inexistente(envuelto)
+
+
+def test_instancia_local_questdb_solo_escucha_en_loopback(monkeypatch):
+    monkeypatch.setattr(qm, 'QUESTDB_HTTP_PORT', 19000)
+    monkeypatch.setattr(qm, 'QUESTDB_PG_PORT', 18812)
+    env = qm._env_puertos()
+    assert env['QDB_HTTP_BIND_TO'] == '127.0.0.1:19000'
+    assert env['QDB_PG_NET_BIND_TO'] == '127.0.0.1:18812'
 
 
 def test_urls_windows():

@@ -5,8 +5,9 @@ enterarse:
 
 1. El eje X va en ÍNDICE de vela, no en fecha. Con `date2num`, sábado y domingo
    ocupaban su hueco y la serie diaria salía a peine — y encima el hueco
-   aparecía y desaparecía según el zoom, porque al alejar `_decimar_ohlc` agrega
-   velas en bloques y el ancho (mediana de `np.diff`) crecía hasta taparlo.
+   aparecía y desaparecía según el zoom, porque al alejar `_decimar_ohlc`
+   submuestrea (o antes, agregaba en bloques) y el ancho (mediana de
+   `np.diff`) crecía hasta taparlo.
 2. La cruceta se engancha a una vela real y sus dos etiquetas dicen la fecha de
    ESA vela y el nivel bajo el cursor.
 """

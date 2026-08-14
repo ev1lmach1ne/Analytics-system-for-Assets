@@ -21,6 +21,7 @@ from gui.widgets.file_explorer import FileExplorer
 from gui.widgets.bombear import bombear_eventos
 from gui.widgets.loading_overlay import (mostrar_overlay_tab, ocultar_overlay_tab,
                                          apagar_overlay_tab)
+from gui.widgets import STYLE_ETIQUETA_SIN_CAJA
 
 _RE_SUFIJO_TF = re.compile(r'\s+\d+[smhd](?:\d+[smhd])?$', re.IGNORECASE)
 
@@ -150,6 +151,12 @@ TF_DEFECTO = '1d'
 # Maximo de puntos dibujados por linea: por encima, el canvas Qt va a tirones
 # al hacer zoom/redibujar (las series 1h de varios años superan 50k puntos).
 MAX_PUNTOS_PLOT = 4000
+
+# Tope de hilos de carga simultaneos al restaurar los activos del comparador:
+# cargar 1 a 1 hacia la visualización mucho más lenta, pero N lecturas a la
+# vez de CSVs 1m de décadas sobrecargan CPU/RAM. Un paralelismo acotado
+# recupera la velocidad sin ese riesgo.
+MAX_CARGAS_PARALELAS = 4
 
 
 def _no_crash(fn):
@@ -355,7 +362,6 @@ class TabComparador(QWidget):
         self._scan_thread = None
         self._scan_done_cb = None
         self._cola_carga = []  # activos restaurados que aún no han leído su CSV
-        self._carga_en_curso = False
         self._carga_iniciada = False
         self._tf = TF_DEFECTO
         self._last_splitter_sizes = [280, 800]
@@ -400,8 +406,8 @@ class TabComparador(QWidget):
             barra.addWidget(btn)
         self._tf_group.idClicked.connect(self._on_tf_changed)
 
-        lbl_rf = QLabel("Rf %:")
-        lbl_rf.setObjectName("tfLabel")
+        lbl_rf = QLabel("Risk Free")
+        lbl_rf.setStyleSheet(STYLE_ETIQUETA_SIN_CAJA)
         barra.addWidget(lbl_rf)
         self.rf_input = QLineEdit("4.33")
         self.rf_input.setFixedWidth(82)
@@ -521,6 +527,10 @@ class TabComparador(QWidget):
         self.tangente_label.setVisible(False)
         self.panel_scatter.vlay.addWidget(self.tangente_label)
         grid.addWidget(self.panel_scatter, 1, 1)
+        # El primer _make_canvas() paga el coste de inicialización de
+        # matplotlib (fuentes, backend): bombear para que el overlay de carga
+        # siga animándose y Windows no marque la ventana "No responde".
+        bombear_eventos()
 
         # ── Splitter: Explorer (izquierda) + Dashboard (derecha) ──
         from core.config import LIMPIADOS_DIR
@@ -561,6 +571,7 @@ class TabComparador(QWidget):
         self.refresh_available()
         self._restore_config()
         self._refresh_all()
+        bombear_eventos()
 
     # ══════════════ toggle explorador ══════════════
 
@@ -712,10 +723,10 @@ class TabComparador(QWidget):
         if cargar:
             self._lanzar_carga(path)
         else:
-            # Restaurado desde config: se encola y se lee de UNO EN UNO la
-            # primera vez que se muestra la pestaña (no al arrancar), para no
-            # lanzar N lecturas de CSVs enormes (p.ej. 1m de décadas) en
-            # paralelo — sobrecargan CPU/RAM y dejan hilos vivos al cerrar.
+            # Restaurado desde config: se encola y se lee en paralelo acotado
+            # (MAX_CARGAS_PARALELAS hilos) la primera vez que se muestra la
+            # pestaña (no al arrancar), para no lanzar N lecturas de CSVs
+            # enormes (p.ej. 1m de décadas) todas a la vez.
             self._cola_carga.append(path)
 
         self.refresh_available()
@@ -727,19 +738,26 @@ class TabComparador(QWidget):
         """Arranca _AssetLoadThread para path. El hilo se parenta a este widget
         y se retira de _threads en _on_thread_finished; sin eso, destruir un
         QThread vivo al cerrar la app aborta el proceso."""
-        mostrar_overlay_tab(self, f"Cargando {os.path.basename(path)}…")
+        self._mostrar_overlay_carga()
         th = _AssetLoadThread(path, parent=self)
         th.loaded.connect(self._on_series_loaded)
         th.finished.connect(lambda p=path, t=th: self._on_thread_finished(p, t))
         self._threads[path] = th
         th.start()
 
-    def _lanzar_siguiente_carga(self):
-        if self._carga_en_curso or not self._cola_carga:
-            return
-        self._carga_en_curso = True
-        path = self._cola_carga.pop(0)
-        self._lanzar_carga(path)
+    def _mostrar_overlay_carga(self):
+        """Rueda de carga con el numero de activos pendientes (total, no el
+        nombre de un archivo concreto: en paralelo ya no es un fichero solo)."""
+        total = len(self._threads) + len(self._cola_carga) + 1
+        texto = f"Cargando {total} activos…" if total > 1 else "Cargando activo…"
+        mostrar_overlay_tab(self, texto)
+
+    def _lanzar_cargas_pendientes(self):
+        """Arranca de la cola tantas cargas como permita el tope de hilos en
+        paralelo. Antes se leia UNO A UNO (esperando cada finished) y con
+        varios CSVs grandes la visualización tardaba muchísimo más."""
+        while self._cola_carga and len(self._threads) < MAX_CARGAS_PARALELAS:
+            self._lanzar_carga(self._cola_carga.pop(0))
 
     def _apagar_hilos(self):
         """Limpieza antes de cerrar la ventana:
@@ -767,7 +785,6 @@ class TabComparador(QWidget):
             except Exception:
                 pass
             self._threads.pop(path, None)
-        self._carga_en_curso = False
         # escaneo del combo (si está en vuelo)
         sth = getattr(self, '_scan_thread', None)
         if sth is not None:
@@ -802,10 +819,10 @@ class TabComparador(QWidget):
     def showEvent(self, event):
         super().showEvent(event)
         # La primera vez que se muestra la pestaña se arranca la carga en
-        # cola de los activos restaurados (uno a uno).
+        # cola de los activos restaurados (en paralelo acotado).
         if not getattr(self, '_carga_iniciada', False):
             self._carga_iniciada = True
-            self._lanzar_siguiente_carga()
+            self._lanzar_cargas_pendientes()
 
     @_no_crash
     def remove_asset(self, path):
@@ -871,8 +888,7 @@ class TabComparador(QWidget):
         if self._threads.get(path) is th:
             self._threads.pop(path, None)
         th.deleteLater()
-        self._carga_en_curso = False
-        self._lanzar_siguiente_carga()
+        self._lanzar_cargas_pendientes()
         # ocultar la rueda de carga cuando no queden cargas en vuelo ni en cola
         if not self._threads and not self._cola_carga:
             ocultar_overlay_tab(self)
