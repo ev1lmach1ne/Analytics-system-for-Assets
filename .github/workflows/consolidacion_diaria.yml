@@ -1,10 +1,10 @@
 # Consolidación diaria de memoria técnica (job nocturno).
 #
-# Se ejecuta a medianoche (UTC) y tras cada push/PR; toma los resúmenes de
-# cambio del día anterior guardados en memoria/cambios/, los pasa por el
-# prompt de síntesis diaria (consolidar_diario.py) y guarda UN único punto
-# consolidado en memoria/resumenes_diarios/<fecha>.json con la etiqueta
-# 'resumen_diario'.
+# Se ejecuta a medianoche (UTC) o manualmente (workflow_dispatch); toma los
+# resúmenes de cambio del día anterior guardados en memoria/cambios/, los
+# pasa por el prompt de síntesis diaria (consolidar_diario.py) y guarda UN
+# único punto consolidado en memoria/resumenes_diarios/<fecha>.json con la
+# etiqueta 'resumen_diario'.
 #
 # En un runner local (con venv + qdrant_store + modelo ONNX) se indexa además
 # en Qdrant añadiendo el paso: python memoria/consolidar_diario.py --indexar.
@@ -24,6 +24,8 @@ permissions:
 jobs:
   consolidar:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     env:
       MEMORIA_LLM_API_KEY: ${{ secrets.MEMORIA_LLM_API_KEY }}
       MEMORIA_LLM_BASE_URL: ${{ secrets.MEMORIA_LLM_BASE_URL }}
@@ -73,8 +75,6 @@ jobs:
           else
             echo "El resumen diario de ${FECHA} ya existía; sin cambios."
           fi
-        permissions:
-          contents: write
 
       - name: Mostrar resumen diario en el job summary
         if: env.SIN_CAMBIOS != '1'

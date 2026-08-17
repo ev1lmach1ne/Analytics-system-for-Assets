@@ -31,6 +31,8 @@ permissions:
 jobs:
   resumen-tecnico:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     env:
       MEMORIA_LLM_API_KEY: ${{ secrets.MEMORIA_LLM_API_KEY }}
       MEMORIA_LLM_BASE_URL: ${{ secrets.MEMORIA_LLM_BASE_URL }}
@@ -119,5 +121,3 @@ jobs:
           else
             echo "Sin cambios nuevos; el resumen ya existe o el diff estaba vacío."
           fi
-        permissions:
-          contents: write
