@@ -166,10 +166,10 @@ def resumen_fallback(diff):
 # ══════════════ llamada al LLM (API compatible OpenAI) ══════════════
 
 def _llamada_llm(prompt, system=None):
-    clave = os.getenv("MEMORIA_LLM_API_KEY", "")
-    base = os.getenv("MEMORIA_LLM_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-    modelo = os.getenv("MEMORIA_LLM_MODEL", "gpt-4o-mini")
-    timeout = int(os.getenv("MEMORIA_LLM_TIMEOUT", "120"))
+    clave = os.getenv("MEMORIA_LLM_API_KEY", "") or ""
+    base = (os.getenv("MEMORIA_LLM_BASE_URL", "") or "https://api.openai.com/v1").rstrip("/")
+    modelo = os.getenv("MEMORIA_LLM_MODEL", "") or "gpt-4o-mini"
+    timeout = int(os.getenv("MEMORIA_LLM_TIMEOUT", "120") or "120")
     if not clave:
         return None
     cuerpo = {
