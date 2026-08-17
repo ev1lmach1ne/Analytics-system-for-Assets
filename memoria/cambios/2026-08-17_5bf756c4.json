@@ -1,0 +1,15 @@
+{
+  "resumen_ejecutivo": "Cambio en 1 archivo(s) (4+ / 4- líneas).",
+  "modificaciones_clave": [
+    {
+      "archivo": "memoria/generar_resumen_cambio.py",
+      "motivo": "modificación detectada en el diff (revisar hunks)"
+    }
+  ],
+  "impacto_tecnico": [
+    "sistema de memoria vectorial (memoria/)"
+  ],
+  "tags": [
+    "generar_resumen_cambio"
+  ]
+}
