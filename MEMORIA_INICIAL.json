@@ -1,0 +1,231 @@
+{
+  "tipo": "memoria_inicial",
+  "proyecto": "Analytics System for Assets",
+  "version_esquema": "1.0",
+  "creado": "2026-08-17",
+  "decisiones_tecnicas_clave": [
+    {
+      "id": "DTC-01",
+      "decision": "Motor de backtest vectorizado con numba",
+      "detalle": "core/backtest.py es un motor vectorizado (sin bucles Python en el hot path) con simulación @njit(nogil=True). Funciones puras sin Qt ni I/O, pensadas para correr en un QThread o tests.",
+      "archivos": ["core/backtest.py", "core/optimizer.py"]
+    },
+    {
+      "id": "DTC-02",
+      "decision": "Convención anti-lookahead: señal en vela t se ejecuta al OPEN de t+1",
+      "detalle": "Nunca se opera la misma vela que genera la señal. El ATR usado al entrar es el de la última vela CERRADA (atr[i-1]), nunca el de la vela de entrada.",
+      "archivos": ["core/backtest.py"]
+    },
+    {
+      "id": "DTC-03",
+      "decision": "Separación de capas: core puro (sin Qt) + GUI + scripts subproceso",
+      "detalle": "core/ contiene la lógica testable sin dependencias de UI; la GUI lanza los scripts pesados de library/scripts_utiles como QProcess (rama --run-script del ejecutable empaquetado); los módulos con Qt viven en gui/.",
+      "archivos": ["app.py", "core/", "gui/", "library/scripts_utiles/"]
+    },
+    {
+      "id": "DTC-04",
+      "decision": "QuestDB 'de bolsillo' auto-gestionado",
+      "detalle": "core/questdb_manager.py descarga el motor (con Java embebido en Windows, JRE Temurin portátil en macOS) y lo arranca en segundo plano sin admin ni Docker. Solo actúa si el host configurado es localhost; si hay QuestDB remota configurada, no la toca.",
+      "archivos": ["core/questdb_manager.py", "gui/questdb_bootstrap.py"]
+    },
+    {
+      "id": "DTC-05",
+      "decision": "Distribución autocontenida con PyInstaller --onefile",
+      "detalle": "El .exe empaqueta todo (incluida la librería JS de LWC y los runtimes de codegen). Doble raíz en runtime: RESOURCE_ROOT (solo lectura, _MEIPASS) vs PROJECT_ROOT (escribible, junto al .exe) para config, Sistemas/ y Favoritos/.",
+      "archivos": ["core/config.py", "empaquetar.py", "app.py"]
+    },
+    {
+      "id": "DTC-06",
+      "decision": "Registro declarativo de estrategias",
+      "detalle": "core/strategies.py expone ESTRATEGIAS con spec de params (tipo, default, min/max) de la que la GUI autogenera formularios, una fn generadora de señales y una descripción legible interpolada.",
+      "archivos": ["core/strategies.py", "gui/widgets/tab_backtest.py"]
+    },
+    {
+      "id": "DTC-07",
+      "decision": "Sistemas multi-setup con bitmask int64",
+      "detalle": "Salidas por setup codificadas como BITMASK int64 (bit k = el setup k pide salir): la salida de un setup no cierra la posición de otro. Máximo MAX_SETUPS=64 setups por sistema.",
+      "archivos": ["core/strategies.py", "core/backtest.py"]
+    },
+    {
+      "id": "DTC-08",
+      "decision": "Optimizador restringido al tramo IN-SAMPLE",
+      "detalle": "core/optimizer.py barre cada combinación SOLO sobre las velas IS (split 70/30 por defecto), evitando data snooping; la validación completa (IS+OOS+WFA+Montecarlo) corre luego con el pipeline normal. Reutiliza señales cuando solo cambian riesgo/stop/TP y paraleliza con ThreadPoolExecutor (numba nogil). Límite de combos (2000) como protección de rendimiento.",
+      "archivos": ["core/optimizer.py", "core/backtest.py"]
+    },
+    {
+      "id": "DTC-09",
+      "decision": "Análisis con bundle de datos: la GUI pinta, no recalcula",
+      "detalle": "analisis_descriptivo.py exporta junto al PDF un bundle con los arrays exactos de cada figura; analisis_graficos.py solo los dibuja (vista instantánea y consistente entre PDF y GUI).",
+      "archivos": ["gui/widgets/analisis_graficos.py", "library/scripts_utiles/analisis_descriptivo.py"]
+    },
+    {
+      "id": "DTC-10",
+      "decision": "Codegen en 3 capas + runtimes portados",
+      "detalle": "ir.py (árbol neutro sin lenguaje), fidelidad.py (qué se pierde en cada plataforma), emisores base/pine/mql (solo escriben nodos). Las librerías de indicadores portadas (pine_runtime.pine, zcs_runtime_mt5.mqh) viajan dentro del paquete.",
+      "archivos": ["core/codegen/", "core/codegen/runtime/"]
+    },
+    {
+      "id": "DTC-11",
+      "decision": "Concurrencia cuidada con la GUI",
+      "detalle": "numba con nogil=True en todos los cálculos largos (si no, retiene el GIL y congela Qt); imports pesados de pestañas en hilo aparte durante el splash; precarga de pestañas con tope de 3.5s; desactivación de ghost windows vía Win32.",
+      "archivos": ["core/metrics.py", "app.py", "gui/main_window.py"]
+    },
+    {
+      "id": "DTC-12",
+      "decision": "Persistencia ligera en JSON junto al ejecutable",
+      "detalle": "config.json (ajustes, tutorial, API keys), .connectors.json (conectores OANDA), .rf_registry.json (tasa libre de riesgo por archivo) y Sistemas/ + Favoritos/ como JSON. Fallos de escritura de registros auxiliares se ignoran (nunca rompen el flujo principal).",
+      "archivos": ["core/config.py", "core/rf_registry.py", "core/connectors/"]
+    }
+  ],
+  "dependencias_criticas": [
+    {
+      "id": "DEP-01",
+      "origen": "core/strategies.py",
+      "destino": "core/backtest.py",
+      "detalle": "Importa TRIGGERS_TRAMO_ENTRADA para los triggers de tramos de entrada; el motor consume las señales que estrategias genera (contrato: entradas/salidas bool[n], setup_id, atr).",
+      "riesgo_si_cambia": "Cambiar la forma de las señales rompe el motor y todas las estrategias del registro."
+    },
+    {
+      "id": "DEP-02",
+      "origen": "core/strategies.py",
+      "destino": "core/metrics.py, core/candle_patterns.py",
+      "detalle": "Estrategias reutilizan ER, KAMA, Hurst, SAR, percentil rodante y patrones de velas como filtros de régimen/entrada.",
+      "riesgo_si_cambia": "Firmas @njit compartidas: un cambio de convención (p. ej. NaN) afecta a estrategias y scripts de library/."
+    },
+    {
+      "id": "DEP-03",
+      "origen": "core/optimizer.py",
+      "destino": "core/backtest.py, core/strategies.py",
+      "detalle": "Usa dividir_is_oos, simular, calcular_metricas y MECANISMOS_SALIDA; genera señales con generar_senales_sistema.",
+      "riesgo_si_cambia": "El contrato de resultados de simular() alimenta también la GUI; cambiarlo exige tocar optimizer, tab_backtest y tests."
+    },
+    {
+      "id": "DEP-04",
+      "origen": "core/codegen/*",
+      "destino": "core/backtest.py (MECANISMOS_SALIDA), core/strategies.py",
+      "detalle": "El IR interpreta los dicts de setup del backtester; el orden de MECANISMOS_SALIDA fija el código de cierres parciales y el informe de fidelidad.",
+      "riesgo_si_cambia": "Reordenar mecanismos de salida corrompe la semántica del código exportado y de la columna 'parcial'."
+    },
+    {
+      "id": "DEP-05",
+      "origen": "gui/widgets/tab_*.py",
+      "destino": "core/config.py",
+      "detalle": "Todas las pestañas copian rutas derivadas (LIMPIADOS_DIR, INFORMES_DIR, SCRIPTS_DIR...) al importarse; app.py obliga a fijar BASE_DATA (FirstLaunchDialog) ANTES de importar gui.main_window.",
+      "riesgo_si_cambia": "Importar gui/ sin configuración fija produce rutas erróneas; cambiar BASE_DATA requiere reiniciar (documentado en README)."
+    },
+    {
+      "id": "DEP-06",
+      "origen": "gui/questdb_bootstrap.py",
+      "destino": "core/questdb_manager.py",
+      "detalle": "Envoltorio Qt (hilo + diálogo de progreso) sobre ensure_running/is_reachable del manager.",
+      "riesgo_si_cambia": "La GUI depende del contrato de estados del bootstrap; el manager debe seguir siendo sin-Qt."
+    },
+    {
+      "id": "DEP-07",
+      "origen": "library/scripts_utiles/*",
+      "destino": "core/metrics.py, core/parsing.py, core/config.py",
+      "detalle": "Los scripts de limpieza/análisis (lanzados como QProcess) importan el catálogo de indicadores, el parseo tolerante y los factores de anualización.",
+      "riesgo_si_cambia": "Los scripts se ejecutan en proceso aparte con su propio sys.path: dependen de que core/ sea importable y de las rutas empaquetadas (SCRIPTS_DIR)."
+    },
+    {
+      "id": "DEP-08",
+      "origen": "gui/widgets/tab_backtest.py",
+      "destino": "core/codegen (vía gui/dialogs/export_codigo_dialog.py)",
+      "detalle": "El constructor de sistemas exporta a Pine/MQL5 usando el IR y el informe de fidelidad.",
+      "riesgo_si_cambia": "Un setup con parámetros no traducibles debe mostrarse como pérdida de fidelidad ANTES de escribir archivos (botón por defecto: Cancelar)."
+    },
+    {
+      "id": "DEP-09",
+      "origen": "app.py",
+      "destino": "core.config (APP_CONFIG_PATH), gui.main_window",
+      "detalle": "Orden de arranque crítico: verificación de dependencias → diálogo de primera apertura → splash → import de MainWindow en hilo → precarga de pestañas → tutorial. El .exe congelado resuelve sys.executable/sys._MEIPASS de forma distinta según frozen o no.",
+      "riesgo_si_cambia": "Alterar el orden de imports rompe el arranque del empaquetado (modo --run-script incluido)."
+    }
+  ],
+  "reglas_negocio_principales": [
+    {
+      "id": "RGN-01",
+      "regla": "Ejecución a open de t+1 (sin lookahead)",
+      "detalle": "Toda señal (entrada o salida) generada en la vela t se ejecuta al open de t+1; nunca se opera la vela que genera la señal. El ATR de entrada es el de la vela cerrada anterior (atr[i-1] al operar el open de i).",
+      "archivos": ["core/backtest.py"]
+    },
+    {
+      "id": "RGN-02",
+      "regla": "Gestión de stop-loss realista",
+      "detalle": "El stop se comprueba contra low/high de CADA vela y se ejecuta al precio del stop; si la vela ABRE al otro lado del stop (gap), el cierre se llena al OPEN (pérdida real por hueco), no al nivel teórico. Un tramo pendiente no se ejecuta si la vela abre atravesando el stop (el stop manda).",
+      "archivos": ["core/backtest.py"]
+    },
+    {
+      "id": "RGN-03",
+      "regla": "Riesgo nominal acotado por presupuesto de setup",
+      "detalle": "riesgo_pct es el límite nominal por operación: distancia al stop × volumen, acotado por equity × riesgo_pct. El presupuesto se fija en la PRIMERA entrada; cada tramo solo consume el riesgo libre; el riesgo nominal total nunca supera el presupuesto. Comisiones y slippage se descuentan aparte del resultado.",
+      "archivos": ["core/backtest.py"]
+    },
+    {
+      "id": "RGN-04",
+      "regla": "Stop Loss × ATR con dos modos",
+      "detalle": "Modo 'fijo': el stop se ancla a la primera entrada y no se mueve al promediar. Modo 'dinamico_promedio': tras cada entrada se reancla al precio medio de la posición con el ATR del momento. En ambos, ningún reanclaje baja un stop ya mejorado por Break Even o Trailing. Stop Loss = 0 significa sin stop real (sin pérdida máxima garantizada).",
+      "archivos": ["core/backtest.py"]
+    },
+    {
+      "id": "RGN-05",
+      "regla": "Fricción por ambos lados",
+      "detalle": "Slippage: encarece la entrada y abarata la salida (en % del precio). Comisión: % del nocional, cobrada en entrada y en salida. Presets por clase de activo: CRYPTO 0.10/0.03, STOCK 0.07/0.07, FUTURO/FOREX 0.02/0.03 (slippage/comisión %).",
+      "archivos": ["core/backtest.py", "core/config.py"]
+    },
+    {
+      "id": "RGN-06",
+      "regla": "Una sola posición abierta por setup",
+      "detalle": "Una posición (long o short, sin invertir directo) por setup; la posición SÍ puede construirse en varios tramos (entrada escalonada). En multi-setup, la salida de un setup no cierra la posición de otro (bitmask).",
+      "archivos": ["core/backtest.py", "core/strategies.py"]
+    },
+    {
+      "id": "RGN-07",
+      "regla": "Órdenes límite con un solo slot pendiente",
+      "detalle": "Una señal puede dejar una orden pendiente a precio concreto: se rellena si low<=precio (long) o high>=precio (short), al precio de la orden o al open si este abre MEJOR (nunca peor). Se cancela por bit del setup, caducidad en velas ('limite_vigencia_velas', 0=sin caducidad) o avance de R ('limite_cancelar_avance_r'). Una entrada por límite es indistinguible de una a mercado para sizing/stop/TP posterior.",
+      "archivos": ["core/backtest.py"]
+    },
+    {
+      "id": "RGN-08",
+      "regla": "Motivos de salida y cierres parciales",
+      "detalle": "Motivos: 0=señal contraria, 1=stop, 2=take-profit, 3=tiempo (n velas), 4=fin de datos, 5=cierre parcial. 'parcial': N>0 etapa secuencial, N<0 cierre parcial por mecanismo global (-1 stop, -2 TP, -3 break-even, -4 trailing, -5 tiempo). Cada mecanismo global dispara con un % de lo que quede abierto.",
+      "archivos": ["core/backtest.py", "core/strategies.py"]
+    },
+    {
+      "id": "RGN-09",
+      "regla": "Velas interpoladas excluidas de señales por defecto",
+      "detalle": "Las velas interpoladas siguen en la serie (continuidad de indicadores) pero NO generan entradas nuevas ni órdenes límite; salidas y gestión de posiciones abiertas siguen activas. Apagar el toggle las trata como velas normales.",
+      "archivos": ["core/backtest.py"]
+    },
+    {
+      "id": "RGN-10",
+      "regla": "Anualización según la clase de activo real",
+      "detalle": "Velas/año y sesión según activo: CRYPTO 24/7/365, FUTURO 1440min/252d, STOCK 390min/252d, FOREX 1440min/252d. Velas diarias (>=1d) se escalan por días de calendario; intradía por sesión real (evita subestimar Sharpe/CAGR en sesiones cortas).",
+      "archivos": ["core/config.py"]
+    },
+    {
+      "id": "RGN-11",
+      "regla": "Optimización y validación separadas",
+      "detalle": "El ranking del optimizador NUNCA ve el tramo OOS (solo [0, corte)); la elección final se valida sobre la serie completa con IS+OOS, Walk-Forward y Montecarlo. Split IS/OOS por defecto 70/30 (slider en GUI).",
+      "archivos": ["core/optimizer.py", "core/backtest.py"]
+    },
+    {
+      "id": "RGN-12",
+      "regla": "Clasificación de activos por heurística + meta",
+      "detalle": "La clase de activo de un CSV (FUTURO/FOREX/STOCK/CRYPTO) se lee del sidecar <csv>.meta.json; si falta, heurística por tokens del nombre y carpeta. Las categorías de descarga se normalizan a carpetas canónicas (CATEGORIA_DESCARGA_MAP).",
+      "archivos": ["core/config.py"]
+    },
+    {
+      "id": "RGN-13",
+      "regla": "Registro auxiliar de tasa libre de riesgo",
+      "detalle": "Si el .meta.json no declara el Rf (archivos legacy o importaciones fallidas), el Rf se recupera de .rf_registry.json. Fallos de escritura del registro se ignoran: nunca rompe la importación.",
+      "archivos": ["core/rf_registry.py"]
+    },
+    {
+      "id": "RGN-14",
+      "regla": "Configuración y datos separados por naturaleza de acceso",
+      "detalle": "Escribible y permanente (junto al .exe): config.json, Sistemas/, Favoritos/, BASE_DATA. Solo lectura (dentro del paquete, _MEIPASS): scripts, runtimes de codegen y assets. QuestDB y datos históricos viven en %LOCALAPPDATA%\\AnalyticsSystemForAssets.",
+      "archivos": ["core/config.py"]
+    }
+  ]
+}

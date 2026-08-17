@@ -16,3 +16,10 @@ cache/
 # Datos personales del usuario (sistemas y favoritos guardados)
 Favoritos/
 Sistemas/
+# Memoria vectorial local (Qdrant) — se regenera con cargar_memoria_inicial.py
+memoria/qdrant_store/
+# Configuración de conectores externos (puede contener claves API)
+.connectors.json
+# Entorno de tests y artefactos de ejecución
+.pytest_cache/
+Ejecuciones
