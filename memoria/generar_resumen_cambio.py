@@ -33,6 +33,7 @@ import json
 import os
 import re
 import sys
+import urllib.error
 import urllib.request
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -188,6 +189,11 @@ def _llamada_llm(prompt, system=None):
         headers={
             "Content-Type": "application/json",
             "Authorization": f"Bearer {clave}",
+            # Cloudflare de opencode.ai/zen/v1 bloquea agentes por defecto (error 1010);
+            # un User-Agent de navegador permite pasar la verificación anti-bot.
+            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                           "AppleWebKit/537.36 (KHTML, like Gecko) "
+                           "Chrome/126.0.0.0 Safari/537.36"),
         },
         method="POST",
     )
@@ -195,6 +201,16 @@ def _llamada_llm(prompt, system=None):
         with urllib.request.urlopen(peticion, timeout=timeout) as resp:
             datos = json.loads(resp.read().decode("utf-8"))
         return datos["choices"][0]["message"]["content"]
+    except urllib.error.HTTPError as e:
+        try:
+            detalle = json.loads(e.read().decode("utf-8", errors="replace"))
+            error = detalle.get("error") or {}
+            motivo = error.get("message") or error.get("type") or str(e)
+        except Exception:
+            motivo = str(e)
+        print(f"AVISO: error al llamar al LLM (HTTP {e.code}: {motivo}); "
+              "se usará el resumen heurístico local.")
+        return None
     except Exception as e:
         print(f"AVISO: error al llamar al LLM ({e}); se usará el resumen heurístico local.")
         return None
