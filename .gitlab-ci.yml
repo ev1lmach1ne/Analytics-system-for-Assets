@@ -1,0 +1,97 @@
+# Memoria técnica — resumen de cambios en cada push o merge request
+# + consolidación diaria programada.
+#
+# Variables del proyecto / grupo (Settings -> CI/CD -> Variables):
+#   MEMORIA_LLM_API_KEY   API key del proveedor LLM (OpenAI-compatible)
+#   MEMORIA_LLM_BASE_URL  (opcional) base URL
+#   MEMORIA_LLM_MODEL     (opcional) modelo
+# Sin clave, los scripts caen al resumen heurístico local (fallback).
+# El JSON de cada cambio se publica como artefacto; el resumen diario se
+# genera en el pipeline programado (crear el schedule en
+# CI/CD -> Schedules, patrón cron 0 0 * * *).
+
+stages:
+  - memoria
+
+resumen-tecnico:
+  stage: memoria
+  image: python:3.12
+  variables:
+    GIT_DEPTH: 0
+    MEMORIA_LLM_API_KEY: $MEMORIA_LLM_API_KEY
+    MEMORIA_LLM_BASE_URL: $MEMORIA_LLM_BASE_URL
+    MEMORIA_LLM_MODEL: $MEMORIA_LLM_MODEL
+  script:
+    - pip install --quiet requests
+    - |
+      # Diff según el tipo de evento (merge request o push)
+      if [ -n "$CI_MERGE_REQUEST_DIFF_BASE_SHA" ]; then
+        BASE_REF="$CI_MERGE_REQUEST_DIFF_BASE_SHA"
+        HEAD_REF="$CI_MERGE_REQUEST_SOURCE_BRANCH_SHA"
+      elif git rev-parse --verify HEAD^ >/dev/null 2>&1; then
+        BASE_REF="HEAD^"
+        HEAD_REF="HEAD"
+      else
+        BASE_REF=$(git rev-list --max-parents=0 HEAD)
+        HEAD_REF="HEAD"
+      fi
+      git diff "$BASE_REF" "$HEAD_REF" > diff.txt
+      git log --pretty=format:"%h %s" "$BASE_REF..$HEAD_REF" > commits.txt || true
+      echo "Diff generado: $(wc -l < diff.txt) líneas"
+    - |
+      python memoria/generar_resumen_cambio.py \
+        --diff diff.txt --commits commits.txt \
+        --origen "${CI_PIPELINE_SOURCE:-gitlab}" \
+        --commit-sha "$CI_COMMIT_SHA" --rama "$CI_COMMIT_REF_NAME" \
+        --salida resumen_cambio.json
+      echo "JSON generado: $(wc -c < resumen_cambio.json) bytes"
+  artifacts:
+    name: resumen-cambio-$CI_COMMIT_SHA
+    paths:
+      - resumen_cambio.json
+    expire_in: 30 days
+
+# Consolidación diaria: solo se ejecuta en el pipeline programado (schedule)
+consolidacion-diaria:
+  stage: memoria
+  image: python:3.12
+  variables:
+    GIT_DEPTH: 0
+    MEMORIA_LLM_API_KEY: $MEMORIA_LLM_API_KEY
+    MEMORIA_LLM_BASE_URL: $MEMORIA_LLM_BASE_URL
+    MEMORIA_LLM_MODEL: $MEMORIA_LLM_MODEL
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+      when: always
+    - if: '$MEMORIA_CONSOLIDAR_MANUAL == "true"'
+      when: always
+    - when: never
+  script:
+    - pip install --quiet requests
+    - |
+      FECHA=$(date -d "yesterday" +%Y-%m-%d)
+      python memoria/consolidar_diario.py --fecha "$FECHA" --salida resumen_diario.json
+      test -s resumen_diario.json
+    - |
+      # Opcional: commitear el resumen al repo (requiere token con permiso de escritura
+      # en CI_JOB_TOKEN o un token personalizado; desactivado por defecto).
+      if [ "$COMMIT_RESULT" = "true" ]; then
+        mkdir -p memoria/resumenes_diarios
+        cp resumen_diario.json "memoria/resumenes_diarios/${FECHA}.json"
+        git config user.name "gitlab-ci[bot]"
+        git config user.email "gitlab-ci@example.com"
+        git add "memoria/resumenes_diarios/${FECHA}.json"
+        if git diff --cached --quiet; then
+          echo "El resumen diario de ${FECHA} ya existía; sin cambios."
+        else
+          git commit -m "memoria: resumen diario ${FECHA}"
+          git push origin "HEAD:${CI_COMMIT_REF_NAME}"
+        fi
+      else
+        echo "COMMIT_RESULT no está en true; el resumen queda como artefacto."
+      fi
+  artifacts:
+    name: resumen-diario-$CI_COMMIT_SHA
+    paths:
+      - resumen_diario.json
+    expire_in: 30 days

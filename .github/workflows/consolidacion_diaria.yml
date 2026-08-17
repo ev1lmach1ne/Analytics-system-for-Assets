@@ -1,0 +1,93 @@
+# Consolidación diaria de memoria técnica (job nocturno).
+#
+# Se ejecuta a medianoche (UTC) o manualmente (workflow_dispatch); toma los
+# resúmenes de cambio del día anterior guardados en memoria/cambios/, los
+# pasa por el prompt de síntesis diaria (consolidar_diario.py) y guarda UN
+# único punto consolidado en memoria/resumenes_diarios/<fecha>.json con la
+# etiqueta 'resumen_diario'.
+#
+# En un runner local (con venv + qdrant_store + modelo ONNX) se indexa además
+# en Qdrant añadiendo el paso: python memoria/consolidar_diario.py --indexar.
+# En CI el Qdrant local no existe, por eso el JSON consolidado se commitea al
+# repo como fuente de verdad para la BD.
+
+name: Consolidación diaria de memoria
+
+on:
+  schedule:
+    - cron: "0 0 * * *"   # 00:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  consolidar:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      MEMORIA_LLM_API_KEY: ${{ secrets.MEMORIA_LLM_API_KEY }}
+      MEMORIA_LLM_BASE_URL: ${{ secrets.MEMORIA_LLM_BASE_URL }}
+      MEMORIA_LLM_MODEL: ${{ vars.MEMORIA_LLM_MODEL }}
+      COMMIT_RESULT: ${{ vars.COMMIT_RESULT }}
+    steps:
+      - name: Checkout con historial completo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependencias
+        run: pip install --quiet requests
+
+      - name: Consolidar resumen diario (día anterior)
+        id: consolidar
+        run: |
+          FECHA=$(date -d "yesterday" +%Y-%m-%d)
+          echo "FECHA=$FECHA" >> "$GITHUB_ENV"
+          python memoria/consolidar_diario.py --fecha "$FECHA" --salida resumen_diario.json
+          if [ ! -s resumen_diario.json ]; then
+            echo "SIN_CAMBIOS=1" >> "$GITHUB_ENV"
+          else
+            echo "Resumen diario: $(wc -c < resumen_diario.json) bytes"
+          fi
+
+      - name: Guardar resumen diario en el repositorio
+        if: env.COMMIT_RESULT == 'true' && env.SIN_CAMBIOS != '1'
+        env:
+          FECHA: ${{ env.FECHA }}
+        run: |
+          DESTINO="memoria/resumenes_diarios/${FECHA}.json"
+          mkdir -p memoria/resumenes_diarios
+          cp resumen_diario.json "$DESTINO"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$DESTINO"
+          if ! git diff --cached --quiet; then
+            git commit -m "memoria: resumen diario ${FECHA}"
+            git push
+            echo "Consolidado guardado en $DESTINO"
+          else
+            echo "El resumen diario de ${FECHA} ya existía; sin cambios."
+          fi
+
+      - name: Mostrar resumen diario en el job summary
+        if: env.SIN_CAMBIOS != '1'
+        run: |
+          echo "## Memoria — resumen diario ${{ env.FECHA }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```json' >> "$GITHUB_STEP_SUMMARY"
+          cat resumen_diario.json >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Subir artefacto
+        if: env.SIN_CAMBIOS != '1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: resumen-diario-${{ env.FECHA }}
+          path: resumen_diario.json
+          retention-days: 30

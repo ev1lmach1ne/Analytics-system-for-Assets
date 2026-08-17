@@ -1,0 +1,20 @@
+{
+  "resumen_ejecutivo": "Cambio en 2 archivo(s) (9+ / 9- líneas).",
+  "modificaciones_clave": [
+    {
+      "archivo": ".github/workflows/consolidacion_diaria.yml",
+      "motivo": "modificación detectada en el diff (revisar hunks)"
+    },
+    {
+      "archivo": ".github/workflows/memoria_tecnica.yml",
+      "motivo": "modificación detectada en el diff (revisar hunks)"
+    }
+  ],
+  "impacto_tecnico": [
+    "pipelines de CI (GitHub Actions)"
+  ],
+  "tags": [
+    "consolidacion_diaria",
+    "memoria_tecnica"
+  ]
+}

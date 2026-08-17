@@ -1,0 +1,123 @@
+# Memoria técnica — resumen de cambios en cada push o pull_request.
+#
+# En cada evento genera un JSON de síntesis técnica (resumen_ejecutivo,
+# modificaciones_clave, impacto_tecnico, tags) a partir del diff y de los
+# mensajes de commit, usando el agente archivista de memoria técnica.
+#
+# Configuración (Settings -> Secrets and variables -> Actions):
+#   Secrets:
+#     MEMORIA_LLM_API_KEY   API key del proveedor LLM (OpenAI-compatible)
+#     MEMORIA_LLM_BASE_URL  (opcional) base URL, ej. https://openrouter.ai/api/v1
+#   Variables:
+#     MEMORIA_LLM_MODEL     (opcional) modelo, ej. gpt-4o-mini
+#
+# Sin clave configurada, el script cae al resumen heurístico local (fallback).
+# El JSON resultante se sube como artefacto y se muestra en el job summary;
+# con COMMIT_RESULT='true' (variable de repo) además se guarda en
+# memoria/cambios/<fecha>_<sha>.json dentro del propio repositorio para
+# alimentar la memoria vectorial.
+
+name: Memoria técnica (resumen de cambios)
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+permissions:
+  contents: read
+
+jobs:
+  resumen-tecnico:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      MEMORIA_LLM_API_KEY: ${{ secrets.MEMORIA_LLM_API_KEY }}
+      MEMORIA_LLM_BASE_URL: ${{ secrets.MEMORIA_LLM_BASE_URL }}
+      MEMORIA_LLM_MODEL: ${{ vars.MEMORIA_LLM_MODEL }}
+      COMMIT_RESULT: ${{ vars.COMMIT_RESULT }}
+    steps:
+      - name: Checkout con historial completo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Obtener diff y mensajes de commit
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE_REF="${{ github.event.pull_request.base.sha }}"
+            HEAD_REF="${{ github.event.pull_request.head.sha }}"
+          else
+            # Push: comparar contra el commit anterior (o el único commit si no hay más)
+            if git rev-parse --verify HEAD^ >/dev/null 2>&1; then
+              BASE_REF="HEAD^"
+              HEAD_REF="HEAD"
+            else
+              BASE_REF=$(git rev-list --max-parents=0 HEAD)
+              HEAD_REF="HEAD"
+            fi
+          fi
+          git diff "$BASE_REF" "$HEAD_REF" > diff.txt
+          git log --pretty=format:"%h %s" "$BASE_REF..$HEAD_REF" > commits.txt
+          echo "BASE_REF=$BASE_REF" >> "$GITHUB_ENV"
+          echo "HEAD_REF=$HEAD_REF" >> "$GITHUB_ENV"
+          echo "Diff generado: $(wc -l < diff.txt) líneas"
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependencias del agente
+        run: pip install --quiet requests
+
+      - name: Generar resumen técnico (JSON)
+        id: resumen
+        env:
+          SHA: ${{ github.sha }}
+          RAMA: ${{ github.head_ref || github.ref_name }}
+        run: |
+          python memoria/generar_resumen_cambio.py \
+            --diff diff.txt --commits commits.txt \
+            --origen "${{ github.event_name }}" \
+            --commit-sha "$SHA" --rama "$RAMA" \
+            --salida resumen_cambio.json
+          echo "JSON generado: $(wc -c < resumen_cambio.json) bytes"
+
+      - name: Mostrar resumen en el job summary
+        run: |
+          echo "## Memoria técnica — resumen del cambio" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo '```json' >> "$GITHUB_STEP_SUMMARY"
+          cat resumen_cambio.json >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Subir artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: resumen-cambio-${{ github.sha }}
+          path: resumen_cambio.json
+          retention-days: 30
+
+      - name: Guardar resumen en el repositorio (memoria/cambios/)
+        if: env.COMMIT_RESULT == 'true' && github.event_name == 'push'
+        env:
+          SHA: ${{ github.sha }}
+          RAMA: ${{ github.ref_name }}
+        run: |
+          FECHA=$(date +%Y-%m-%d)
+          DESTINO="memoria/cambios/${FECHA}_${SHA:0:8}.json"
+          mkdir -p memoria/cambios
+          cp resumen_cambio.json "$DESTINO"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$DESTINO"
+          if ! git diff --cached --quiet; then
+            git commit -m "memoria: resumen técnico del cambio ${SHA:0:8}"
+            git push
+            echo "Guardado en $DESTINO"
+          else
+            echo "Sin cambios nuevos; el resumen ya existe o el diff estaba vacío."
+          fi
