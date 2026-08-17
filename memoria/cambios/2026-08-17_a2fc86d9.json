@@ -1,0 +1,21 @@
+{
+  "resumen_ejecutivo": "Se documenta en AGENTS.md la configuración actual del LLM del repositorio, que usa OpenCode Zen con el modelo gratuito deepseek-v4-flash-free, incluyendo notas sobre el endpoint, uso de User-Agent y consideraciones sobre privacidad/mejora de modelos gratuitos.",
+  "modificaciones_clave": [
+    {
+      "archivo": "AGENTS.md",
+      "motivo": "Añadir sección de configuración actual del LLM para reflejar el proveedor OpenCode Zen, el modelo deepseek-v4-flash-free, la URL base, el comportamiento tras Cloudflare y las implicaciones de usar modelos gratuitos."
+    }
+  ],
+  "impacto_tecnico": [
+    "Documentación del proyecto (AGENTS.md) para desarrolladores y agentes que lean la memoria técnica.",
+    "Configuración de variables de entorno relacionadas con el LLM (MEMORIA_LLM_BASE_URL, MEMORIA_LLM_MODEL) y scripts que consumen el endpoint.",
+    "Posibles decisiones futuras sobre el uso de modelos gratuitos vs de pago y consideraciones de privacidad."
+  ],
+  "tags": [
+    "LLM",
+    "OpenCode Zen",
+    "deepseek-v4-flash-free",
+    "configuración",
+    "AGENTS.md"
+  ]
+}
