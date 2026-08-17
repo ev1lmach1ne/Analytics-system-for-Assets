@@ -56,3 +56,11 @@ Este repositorio incluye una **memoria vectorial técnica** (Qdrant local en
 - Variables de entorno del LLM (CI o local): `MEMORIA_LLM_API_KEY`,
   `MEMORIA_LLM_BASE_URL`, `MEMORIA_LLM_MODEL`. Sin clave, todo usa fallback
   heurístico local (no requiere red).
+- Configuración actual del repo: proveedor **OpenCode Zen**
+  (`MEMORIA_LLM_BASE_URL=https://opencode.ai/zen/v1`), modelo
+  **`deepseek-v4-flash-free`** (gratuito, no consume créditos; el plan de
+  suscripción no financia la API directa, que es pay-as-you-go). El endpoint
+  está tras Cloudflare: los scripts ya envían un User-Agent de navegador.
+  Modelos `*-free` pueden usar los datos para mejorar el modelo durante el
+  periodo gratuito (ver docs de Zen); con créditos se puede volver al modelo
+  de pago `deepseek-v4-flash`.
