@@ -1,0 +1,49 @@
+{
+  "resumen_ejecutivo": "Cambio en 8 archivo(s) (567+ / 49- líneas).",
+  "modificaciones_clave": [
+    {
+      "archivo": "AGENTS.md",
+      "motivo": "modificación detectada en el diff (revisar hunks)"
+    },
+    {
+      "archivo": "INFORME_AUDITORIA_BACKTEST.md",
+      "motivo": "modificación detectada en el diff (revisar hunks)"
+    },
+    {
+      "archivo": "app.py",
+      "motivo": "modificación detectada en el diff (revisar hunks)"
+    },
+    {
+      "archivo": "core/backtest.py",
+      "motivo": "modificación detectada en el diff (revisar hunks)"
+    },
+    {
+      "archivo": "core/codegen/base.py",
+      "motivo": "modificación detectada en el diff (revisar hunks)"
+    },
+    {
+      "archivo": "core/codegen/fidelidad.py",
+      "motivo": "modificación detectada en el diff (revisar hunks)"
+    },
+    {
+      "archivo": "core/codegen/ir.py",
+      "motivo": "modificación detectada en el diff (revisar hunks)"
+    },
+    {
+      "archivo": "tests/test_utilidades.py",
+      "motivo": "modificación detectada en el diff (revisar hunks)"
+    }
+  ],
+  "impacto_tecnico": [
+    "punto de entrada de la aplicación (app.py)",
+    "motor de backtest (core/backtest.py)",
+    "exportador de código Pine/MQL5 (core/codegen/)",
+    "suite de pruebas (tests/)"
+  ],
+  "tags": [
+    "______",
+    "________________________",
+    "app",
+    "backtest"
+  ]
+}
