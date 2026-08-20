@@ -1,0 +1,27 @@
+{
+  "resumen_ejecutivo": "Cambio en 3 archivo(s) (329+ / 4- líneas).",
+  "modificaciones_clave": [
+    {
+      "archivo": "core/config.py",
+      "motivo": "modificación detectada en el diff (revisar hunks)"
+    },
+    {
+      "archivo": "core/metrics.py",
+      "motivo": "modificación detectada en el diff (revisar hunks)"
+    },
+    {
+      "archivo": "gui/widgets/analisis_tarjetas.py",
+      "motivo": "modificación detectada en el diff (revisar hunks)"
+    }
+  ],
+  "impacto_tecnico": [
+    "configuración global y rutas (core/config.py)",
+    "métricas cuantitativas (core/metrics.py)",
+    "pestañas y widgets de la GUI (gui/widgets/)"
+  ],
+  "tags": [
+    "config",
+    "metrics",
+    "analisis_tarjetas"
+  ]
+}

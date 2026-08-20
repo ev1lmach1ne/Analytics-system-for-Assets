@@ -11,30 +11,31 @@
 // NO EDITAR A MANO en el archivo generado: se regenera en cada exportación.
 // ─────────────────────────────────────────────────────────────────────────
 
-// ══════════════ ATR — media SIMPLE del True Range ══════════════
-// El Backtester promedia el TR con una media móvil simple; `ta.atr` usa el
-// suavizado de Wilder (RMA), que reacciona más despacio. La diferencia no es
-// cosmética: el ATR fija la distancia al stop y, con ella, el tamaño de la
-// posición (unidades = riesgo / distancia). Usar ta.atr cambiaría el tamaño
-// de TODAS las operaciones.
+// ══════════════ ATR — suavizado de Wilder (RMA) ══════════════
+// El Backtester usa el suavizado de Wilder del True Range (semilla SMA de
+// las primeras `periodo` velas y recursión de Wilder), que es exactamente
+// lo que calcula ta.atr. Se mantiene el envoltorio zcsAtr para que los
+// puntos de uso del script generado no cambien, pero ahora delega en el
+// nativo. El ATR fija la distancia al stop y, con ella, el tamaño de la
+// posición (unidades = riesgo / distancia).
 zcsAtr(int periodo) =>
-    ta.sma(ta.tr(true), periodo)
+    ta.atr(periodo)
 
-// ══════════════ Bollinger — desviación MUESTRAL ══════════════
-// pandas .std() usa ddof=1 (divide por n-1); `ta.stdev` divide por n salvo
-// que se le pase biased=false. Con periodos cortos la diferencia mueve las
-// bandas lo bastante como para cambiar qué velas disparan la señal.
+// ══════════════ Bollinger — desviación POBLACIONAL ══════════════
+// pandas .std(ddof=0) divide por n, igual que ta.stdev con biased=true.
+// Con periodos cortos la diferencia mueve las bandas lo bastante como para
+// cambiar qué velas disparan la señal.
 zcsBbMedia(float src, int periodo) =>
     ta.sma(src, periodo)
 
 zcsBbDesv(float src, int periodo) =>
-    ta.stdev(src, periodo, false)
+    ta.stdev(src, periodo, true)
 
 zcsBbSup(float src, int periodo, float desv) =>
-    ta.sma(src, periodo) + desv * ta.stdev(src, periodo, false)
+    ta.sma(src, periodo) + desv * ta.stdev(src, periodo, true)
 
 zcsBbInf(float src, int periodo, float desv) =>
-    ta.sma(src, periodo) - desv * ta.stdev(src, periodo, false)
+    ta.sma(src, periodo) - desv * ta.stdev(src, periodo, true)
 
 // ══════════════ Efficiency Ratio de Kaufman ══════════════
 // |movimiento neto| / movimiento total sobre retornos LOG, en `periodo`
@@ -170,6 +171,61 @@ zcsSar(float afIni, float afPaso, float afMax) =>
                     afV := math.min(afV + afPaso, afMax)
     [sarV, tendV]
 
+// ══════════════ ZigZag no repintante ══════════════
+// Replica _zigzag_eventos/_zigzag_series de core/strategies.py. Los pivotes
+// se confirman con der = piernas/2 velas de retraso (la detección es la de
+// ta.pivothigh/ta.pivotlow con izq = der), y el estado aplica las dos reglas
+// del motor: un pivote del MISMO tipo solo sustituye si es más extremo, y
+// para abrir un tramo de tipo contrario hace falta que la variación alcance
+// `desviacion` %. Devuelve [precio del pivote vigente, tipo ±1]; antes del
+// primer pivote confirmado el precio es na y el tipo 0.
+zcsZigzag(float desviacion, int piernas) =>
+    int der = math.max(1, int(piernas / 2))
+    int izq = der
+    float ph = ta.pivothigh(high, izq, der)
+    float pl = ta.pivotlow(low, izq, der)
+    var float pivPrecio = na
+    var int pivTipo = 0
+    var float ultPrecio = na
+    var int ultTipo = 0
+    // el motor procesa primero el pivote alto y luego el bajo en la misma
+    // vela de confirmación (orden de _pivotes_candidatos)
+    if not na(ph)
+        if na(ultPrecio)
+            pivPrecio := ph
+            pivTipo := 1
+            ultPrecio := ph
+            ultTipo := 1
+        else if ultTipo == 1
+            if ph > ultPrecio
+                pivPrecio := ph
+                ultPrecio := ph
+        else
+            float variacion = ultPrecio != 0 ? math.abs(ph - ultPrecio) / math.abs(ultPrecio) * 100.0 : 0.0
+            if variacion >= desviacion
+                pivPrecio := ph
+                pivTipo := 1
+                ultPrecio := ph
+                ultTipo := 1
+    if not na(pl)
+        if na(ultPrecio)
+            pivPrecio := pl
+            pivTipo := -1
+            ultPrecio := pl
+            ultTipo := -1
+        else if ultTipo == -1
+            if pl < ultPrecio
+                pivPrecio := pl
+                ultPrecio := pl
+        else
+            float variacion2 = ultPrecio != 0 ? math.abs(pl - ultPrecio) / math.abs(ultPrecio) * 100.0 : 0.0
+            if variacion2 >= desviacion
+                pivPrecio := pl
+                pivTipo := -1
+                ultPrecio := pl
+                ultTipo := -1
+    [pivPrecio, pivTipo]
+
 // ══════════════ Cruces ══════════════
 // Un cruce exige que la vela ANTERIOR estuviera al otro lado: comparar solo
 // el estado actual convertiría una condición de cruce en una de posición y
@@ -186,3 +242,217 @@ zcsCruzaAbajo(float a, float b) =>
 // pasar del 100% sin que eso sea un error.
 zcsUnidadesPorRiesgo(float equity, float riesgoPct, float distancia) =>
     distancia > 0 ? equity * riesgoPct / distancia : 0.0
+
+// ─────────────────────── Supertrend ───────────────────────
+// Replica _supertrend_serie de core/strategies.py: envolvente ATR con la
+// recursión clásica (max/min del nivel previo según el cierre). Devuelve
+// [nivel, tendencia] (+1 alcista / -1 bajista); el warm-up del ATR es NaN
+// hasta la semilla SMA, igual que en el motor (que no rellena aquí a
+// propósito, para que la recursión coincida vela a vela).
+zcsSupertrend(int periodo, float mult) =>
+    float hl2 = (high + low) / 2
+    float atrV = zcsAtr(periodo)
+    var float prevUp = na
+    var float prevDn = na
+    float up = hl2 - mult * atrV
+    float dn = hl2 + mult * atrV
+    if not na(prevUp)
+        up := close[1] > prevUp ? math.max(up, prevUp) : up
+        dn := close[1] < prevDn ? math.min(dn, prevDn) : dn
+    prevUp := up
+    prevDn := dn
+    var int tendV = 0
+    float stV = na
+    if tendV == 0
+        tendV := 1
+        stV := hl2
+    else if tendV > 0
+        if close < up
+            tendV := -1
+            stV := dn
+        else
+            stV := up
+    else
+        if close > dn
+            tendV := 1
+            stV := up
+        else
+            stV := dn
+    [stV, tendV]
+
+// ─────────────────────── MACD ───────────────────────
+// Replica _macd_series de core/strategies.py: EMA (ajustada, span) de la
+// diferencia de EMAs. Devuelve [linea, senal, histograma].
+zcsMacd(int rapido, int lento, int senal) =>
+    float linea = ta.ema(close, rapido) - ta.ema(close, lento)
+    float senalV = ta.ema(linea, senal)
+    [linea, senalV, linea - senalV]
+
+// ─────────────────────── ADX (Wilder) ───────────────────────
+// Replica _adx_series de core/strategies.py: +DI/−DI/ADX con el mismo RMA
+// de Wilder (semilla SMA) que ta.rma. Devuelve [adx, plusDi, minusDi].
+zcsAdx(int periodo) =>
+    float up = high - high[1]
+    float dn = -(low - low[1])
+    float plusDm = up > dn and up > 0 ? up : 0.0
+    float minusDm = dn > up and dn > 0 ? dn : 0.0
+    float tr = math.max(high - low, math.max(math.abs(high - close[1]), math.abs(low - close[1])))
+    float trR = ta.rma(tr, periodo)
+    float pR = ta.rma(plusDm, periodo)
+    float mR = ta.rma(minusDm, periodo)
+    float pdi = 100.0 * pR / trR
+    float mdi = 100.0 * mR / trR
+    float dx = 100.0 * math.abs(pdi - mdi) / math.max(pdi + mdi, 1e-12)
+    [ta.rma(dx, periodo), pdi, mdi]
+
+// ─────────────────────── Aroon ───────────────────────
+// Replica _aroon_series de core/strategies.py: % del recorrido desde el
+// último extremo de la ventana de `periodo` velas (incluida la actual);
+// 100 cuando el extremo es la vela actual. Con empates manda el extremo
+// más reciente (ta.barssince), igual que el motor.
+zcsAroonUp(int periodo) =>
+    float maxH = ta.highest(high, periodo)
+    int bsi = ta.barssince(high >= maxH)
+    bsi := math.min(bsi, periodo - 1)
+    100.0 * (periodo - bsi) / periodo
+
+zcsAroonDown(int periodo) =>
+    float minL = ta.lowest(low, periodo)
+    int bsi = ta.barssince(low <= minL)
+    bsi := math.min(bsi, periodo - 1)
+    100.0 * (periodo - bsi) / periodo
+
+// ─────────────────────── CMO ───────────────────────
+// Replica _cmo_serie de core/strategies.py: 100·(SU−SD)/(SU+SD) con SU/SD
+// la suma de los cambios al alza/baja de `periodo` velas.
+zcsCmo(int periodo) =>
+    float su = 0.0
+    float sd = 0.0
+    for i = 1 to periodo
+        float chg = close - close[i]
+        if chg > 0.0
+            su += chg
+        else
+            sd += -chg
+    su + sd > 0.0 ? 100.0 * (su - sd) / (su + sd) : 0.0
+
+// ─────────────────────── TRIX ───────────────────────
+// Replica _trix_serie de core/strategies.py: % de cambio de la EMA triple.
+zcsTrix(int periodo) =>
+    float e1 = ta.ema(close, periodo)
+    float e2 = ta.ema(e1, periodo)
+    float e3 = ta.ema(e2, periodo)
+    e3[1] != 0.0 ? (e3 - e3[1]) / e3[1] * 100.0 : 0.0
+
+// ─────────────────────── StochRSI ───────────────────────
+// Replica _stochrsi_series de core/strategies.py (suavizados %K=3 y %D=3):
+// %K = estocástico del RSI en su ventana, suavizado; %D = suavizado de %K.
+zcsStochRsiK(int periodo) =>
+    float r = ta.rsi(close, periodo)
+    float mn = ta.lowest(r, periodo)
+    float mx = ta.highest(r, periodo)
+    float raw = mx - mn > 0.0 ? (r - mn) / (mx - mn) : 0.0
+    ta.sma(raw, 3)
+
+zcsStochRsiD(int periodo) =>
+    ta.sma(zcsStochRsiK(periodo), 3)
+
+// ─────────────────────── Ichimoku (alineado) ───────────────────────
+// Replica _ichimoku_series de core/strategies.py. Las Senkou se devuelven
+// ALINEADAS (sin el desplazamiento +26 del gráfico: sería lookahead) y el
+// Chikou es el cierre 26 velas ATRÁS (dato pasado).
+zcsIchimokuTenkan(int t, int k, int s) =>
+    ta.sma((high + low) / 2, t)
+
+zcsIchimokuKijun(int t, int k, int s) =>
+    ta.sma((high + low) / 2, k)
+
+zcsIchimokuSenkouA(int t, int k, int s) =>
+    (ta.sma((high + low) / 2, t) + ta.sma((high + low) / 2, k)) / 2
+
+zcsIchimokuSenkouB(int t, int k, int s) =>
+    ta.sma((high + low) / 2, s)
+
+zcsIchimokuChikou(int t, int k, int s) =>
+    close[26]
+
+// ─────────────────────── Keltner ───────────────────────
+// Replica _keltner_series de core/strategies.py: EMA ± mult×ATR.
+zcsKeltnerMedia(int periodo, float mult) =>
+    ta.ema(close, periodo)
+
+zcsKeltnerSup(int periodo, float mult) =>
+    ta.ema(close, periodo) + mult * ta.atr(periodo)
+
+zcsKeltnerInf(int periodo, float mult) =>
+    ta.ema(close, periodo) - mult * ta.atr(periodo)
+
+// ─────────────────────── TTM Squeeze ───────────────────────
+// Replica _ttm_squeeze_series de core/strategies.py: squeeze = Bollinger
+// dentro de Keltner (1.0/0.0); momentum = midprice − SMA(midprice).
+zcsTtmSqueeze(int periodo, float multBb, float multKc) =>
+    float bbSup = ta.sma(close, periodo) + multBb * ta.stdev(close, periodo)
+    float bbInf = ta.sma(close, periodo) - multBb * ta.stdev(close, periodo)
+    float kcSup = ta.ema(close, periodo) + multKc * ta.atr(periodo)
+    float kcInf = ta.ema(close, periodo) - multKc * ta.atr(periodo)
+    bbSup <= kcSup and bbInf >= kcInf ? 1.0 : 0.0
+
+zcsTtmMomentum(int periodo, float multBb, float multKc) =>
+    float mid = (high + low) / 2
+    mid - ta.sma(mid, periodo)
+
+// ─────────────────────── VWAP (anclaje + bandas) ───────────────────────
+// Replica _vwap_series de core/strategies.py (referencia TradingView):
+// acumulado de hlc3·vol / vol por anclaje de calendario; banda = media ±
+// (σ poblacional del anclaje o media·0.01)·k. La 1ª vela de cada anclaje
+// resetea (la banda colapsa sobre el VWAP, como en TradingView).
+zcsVwapNuevoAncla(string anclaje) =>
+    bar_index == 0 or switch anclaje
+        "D"   => timeframe.change("D")
+        "W"   => timeframe.change("W")
+        "M"   => timeframe.change("M")
+        "T"   => timeframe.change("3M")
+        "A"   => timeframe.change("12M")
+        "10Y" => timeframe.change("12M") and year % 10 == 0
+        "100Y" => timeframe.change("12M") and year % 100 == 0
+        => false
+
+zcsVwapMedia(string anclaje, float k, string modo) =>
+    float src = hlc3
+    bool newP = zcsVwapNuevoAncla(anclaje)
+    var float acT = na
+    var float acV = na
+    if newP or na(acV)
+        acT := src * volume
+        acV := volume
+    else
+        acT := acT + src * volume
+        acV := acV + volume
+    acV > 0.0 ? acT / acV : na
+
+zcsVwapSd(string anclaje, float k, string modo) =>
+    float src = hlc3
+    bool newP = zcsVwapNuevoAncla(anclaje)
+    var float sumS = na
+    var float sumS2 = na
+    var int cnt = 0
+    if newP or cnt == 0
+        sumS := src
+        sumS2 := src * src
+        cnt := 1
+    else
+        sumS := sumS + src
+        sumS2 := sumS2 + src * src
+        cnt := cnt + 1
+    float media = sumS / cnt
+    math.sqrt(math.max(sumS2 / cnt - media * media, 0.0))
+
+zcsVwapSup(string anclaje, float k, string modo) =>
+    float m = zcsVwapMedia(anclaje, k, modo)
+    float base = modo == "pct" ? m * 0.01 : zcsVwapSd(anclaje, k, modo)
+    m + base * k
+
+zcsVwapInf(string anclaje, float k, string modo) =>
+    float m = zcsVwapMedia(anclaje, k, modo)
+    float base = modo == "pct" ? m * 0.01 : zcsVwapSd(anclaje, k, modo)
+    m - base * k

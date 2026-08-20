@@ -357,3 +357,17 @@ def velas_por_anio(tipo_activo, minutos_vela):
         dias_por_vela = minutos_vela / 1440.0
         return dias_anio / dias_por_vela
     return (minutos_dia / minutos_vela) * dias_anio
+
+
+def velas_por_dia(tipo_activo, minutos_vela):
+    """Nº de velas por día de trading de la clase de activo (CRYPTO 1440,
+    STOCK 390, FUTURO/FOREX 1440), para métricas por tiempo como
+    'avg_trades_por_dia'. Misma sesión real que `velas_por_anio`:
+    - vela intradía: velas que caben en la sesión (`minutos_dia / minutos_vela`).
+    - vela >= 1 día de calendario: fracción de día que abarca la vela.
+    Si `tipo_activo` es None o desconocido, cae al supuesto 24/7 (1440 min)."""
+    minutos_dia = _MINUTOS_DIA_ANUALIZACION.get(tipo_activo, 1440)
+    minutos_vela = max(float(minutos_vela), 1e-9)
+    if minutos_vela >= 1440.0:
+        return 1.0 / (minutos_vela / 1440.0)
+    return minutos_dia / minutos_vela

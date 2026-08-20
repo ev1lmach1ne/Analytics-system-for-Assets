@@ -1,4 +1,4 @@
-"""
+﻿"""
 core/strategies.py
 Catálogo de indicadores y registro declarativo de estrategias para el motor
 de backtest (core/backtest.py). Sin Qt, sin I/O — la GUI genera los
@@ -26,6 +26,7 @@ Máximo MAX_SETUPS setups por sistema (límite del bitmask de 64 bits).
 """
 import numpy as np
 import pandas as pd
+from numba import njit
 
 from core.candle_patterns import (
     PATRONES_INFO, detectar_patrones, preparar_contexto, _mascara_sesion,
@@ -35,6 +36,7 @@ from core.metrics import (
     calcular_percentil_rodante_numba, calcular_sar_numba,
 )
 from core.backtest import TRIGGERS_TRAMO_ENTRADA
+from core.config import tf_to_minutes
 
 PERIODO_ATR_DEFECTO = 14
 MAX_SETUPS = 64   # límite del bitmask int64 de salidas por setup
@@ -56,20 +58,48 @@ def rsi(c, periodo=14):
     ganancia = delta.clip(lower=0).ewm(alpha=1.0 / periodo, adjust=False).mean()
     perdida = (-delta.clip(upper=0)).ewm(alpha=1.0 / periodo, adjust=False).mean()
     rs = ganancia / perdida.replace(0, np.nan)
-    return (100 - 100 / (1 + rs)).fillna(50.0).values
+    rsi = 100 - 100 / (1 + rs)
+    # Sin pérdidas en la ventana, la fuerza alcista es pura: el RSI debe ser
+    # 100, no 50. El 50 neutro se reserva solo para la serie plana (ganancias
+    # y pérdidas a 0 a la vez) y para el warm-up (NaN, igual que antes).
+    sin_perdidas = (perdida == 0) & (ganancia > 0)
+    rsi = rsi.mask(sin_perdidas, 100.0)
+    return rsi.fillna(50.0).values
 
 
 def atr(h, l, c, periodo=PERIODO_ATR_DEFECTO):
     hs, ls, cs = pd.Series(h), pd.Series(l), pd.Series(c)
     tr = pd.concat([hs - ls, (hs - cs.shift(1)).abs(),
                     (ls - cs.shift(1)).abs()], axis=1).max(axis=1)
-    return tr.rolling(int(periodo)).mean().bfill().values
+    vals = _atr_rma_numba(tr.values, int(periodo))
+    return pd.Series(vals).bfill().values
+
+
+@njit(nogil=True)
+def _atr_rma_numba(tr, periodo):
+    """Suavizado de Wilder (RMA) del True Range, con la misma semilla que
+    ta.rma/ta.atr de Pine: SMA de las primeras `periodo` velas y después la
+    recursión atr[i] = (atr[i-1]*(periodo-1) + tr[i]) / periodo. Devuelve un
+    array del mismo largo (el warm-up queda en NaN; lo rellena atr() con
+    bfill, igual que la versión anterior con media simple)."""
+    n = len(tr)
+    out = np.full(n, np.nan)
+    p = int(periodo)
+    if n < p or p <= 0:
+        return out
+    suma = 0.0
+    for i in range(p):
+        suma += tr[i]
+    out[p - 1] = suma / p
+    for i in range(p, n):
+        out[i] = (out[i - 1] * (p - 1) + tr[i]) / p
+    return out
 
 
 def bollinger(c, periodo=20, desv=2.0):
     s = pd.Series(c)
     media = s.rolling(int(periodo)).mean()
-    std = s.rolling(int(periodo)).std()
+    std = s.rolling(int(periodo)).std(ddof=0)
     return media.values, (media + desv * std).values, (media - desv * std).values
 
 
@@ -147,6 +177,277 @@ def _sar_serie(h, l, af_inicial=0.02, af_paso=0.02, af_max=0.2):
     return calcular_sar_numba(
         np.asarray(h, dtype=np.float64), np.asarray(l, dtype=np.float64),
         float(af_inicial), float(af_paso), float(af_max))
+
+
+def _supertrend_serie(h, l, c, periodo=10, multiplicador=3.0):
+    """Supertrend (clásico, estilo TradingView): envolvente ATR que sigue al
+    precio y cambia de lado en los giros.
+
+    upper[i] = hl2 - mult·ATR  (mínimo corriente de la pata bajista)
+    lower[i] = hl2 + mult·ATR  (máximo corriente de la pata alcista)
+    Cuando el cierre salta el nivel de la pata contraria, la tendencia gira.
+    Devuelve (st, tendencia ±1): `st` es el nivel vigente (la envolvente del
+    lado de la tendencia) y `tendencia` +1 alcista / -1 bajista. Solo usa
+    datos hasta la vela i (no repinta).
+
+    El ATR se calcula con el RMA de Wilder SIN relleno de warm-up (a
+    diferencia de atr(), que hace bfill para el dimensionado): así el estado
+    de la recursión coincide vela a vela con la versión del runtime de
+    exportación, donde el warm-up es NaN hasta la semilla SMA."""
+    n = len(c)
+    st = np.full(n, np.nan)
+    tendencia = np.zeros(n, dtype=np.int8)
+    if n == 0:
+        return st, tendencia
+    hs, ls, cs = pd.Series(h), pd.Series(l), pd.Series(c)
+    tr = pd.concat([hs - ls, (hs - cs.shift(1)).abs(),
+                    (ls - cs.shift(1)).abs()], axis=1).max(axis=1)
+    atr_v = _atr_rma_numba(tr.values, int(periodo))
+    hl2 = (np.asarray(h, dtype=np.float64) + np.asarray(l, dtype=np.float64)) * 0.5
+    up = np.full(n, np.nan)
+    dn = np.full(n, np.nan)
+    tendencia[0] = 1
+    st[0] = hl2[0]
+    up[0] = hl2[0] - multiplicador * atr_v[0]
+    dn[0] = hl2[0] + multiplicador * atr_v[0]
+    for i in range(1, n):
+        up_i = hl2[i] - multiplicador * atr_v[i]
+        dn_i = hl2[i] + multiplicador * atr_v[i]
+        if c[i - 1] > up[i - 1]:
+            up[i] = max(up_i, up[i - 1])
+        else:
+            up[i] = up_i
+        if c[i - 1] < dn[i - 1]:
+            dn[i] = min(dn_i, dn[i - 1])
+        else:
+            dn[i] = dn_i
+        if tendencia[i - 1] > 0:
+            if c[i] < up[i]:
+                tendencia[i] = -1
+            else:
+                tendencia[i] = 1
+        else:
+            if c[i] > dn[i]:
+                tendencia[i] = 1
+            else:
+                tendencia[i] = -1
+        st[i] = up[i] if tendencia[i] > 0 else dn[i]
+    return st, tendencia
+
+
+def _ichimoku_series(h, l, c, tenkan=9, kijun=26, senkou=52):
+    """Ichimoku Cloud (sin el desplazamiento futuro del gráfico).
+
+    tenkan/kijun = media rodante de (h+l)/2 de `tenkan`/`kijun` velas;
+    senkou_a = (tenkan+kijun)/2; senkou_b = media rodante de (h+l)/2 de
+    `senkou`. Las senkou se devuelven ALINEADAS con la vela actual: el
+    desplazamiento +26 de TradingView es futuro y sería lookahead en el
+    backtest. chikou = cierre desplazado 26 velas ATRÁS (dato pasado, sin
+    lookahead). Devuelve (tenkan, kijun, senkou_a, senkou_b, chikou)."""
+    hl2 = pd.Series((np.asarray(h, dtype=float)
+                     + np.asarray(l, dtype=float)) * 0.5)
+    tenkan_v = hl2.rolling(int(tenkan)).mean().values
+    kijun_v = hl2.rolling(int(kijun)).mean().values
+    senkou_a = ((pd.Series(tenkan_v) + pd.Series(kijun_v)) * 0.5).values
+    senkou_b = hl2.rolling(int(senkou)).mean().values
+    n = len(c)
+    chikou = np.full(n, np.nan)
+    if n > 26:
+        chikou[26:] = np.asarray(c, dtype=float)[:n - 26]
+    return tenkan_v, kijun_v, senkou_a, senkou_b, chikou
+
+
+def _keltner_series(c, h, l, periodo=20, mult=2.0):
+    """Bandas de Keltner: media = EMA, sup/inf = EMA ± mult×ATR (Wilder)."""
+    media = ema(c, periodo)
+    atr_v = atr(np.asarray(h, dtype=float), np.asarray(l, dtype=float),
+                np.asarray(c, dtype=float), periodo)
+    return media, media + mult * atr_v, media - mult * atr_v
+
+
+def _ttm_squeeze_series(c, h, l, periodo=20, mult_bb=2.0, mult_kc=1.5):
+    """TTM Squeeze (John Carter): compresión de volatilidad cuando las
+    Bandas de Bollinger (mult_bb) quedan DENTRO de las Keltner (mult_kc).
+    Devuelve (squeeze_on bool, momentum) con momentum = midprice −
+    SMA(midprice, periodo): el "despegue" es salir del squeeze con momentum
+    en la dirección."""
+    media_bb, sup_bb, inf_bb = bollinger(c, periodo, mult_bb)
+    media_kc, sup_kc, inf_kc = _keltner_series(c, h, l, periodo, mult_kc)
+    squeeze_on = (sup_bb <= sup_kc) & (inf_bb >= inf_kc)
+    midprice = (np.asarray(h, dtype=float) + np.asarray(l, dtype=float)) * 0.5
+    momentum = midprice - sma(midprice, periodo)
+    return squeeze_on, momentum
+
+
+def _aroon_series(h, l, periodo=25):
+    """Aroon Up/Down (convención TradingView): % del recorrido del camino
+    desde el último extremo de la ventana de `periodo` velas (incluida la
+    actual). Ventana [i-periodo+1, i]; up = 100·(periodo − velas desde el
+    máximo)/periodo, donde «velas desde» = 0 si el máximo es la vela actual
+    (up = 100) y crece hacia atrás. Con empates se usa el extremo MÁS
+    reciente (mismo criterio que ta.barssince del runtime Pine)."""
+    hs, ls = pd.Series(h), pd.Series(l)
+    up = np.full(len(h), np.nan)
+    dn = np.full(len(h), np.nan)
+    p = int(periodo)
+    for i in range(p - 1, len(h)):
+        ventana_h = hs.iloc[i - p + 1:i + 1].values[::-1]   # actual primero
+        ventana_l = ls.iloc[i - p + 1:i + 1].values[::-1]
+        idx_r_h = int(np.argmax(ventana_h))   # 0 = vela actual (más reciente)
+        idx_r_l = int(np.argmin(ventana_l))
+        up[i] = 100.0 * (p - idx_r_h) / p
+        dn[i] = 100.0 * (p - idx_r_l) / p
+    return up, dn
+
+
+def _cmo_serie(c, periodo=14):
+    """Chande Momentum Oscillator: 100·(SU−SD)/(SU+SD) con SU/SD la suma de
+    los cambios al alza/baja de `periodo` velas."""
+    s = pd.Series(c)
+    delta = s.diff()
+    su = delta.clip(lower=0).rolling(int(periodo)).sum()
+    sd = (-delta.clip(upper=0)).rolling(int(periodo)).sum()
+    with np.errstate(divide='ignore', invalid='ignore'):
+        cmo = 100.0 * (su - sd) / (su + sd)
+    return cmo.values
+
+
+def _obv_serie(c, v):
+    """On Balance Volume: acumula volumen con signo según el cierre."""
+    c = np.asarray(c, dtype=np.float64)
+    v = np.asarray(v, dtype=np.float64)
+    n = len(c)
+    obv = np.zeros(n)
+    for i in range(1, n):
+        if c[i] > c[i - 1]:
+            obv[i] = obv[i - 1] + v[i]
+        elif c[i] < c[i - 1]:
+            obv[i] = obv[i - 1] - v[i]
+        else:
+            obv[i] = obv[i - 1]
+    return obv
+
+
+def _trix_serie(c, periodo=15):
+    """TRIX: % de cambio de la EMA triple."""
+    e1 = ema(c, periodo)
+    e2 = ema(e1, periodo)
+    e3 = ema(e2, periodo)
+    trix = np.full(len(c), np.nan)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        trix[1:] = np.diff(e3) / e3[:-1] * 100.0
+    return trix
+
+
+def _stochrsi_series(c, periodo=14, suavizado_k=3, suavizado_d=3):
+    """StochRSI (TradingView): estocástico aplicado al RSI. Devuelve
+    (k_line, d_line): %K = (RSI − mín(RSI, n)) / (máx(RSI, n) − mín(RSI, n))
+    sobre la ventana de `periodo` valores, suavizado %K y %D."""
+    r = pd.Series(rsi(c, periodo))
+    p = int(periodo)
+    minimo = r.rolling(p).min()
+    maximo = r.rolling(p).max()
+    rango = (maximo - minimo).replace(0, np.nan)
+    k = ((r - minimo) / rango).fillna(0.0)
+    k_line = k.rolling(int(suavizado_k)).mean()
+    d_line = k_line.rolling(int(suavizado_d)).mean()
+    return k_line.values, d_line.values
+
+
+# VWAP (referencia TradingView): anclajes de calendario y bandas por
+# desviación estándar del src dentro del anclaje (o porcentaje).
+_ANCLAJES_VWAP = {'D': 'D', 'W': 'W', 'M': 'M', 'T': 'Q', 'A': 'Y'}
+_ETIQUETAS_ANCLAJE = {'D': 'Sesión', 'W': 'Semana', 'M': 'Mes',
+                      'T': 'Trimestre', 'A': 'Año', '10Y': 'Década',
+                      '100Y': 'Siglo'}
+_ANCLAJES_REGLA = list(_ETIQUETAS_ANCLAJE)
+
+
+def _vwap_series(df, anclaje='D', k=1.0, modo='sd'):
+    """VWAP (referencia TradingView) acumulado por anclaje de calendario.
+
+    anclaje: 'D' sesión, 'W' semana, 'M' mes, 'T' trimestre, 'A' año,
+    '10Y' década, '100Y' siglo — el acumulado se resetea en cada borde.
+    modo: 'sd' -> base de banda = desviación estándar POBLACIONAL del src
+    (hlc3) dentro del anclaje (0 en la 1ª vela del anclaje, como TV, así la
+    banda se cierra sobre el VWAP al reiniciar); 'pct' -> base = vwap·0.01.
+    k: multiplicador de la banda.
+
+    Devuelve {'media', 'sd', 'sup', 'inf'} (arrays del largo de df). Sin
+    columna de volumen (o todo 0) el VWAP es NaN (no definido)."""
+    n = len(df)
+    vacio = {'media': np.full(n, np.nan), 'sd': np.full(n, np.nan),
+             'sup': np.full(n, np.nan), 'inf': np.full(n, np.nan)}
+    if 'volume' not in df.columns:
+        return vacio
+    fechas = pd.DatetimeIndex(df['timestamp'])
+    src = (df['high'].values.astype(float)
+           + df['low'].values.astype(float)
+           + df['close'].values.astype(float)) / 3.0
+    vol = df['volume'].fillna(0.0).values.astype(float)
+    if not np.any(vol > 0):
+        return vacio
+
+    if anclaje == '10Y':
+        grupo = (fechas.year // 10 * 10).to_numpy()
+    elif anclaje == '100Y':
+        grupo = (fechas.year // 100 * 100).to_numpy()
+    else:
+        grupo = fechas.tz_localize(None).to_period(_ANCLAJES_VWAP.get(anclaje, 'D'))
+    s = pd.Series(src, index=fechas)
+    v = pd.Series(vol, index=fechas)
+    acum_v = v.groupby(grupo).cumsum()
+    with np.errstate(divide='ignore', invalid='ignore'):
+        media = (s * v).groupby(grupo).cumsum() / acum_v.where(acum_v > 0)
+    media_v = media.values.astype(float)
+    # desviación estándar POBLACIONAL del src dentro del anclaje (sin
+    # ponderar por volumen, como ta.vwap de TradingView): sd² = E[x²]−E[x]²
+    contador = s.groupby(grupo).cumcount() + 1.0
+    media_src = s.groupby(grupo).cumsum() / contador
+    media_src2 = (s ** 2).groupby(grupo).cumsum() / contador
+    var = (media_src2 - media_src ** 2).values.astype(float)
+    sd_v = np.sqrt(np.clip(var, 0.0, None))
+    base = sd_v if modo == 'sd' else media_v * 0.01
+    return {'media': media_v, 'sd': sd_v,
+            'sup': media_v + base * float(k), 'inf': media_v - base * float(k)}
+
+
+def _vwap_serie(df, _periodo=None):
+    """VWAP de sesión (anclaje 'D'), mantenido por compatibilidad."""
+    return _vwap_series(df, 'D')['media']
+
+
+def _macd_series(c, rapido=12, lento=26, senal=9):
+    """MACD (línea, señal, histograma) con EMA (ewm span, adjust=False)."""
+    linea = ema(c, rapido) - ema(c, lento)
+    linea_senal = ema(linea, senal)
+    return linea, linea_senal, linea - linea_senal
+
+
+def _adx_series(h, l, c, periodo=14):
+    p = int(periodo)
+    hs, ls, cs = pd.Series(h), pd.Series(l), pd.Series(c)
+    up = hs.diff()
+    dn = -ls.diff()
+    plus_dm = np.where((up > dn) & (up > 0), up, 0.0)
+    minus_dm = np.where((dn > up) & (dn > 0), dn, 0.0)
+    tr = pd.concat([hs - ls, (hs - cs.shift(1)).abs(),
+                    (ls - cs.shift(1)).abs()], axis=1).max(axis=1)
+    tr_rma = _atr_rma_numba(tr.values, p)
+    plus_rma = _atr_rma_numba(plus_dm, p)
+    minus_rma = _atr_rma_numba(minus_dm, p)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        plus_di = 100.0 * plus_rma / tr_rma
+        minus_di = 100.0 * minus_rma / tr_rma
+    dx = 100.0 * np.abs(plus_di - minus_di) / np.maximum(plus_di + minus_di, 1e-12)
+    # el ADX se siembra con las primeras `periodo` dx validas (dx es valido
+    # desde p-1: los DI necesitan su propia RMA) y luego aplica la recursion
+    adx = np.full(len(dx), np.nan)
+    if len(dx) >= 2 * p - 1:
+        adx[2 * p - 2] = np.nanmean(dx[p - 1:2 * p - 1])
+        for i in range(2 * p - 1, len(dx)):
+            adx[i] = (adx[i - 1] * (p - 1) + dx[i]) / p
+    return adx, plus_di, minus_di
 
 
 def _pivotes_candidatos(h, l, piernas):
@@ -369,6 +670,229 @@ def _gen_cruce_medias(df, p):
     return s
 
 
+def _gen_supertrend(df, p):
+    """Entra en el giro del Supertrend (la tendencia cambia de lado); la
+    salida es el giro contrario. El nivel no se usa para stop: es un sistema
+    de seguimiento, el giro es la salida."""
+    c = df['close'].values
+    n = len(c)
+    h, l = df['high'].values, df['low'].values
+    s = _base_senales(n, h, l, c)
+    _st, tend = _supertrend_serie(h, l, c, int(p['periodo']),
+                                  float(p['multiplicador']))
+    gira_up = _limpiar_nan((tend[:-1] < 0) & (tend[1:] > 0), tend[1:])
+    gira_dn = _limpiar_nan((tend[:-1] > 0) & (tend[1:] < 0), tend[1:])
+    if p['direccion'] in ('Long', 'Ambas'):
+        s['entradas_long'][1:] = gira_up
+        s['salidas_long'][1:] = gira_dn
+    if p['direccion'] in ('Short', 'Ambas'):
+        s['entradas_short'][1:] = gira_dn
+        s['salidas_short'][1:] = gira_up
+    return s
+
+
+def _gen_macd(df, p):
+    """Entra en el cruce de la línea sobre su señal; sale en el cruce
+    contrario (como el cruce de medias, pero con la línea MACD)."""
+    c = df['close'].values
+    n = len(c)
+    s = _base_senales(n, df['high'].values, df['low'].values, c)
+    linea, senal, _hist = _macd_series(c, int(p['rapido']), int(p['lento']),
+                                       int(p['senal']))
+    arriba = _limpiar_nan(_cruza_arriba(linea, senal), linea)
+    abajo = _limpiar_nan(_cruza_abajo(linea, senal), linea)
+    if p['direccion'] in ('Long', 'Ambas'):
+        s['entradas_long'] = arriba
+        s['salidas_long'] = abajo
+    if p['direccion'] in ('Short', 'Ambas'):
+        s['entradas_short'] = abajo
+        s['salidas_short'] = arriba
+    return s
+
+
+def _gen_adx(df, p):
+    """Cruces de +DI/−DI de Wilder, solo cuando la fuerza del ADX supera el
+    umbral: un cruce en mercado lateral (ADX bajo) no entra. La salida es el
+    cruce contrario (con o sin fuerza: ya dentro, el giro de DI manda)."""
+    c = df['close'].values
+    n = len(c)
+    h, l = df['high'].values, df['low'].values
+    s = _base_senales(n, h, l, c)
+    adx, pdi, mdi = _adx_series(h, l, c, int(p['periodo']))
+    fuerza = _limpiar_nan(adx >= float(p['umbral_fuerza']), adx)
+    cruza_up = _limpiar_nan(_cruza_arriba(pdi, mdi), pdi) & fuerza
+    cruza_dn = _limpiar_nan(_cruza_abajo(pdi, mdi), pdi) & fuerza
+    if p['direccion'] in ('Long', 'Ambas'):
+        s['entradas_long'] = cruza_up
+        s['salidas_long'] = cruza_dn
+    if p['direccion'] in ('Short', 'Ambas'):
+        s['entradas_short'] = cruza_dn
+        s['salidas_short'] = cruza_up
+    return s
+
+
+def _gen_aroon(df, p):
+    """Cruce de Aroon Up/Down con fuerza mínima: entra cuando el lado
+    alcista/bajista cruza al contrario y está por encima del umbral (70
+    típico); la salida es el cruce contrario."""
+    c = df['close'].values
+    n = len(c)
+    h, l = df['high'].values, df['low'].values
+    s = _base_senales(n, h, l, c)
+    up, dn = _aroon_series(h, l, int(p['periodo']))
+    umbral = float(p['umbral'])
+    cruza_up = _limpiar_nan(_cruza_arriba(up, dn), up, dn)
+    cruza_dn = _limpiar_nan(_cruza_abajo(up, dn), up, dn)
+    fuerza_up = _limpiar_nan(up > umbral, up)
+    fuerza_dn = _limpiar_nan(dn > umbral, dn)
+    if p['direccion'] in ('Long', 'Ambas'):
+        s['entradas_long'] = cruza_up & fuerza_up
+        s['salidas_long'] = cruza_dn
+    if p['direccion'] in ('Short', 'Ambas'):
+        s['entradas_short'] = cruza_dn & fuerza_dn
+        s['salidas_short'] = cruza_up
+    return s
+
+
+def _gen_cmo(df, p):
+    """Reversión a la media con el Chande Momentum Oscillator: entra cuando
+    el CMO entra en la zona extrema (bajo sobreventa / sobre el sobrecompra)
+    y sale al volver a cruzar 0."""
+    c = df['close'].values
+    n = len(c)
+    s = _base_senales(n, df['high'].values, df['low'].values, c)
+    cmo = _cmo_serie(c, int(p['periodo']))
+    sv = float(p['sobreventa'])
+    sc = float(p['sobrecompra'])
+    if p['direccion'] in ('Long', 'Ambas'):
+        s['entradas_long'] = _limpiar_nan(cmo < sv, cmo)
+        s['salidas_long'] = _limpiar_nan(cmo > 0.0, cmo)
+    if p['direccion'] in ('Short', 'Ambas'):
+        s['entradas_short'] = _limpiar_nan(cmo > sc, cmo)
+        s['salidas_short'] = _limpiar_nan(cmo < 0.0, cmo)
+    return s
+
+
+def _gen_trix(df, p):
+    """TRIX (cambio % de la EMA triple): entra cuando cruza el cero, sale en
+    el cruce contrario. Mismo criterio de señal que el MACD con línea en 0."""
+    c = df['close'].values
+    n = len(c)
+    s = _base_senales(n, df['high'].values, df['low'].values, c)
+    trix = _trix_serie(c, int(p['periodo']))
+    cero = np.zeros(n)
+    cruza_up = _limpiar_nan(_cruza_arriba(trix, cero), trix)
+    cruza_dn = _limpiar_nan(_cruza_abajo(trix, cero), trix)
+    if p['direccion'] in ('Long', 'Ambas'):
+        s['entradas_long'] = cruza_up
+        s['salidas_long'] = cruza_dn
+    if p['direccion'] in ('Short', 'Ambas'):
+        s['entradas_short'] = cruza_dn
+        s['salidas_short'] = cruza_up
+    return s
+
+
+def _gen_stochrsi(df, p):
+    """StochRSI (estocástico sobre el RSI): entra en el cruce %K/%D
+    CONFIRMADO dentro de la zona extrema; sale al recuperar la media (0.5)."""
+    c = df['close'].values
+    n = len(c)
+    s = _base_senales(n, df['high'].values, df['low'].values, c)
+    k, d = _stochrsi_series(c, int(p['periodo']))
+    cruza_up = _limpiar_nan(_cruza_arriba(k, d), k, d)
+    cruza_dn = _limpiar_nan(_cruza_abajo(k, d), k, d)
+    sv = float(p['sobreventa'])
+    sc = float(p['sobrecompra'])
+    if p['direccion'] in ('Long', 'Ambas'):
+        s['entradas_long'] = cruza_up & _limpiar_nan(k < sv, k)
+        s['salidas_long'] = _limpiar_nan(k > 0.5, k)
+    if p['direccion'] in ('Short', 'Ambas'):
+        s['entradas_short'] = cruza_dn & _limpiar_nan(k > sc, k)
+        s['salidas_short'] = _limpiar_nan(k < 0.5, k)
+    return s
+
+
+def _gen_ichimoku(df, p):
+    """Cruce Tenkan/Kijun de Ichimoku: entra cuando la línea rápida cruza a
+    la lenta; sale en el cruce contrario. Las Senkou se usan ALINEADAS (sin
+    el desplazamiento +26 del gráfico, que sería lookahead)."""
+    c = df['close'].values
+    n = len(c)
+    h, l = df['high'].values, df['low'].values
+    s = _base_senales(n, h, l, c)
+    tenkan, kijun, _sa, _sb, _chikou = _ichimoku_series(
+        h, l, c, int(p['tenkan']), int(p['kijun']), int(p['senkou']))
+    arriba = _limpiar_nan(_cruza_arriba(tenkan, kijun), tenkan, kijun)
+    abajo = _limpiar_nan(_cruza_abajo(tenkan, kijun), tenkan, kijun)
+    if p['direccion'] in ('Long', 'Ambas'):
+        s['entradas_long'] = arriba
+        s['salidas_long'] = abajo
+    if p['direccion'] in ('Short', 'Ambas'):
+        s['entradas_short'] = abajo
+        s['salidas_short'] = arriba
+    return s
+
+
+def _gen_keltner(df, p):
+    """Reversión con bandas de Keltner: entra fuera de banda, sale a la
+    media (EMA)."""
+    c = df['close'].values
+    n = len(c)
+    h, l = df['high'].values, df['low'].values
+    s = _base_senales(n, h, l, c)
+    media, sup, inf = _keltner_series(c, h, l, int(p['periodo']),
+                                      float(p['mult']))
+    if p['direccion'] in ('Long', 'Ambas'):
+        s['entradas_long'] = _limpiar_nan(c < inf, inf)
+        s['salidas_long'] = _limpiar_nan(c > media, media)
+    if p['direccion'] in ('Short', 'Ambas'):
+        s['entradas_short'] = _limpiar_nan(c > sup, sup)
+        s['salidas_short'] = _limpiar_nan(c < media, media)
+    return s
+
+
+def _gen_ttm(df, p):
+    """TTM Squeeze (breakout): entra cuando el momentum cruza 0 FUERA del
+    squeeze (la compresión de volatilidad se libera); sale en el cruce
+    contrario."""
+    c = df['close'].values
+    n = len(c)
+    h, l = df['high'].values, df['low'].values
+    s = _base_senales(n, h, l, c)
+    sq, mom = _ttm_squeeze_series(c, h, l, int(p['periodo']),
+                                  float(p['mult_bb']), float(p['mult_kc']))
+    liberado = _limpiar_nan(~np.asarray(sq, dtype=bool), mom)
+    cero = np.zeros(n)
+    cruza_up = _limpiar_nan(_cruza_arriba(mom, cero), mom)
+    cruza_dn = _limpiar_nan(_cruza_abajo(mom, cero), mom)
+    if p['direccion'] in ('Long', 'Ambas'):
+        s['entradas_long'] = cruza_up & liberado
+        s['salidas_long'] = cruza_dn
+    if p['direccion'] in ('Short', 'Ambas'):
+        s['entradas_short'] = cruza_dn & liberado
+        s['salidas_short'] = cruza_up
+    return s
+
+
+def _gen_vwap(df, p):
+    """VWAP reversión (referencia TradingView): entra cuando el cierre toca
+    la banda inferior/superior (kσ) del VWAP del anclaje elegido; sale al
+    volver a la media (el propio VWAP). Requiere volumen real en el CSV."""
+    c = df['close'].values
+    n = len(c)
+    h, l = df['high'].values, df['low'].values
+    s = _base_senales(n, h, l, c)
+    r = _vwap_series(df, p['anclaje'], float(p['k']), p['modo'])
+    media, inf, sup = r['media'], r['inf'], r['sup']
+    if p['direccion'] in ('Long', 'Ambas'):
+        s['entradas_long'] = _limpiar_nan(c <= inf, inf, media)
+        s['salidas_long'] = _limpiar_nan(c >= media, media)
+    if p['direccion'] in ('Short', 'Ambas'):
+        s['entradas_short'] = _limpiar_nan(c >= sup, sup, media)
+        s['salidas_short'] = _limpiar_nan(c <= media, media)
+    return s
+
+
 def _gen_bollinger(df, p):
     c = df['close'].values
     n = len(c)
@@ -557,7 +1081,16 @@ def _gen_patrones(df, p):
 
 _INDICADORES_REGLA = ['close', 'open', 'high', 'low', 'SMA', 'EMA', 'RSI',
                       'ATR', 'BB_sup', 'BB_inf', 'BB_media', 'KAMA', 'ER', 'SAR',
-                      'DONCHIAN_SUP', 'DONCHIAN_INF', 'ZIGZAG']
+                      'DONCHIAN_SUP', 'DONCHIAN_INF', 'ZIGZAG',
+                      'SUPERTREND', 'MACD_LINEA', 'MACD_SENAL', 'MACD_HIST',
+                      'ADX', 'DI_PLUS', 'DI_MINUS',
+                      'AROON_UP', 'AROON_DN', 'CMO', 'OBV', 'TRIX', 'STOCHRSI',
+                      'VWAP',
+                      'ICHIMOKU_TENKAN', 'ICHIMOKU_KIJUN', 'ICHIMOKU_SENKOU_A',
+                      'ICHIMOKU_SENKOU_B', 'ICHIMOKU_CHIKOU',
+                      'KELTNER_SUP', 'KELTNER_INF', 'KELTNER_MEDIA',
+                      'TTM_SQUEEZE', 'TTM_MOMENTUM',
+                      'VWAP_MEDIA', 'VWAP_SD', 'VWAP_SUP', 'VWAP_INF']
 _OPERADORES_REGLA = ['>', '<', 'cruza arriba', 'cruza abajo']
 
 # defaults fijos de KAMA cuando se usa desde el constructor de reglas: la
@@ -620,6 +1153,65 @@ def _serie_indicador(df, spec):
             df['high'].values, df['low'].values,
             _SAR_AF_INICIAL_REGLA, _SAR_AF_PASO_REGLA, _SAR_AF_MAX_REGLA)
         return sar
+    if tipo == 'SUPERTREND':
+        st, _tend = _supertrend_serie(
+            df['high'].values, df['low'].values, c, periodo, 3.0)
+        return st
+    if tipo == 'AROON_UP':
+        up, _dn = _aroon_series(df['high'].values, df['low'].values, periodo)
+        return up
+    if tipo == 'AROON_DN':
+        _up, dn = _aroon_series(df['high'].values, df['low'].values, periodo)
+        return dn
+    if tipo == 'CMO':
+        return _cmo_serie(c, periodo)
+    if tipo == 'OBV':
+        vol = df['volume'].values if 'volume' in df.columns \
+            else np.zeros(len(c))
+        return _obv_serie(c, vol)
+    if tipo == 'TRIX':
+        return _trix_serie(c, periodo)
+    if tipo == 'STOCHRSI':
+        k, _d = _stochrsi_series(c, periodo)
+        return k
+    if tipo == 'VWAP':
+        return _vwap_serie(df, periodo)
+    if tipo in ('MACD_LINEA', 'MACD_SENAL', 'MACD_HIST'):
+        # el editor solo ofrece un «Periodo»: el de MACD se fija en los
+        # clásicos 12/26/9 (para variarlos está la plantilla MACD)
+        linea, senal, hist = _macd_series(c, 12, 26, 9)
+        return {'MACD_LINEA': linea, 'MACD_SENAL': senal,
+                'MACD_HIST': hist}[tipo]
+    if tipo in ('ADX', 'DI_PLUS', 'DI_MINUS'):
+        adx, pdi, mdi = _adx_series(
+            df['high'].values, df['low'].values, c, periodo)
+        return {'ADX': adx, 'DI_PLUS': pdi, 'DI_MINUS': mdi}[tipo]
+    if tipo in ('ICHIMOKU_TENKAN', 'ICHIMOKU_KIJUN', 'ICHIMOKU_SENKOU_A',
+                'ICHIMOKU_SENKOU_B', 'ICHIMOKU_CHIKOU'):
+        # en el editor los tres periodos quedan fijos (9/26/52), igual que
+        # los 12/26/9 del MACD; la plantilla Ichimoku los expone todos
+        tenkan_v, kijun_v, sa, sb, chikou = _ichimoku_series(
+            df['high'].values, df['low'].values, c, 9, 26, 52)
+        return {'ICHIMOKU_TENKAN': tenkan_v, 'ICHIMOKU_KIJUN': kijun_v,
+                'ICHIMOKU_SENKOU_A': sa, 'ICHIMOKU_SENKOU_B': sb,
+                'ICHIMOKU_CHIKOU': chikou}[tipo]
+    if tipo in ('KELTNER_SUP', 'KELTNER_INF', 'KELTNER_MEDIA'):
+        # multiplicador fijo ×2 en el editor; la plantilla lo varía
+        media_k, sup_k, inf_k = _keltner_series(
+            c, df['high'].values, df['low'].values, periodo, 2.0)
+        return {'KELTNER_MEDIA': media_k, 'KELTNER_SUP': sup_k,
+                'KELTNER_INF': inf_k}[tipo]
+    if tipo in ('TTM_SQUEEZE', 'TTM_MOMENTUM'):
+        sq, mom = _ttm_squeeze_series(
+            c, df['high'].values, df['low'].values, periodo, 2.0, 1.5)
+        if tipo == 'TTM_SQUEEZE':
+            return sq.astype(np.float64)
+        return mom
+    if tipo in ('VWAP_MEDIA', 'VWAP_SD', 'VWAP_SUP', 'VWAP_INF'):
+        r = _vwap_series(df, spec.get('anclaje', 'D'),
+                         float(spec.get('k', 1.0)), spec.get('modo', 'sd'))
+        return {'VWAP_MEDIA': r['media'], 'VWAP_SD': r['sd'],
+                'VWAP_SUP': r['sup'], 'VWAP_INF': r['inf']}[tipo]
     raise ValueError(f"Indicador desconocido: {tipo}")
 
 
@@ -713,6 +1305,28 @@ def _desc_spec(spec):
         return 'SAR'   # sus tres parámetros son fijos aquí, no hay periodo que mostrar
     if tipo == 'ZIGZAG':
         return f"ZIGZAG(piernas={spec.get('periodo', _ZIGZAG_PIERNAS_REGLA)})"
+    if tipo == 'SUPERTREND':
+        return f"SUPERTREND({spec.get('periodo', 10)},×3)"
+    if tipo in ('MACD_LINEA', 'MACD_SENAL', 'MACD_HIST'):
+        return f"{tipo}(12,26,9)"   # parámetros fijos en el editor
+    if tipo in ('OBV', 'VWAP'):
+        return tipo   # sin periodo configurable en el editor
+    if tipo in ('ICHIMOKU_TENKAN', 'ICHIMOKU_KIJUN', 'ICHIMOKU_SENKOU_A',
+                'ICHIMOKU_SENKOU_B', 'ICHIMOKU_CHIKOU'):
+        return f"{tipo}(9,26,52)"   # parámetros fijos en el editor
+    if tipo in ('KELTNER_SUP', 'KELTNER_INF', 'KELTNER_MEDIA'):
+        return f"{tipo}({spec.get('periodo', 20)},×2)"
+    if tipo in ('TTM_SQUEEZE', 'TTM_MOMENTUM'):
+        return f"{tipo}({spec.get('periodo', 20)},×2,×1.5)"
+    if tipo in ('VWAP_MEDIA', 'VWAP_SD', 'VWAP_SUP', 'VWAP_INF'):
+        anclaje = _ETIQUETAS_ANCLAJE.get(spec.get('anclaje', 'D'),
+                                         spec.get('anclaje', 'D'))
+        modo = 'SD' if spec.get('modo', 'sd') == 'sd' else '%'
+        if tipo == 'VWAP_MEDIA':
+            return f"VWAP({anclaje})"
+        if tipo == 'VWAP_SD':
+            return f"VWAP σ({anclaje})"
+        return f"VWAP {tipo.split('_')[-1]}({anclaje}, {spec.get('k', 1.0):g}σ {modo})"
     return f"{tipo}({spec.get('periodo', 14)})"
 
 
@@ -854,6 +1468,164 @@ def _desc_sar(p):
     partes.append("(el nivel de giro acelera cuanto más avanza la tendencia; "
                   "sin stop ATR por defecto, igual criterio que Cruce de medias: "
                   "el propio giro ya es la salida)")
+    return "\n".join(partes)
+
+
+def _desc_supertrend(p):
+    firma = (f"Supertrend(ATR {p['periodo']} × {p['multiplicador']:g})")
+    partes = []
+    if p['direccion'] in ('Long', 'Ambas'):
+        partes.append(f"Entrada Long: {firma} gira a alcista (el precio cierra "
+                      f"por encima de la envolvente bajista) · Salida Long: gira "
+                      f"a bajista")
+    if p['direccion'] in ('Short', 'Ambas'):
+        partes.append(f"Entrada Short: {firma} gira a bajista (el precio cierra "
+                      f"por debajo de la envolvente alcista) · Salida Short: "
+                      f"gira a alcista")
+    partes.append("(sin stop ATR por defecto, igual criterio que Cruce de "
+                  "medias/SAR: el propio giro ya es la salida)")
+    return "\n".join(partes)
+
+
+def _desc_macd(p):
+    firma = f"MACD({p['rapido']},{p['lento']},{p['senal']})"
+    partes = []
+    if p['direccion'] in ('Long', 'Ambas'):
+        partes.append(f"Entrada Long: la línea {firma} cruza ARRIBA su señal · "
+                      f"Salida Long: cruza ABAJO")
+    if p['direccion'] in ('Short', 'Ambas'):
+        partes.append(f"Entrada Short: la línea {firma} cruza ABAJO su señal · "
+                      f"Salida Short: cruza ARRIBA")
+    partes.append("(el cruce de la señal actúa como la media lenta de un cruce "
+                  "de medias: sin stop ATR por defecto)")
+    return "\n".join(partes)
+
+
+def _desc_adx(p):
+    firma = f"ADX({p['periodo']})"
+    partes = []
+    if p['direccion'] in ('Long', 'Ambas'):
+        partes.append(f"Entrada Long: +DI cruza ARRIBA −DI con {firma} ≥ "
+                      f"{p['umbral_fuerza']:g} · Salida Long: +DI cruza ABAJO −DI")
+    if p['direccion'] in ('Short', 'Ambas'):
+        partes.append(f"Entrada Short: −DI cruza ARRIBA +DI con {firma} ≥ "
+                      f"{p['umbral_fuerza']:g} · Salida Short: −DI cruza ABAJO +DI")
+    partes.append("(el umbral de ADX solo se exige para ENTRAR: un cruce de DI "
+                  "con el mercado lateral no abre posición)")
+    return "\n".join(partes)
+
+
+def _desc_aroon(p):
+    firma = f"Aroon({p['periodo']})"
+    partes = []
+    if p['direccion'] in ('Long', 'Ambas'):
+        partes.append(f"Entrada Long: Aroon Up cruza ARRIBA Aroon Down con "
+                      f"{firma} Up > {p['umbral']:g} · Salida Long: cruce contrario")
+    if p['direccion'] in ('Short', 'Ambas'):
+        partes.append(f"Entrada Short: Aroon Down cruza ARRIBA Aroon Up con "
+                      f"{firma} Down > {p['umbral']:g} · Salida Short: cruce "
+                      f"contrario")
+    partes.append("(el umbral solo se exige para ENTRAR: el cruce contrario "
+                  "cierra aunque la fuerza haya caído)")
+    return "\n".join(partes)
+
+
+def _desc_cmo(p):
+    firma = f"CMO({p['periodo']})"
+    partes = []
+    if p['direccion'] in ('Long', 'Ambas'):
+        partes.append(f"Entrada Long: {firma} < {p['sobreventa']:g} "
+                      f"(sobreventa) · Salida Long: {firma} > 0")
+    if p['direccion'] in ('Short', 'Ambas'):
+        partes.append(f"Entrada Short: {firma} > {p['sobrecompra']:g} "
+                      f"(sobrecompra) · Salida Short: {firma} < 0")
+    partes.append("(misma lógica de reversión que la plantilla RSI, con el "
+                  "CMO en lugar del RSI)")
+    return "\n".join(partes)
+
+
+def _desc_trix(p):
+    firma = f"TRIX({p['periodo']})"
+    partes = []
+    if p['direccion'] in ('Long', 'Ambas'):
+        partes.append(f"Entrada Long: {firma} cruza ARRIBA el cero · "
+                      f"Salida Long: cruza ABAJO")
+    if p['direccion'] in ('Short', 'Ambas'):
+        partes.append(f"Entrada Short: {firma} cruza ABAJO el cero · "
+                      f"Salida Short: cruza ARRIBA")
+    partes.append("(el cruce del cero actúa como la señal de un MACD sin "
+                  "línea de señal: sin stop ATR por defecto)")
+    return "\n".join(partes)
+
+
+def _desc_stochrsi(p):
+    firma = f"StochRSI({p['periodo']})"
+    partes = []
+    if p['direccion'] in ('Long', 'Ambas'):
+        partes.append(f"Entrada Long: %K cruza ARRIBA %D con %K < "
+                      f"{p['sobreventa']:g} · Salida Long: %K > 0.5")
+    if p['direccion'] in ('Short', 'Ambas'):
+        partes.append(f"Entrada Short: %K cruza ABAJO %D con %K > "
+                      f"{p['sobrecompra']:g} · Salida Short: %K < 0.5")
+    partes.append("(misma lógica que la plantilla Stochastic, con el RSI "
+                  "como fuente del estocástico)")
+    return "\n".join(partes)
+
+
+def _desc_ichimoku(p):
+    firma = f"Ichimoku(T {p['tenkan']}, K {p['kijun']}, S {p['senkou']})"
+    partes = []
+    if p['direccion'] in ('Long', 'Ambas'):
+        partes.append(f"Entrada Long: Tenkan cruza ARRIBA Kijun · "
+                      f"Salida Long: cruce contrario")
+    if p['direccion'] in ('Short', 'Ambas'):
+        partes.append(f"Entrada Short: Tenkan cruza ABAJO Kijun · "
+                      f"Salida Short: cruce contrario")
+    partes.append("(las Senkou se usan ALINEADAS, sin el desplazamiento +26 "
+                  "del gráfico: ese desplazamiento miraría al futuro)")
+    return "\n".join(partes)
+
+
+def _desc_keltner(p):
+    firma = f"Keltner({p['periodo']}, ×{p['mult']:g})"
+    partes = []
+    if p['direccion'] in ('Long', 'Ambas'):
+        partes.append(f"Entrada Long: cierre < banda inferior {firma} · "
+                      f"Salida Long: cierre > media (EMA)")
+    if p['direccion'] in ('Short', 'Ambas'):
+        partes.append(f"Entrada Short: cierre > banda superior {firma} · "
+                      f"Salida Short: cierre < media (EMA)")
+    partes.append("(misma lógica de reversión que la plantilla Bollinger + "
+                  "ATR, con las bandas ancladas a la EMA)")
+    return "\n".join(partes)
+
+
+def _desc_ttm(p):
+    firma = f"TTM({p['periodo']}, BB ×{p['mult_bb']:g}, KC ×{p['mult_kc']:g})"
+    partes = []
+    if p['direccion'] in ('Long', 'Ambas'):
+        partes.append(f"Entrada Long: {firma} sale del squeeze con momentum "
+                      f"cruza ARRIBA 0 · Salida Long: cruza ABAJO")
+    if p['direccion'] in ('Short', 'Ambas'):
+        partes.append(f"Entrada Short: {firma} sale del squeeze con momentum "
+                      f"cruza ABAJO 0 · Salida Short: cruza ARRIBA")
+    partes.append("(el squeeze = Bollinger dentro de Keltner: la liberación "
+                  "suele anticipar un movimiento direccional)")
+    return "\n".join(partes)
+
+
+def _desc_vwap(p):
+    firma = (f"VWAP({_ETIQUETAS_ANCLAJE.get(p['anclaje'], p['anclaje'])}, "
+             f"{p['k']:g}{'σ' if p['modo'] == 'sd' else '%'})")
+    partes = []
+    if p['direccion'] in ('Long', 'Ambas'):
+        partes.append(f"Entrada Long: cierre ≤ banda inferior {firma} "
+                      f"(sobreventa) · Salida Long: cierre ≥ el VWAP (media)")
+    if p['direccion'] in ('Short', 'Ambas'):
+        partes.append(f"Entrada Short: cierre ≥ banda superior {firma} "
+                      f"(sobrecompra) · Salida Short: cierre ≤ el VWAP (media)")
+    partes.append("(reversión a la media del VWAP; requiere volumen real en "
+                  "el CSV — con volumen 0 el VWAP no se define)")
     return "\n".join(partes)
 
 
@@ -1061,6 +1833,190 @@ ESTRATEGIAS = {
              'defecto': 5, 'min': 1, 'max': 100},
         ],
     },
+    'Supertrend': {
+        'color': '#ab47bc',
+        'categoria': 'Direccional',
+        'desc_corta': 'Giros del Supertrend (envolvente ATR)',
+        'generar': _gen_supertrend,
+        'descripcion': _desc_supertrend,
+        # el giro ES la salida, igual razón que Cruce de medias/KAMA/SAR
+        'defaults_setup': {'stop_atr': 0.0},
+        'params': [
+            {'clave': 'periodo', 'etiqueta': 'Periodo ATR', 'tipo': 'int',
+             'defecto': 10, 'min': 2, 'max': 100},
+            {'clave': 'multiplicador', 'etiqueta': 'Multiplicador ATR',
+             'tipo': 'float', 'defecto': 3.0, 'min': 0.5, 'max': 5.0},
+            {'clave': 'direccion', 'etiqueta': 'Dirección', 'tipo': 'choice',
+             'opciones': _OPCIONES_DIRECCION, 'defecto': 'Ambas'},
+        ],
+    },
+    'MACD': {
+        'color': '#ff7043',
+        'categoria': 'Direccional',
+        'desc_corta': 'Cruces de la línea MACD sobre su señal',
+        'generar': _gen_macd,
+        'descripcion': _desc_macd,
+        'defaults_setup': {'stop_atr': 0.0},
+        'params': [
+            {'clave': 'rapido', 'etiqueta': 'EMA rápida', 'tipo': 'int',
+             'defecto': 12, 'min': 2, 'max': 100},
+            {'clave': 'lento', 'etiqueta': 'EMA lenta', 'tipo': 'int',
+             'defecto': 26, 'min': 3, 'max': 200},
+            {'clave': 'senal', 'etiqueta': 'EMA señal', 'tipo': 'int',
+             'defecto': 9, 'min': 2, 'max': 50},
+            {'clave': 'direccion', 'etiqueta': 'Dirección', 'tipo': 'choice',
+             'opciones': _OPCIONES_DIRECCION, 'defecto': 'Ambas'},
+        ],
+    },
+    'ADX (fuerza de tendencia)': {
+        'color': '#5c6bc0',
+        'categoria': 'Direccional',
+        'desc_corta': 'Cruces +DI/−DI con fuerza ADX mínima',
+        'generar': _gen_adx,
+        'descripcion': _desc_adx,
+        'defaults_setup': {'stop_atr': 0.0},
+        'params': [
+            {'clave': 'periodo', 'etiqueta': 'Periodo', 'tipo': 'int',
+             'defecto': 14, 'min': 2, 'max': 100},
+            {'clave': 'umbral_fuerza', 'etiqueta': 'ADX mínimo', 'tipo': 'float',
+             'defecto': 20.0, 'min': 5.0, 'max': 60.0},
+            {'clave': 'direccion', 'etiqueta': 'Dirección', 'tipo': 'choice',
+             'opciones': _OPCIONES_DIRECCION, 'defecto': 'Ambas'},
+        ],
+    },
+    'Aroon': {
+        'color': '#1abc9c',
+        'categoria': 'Direccional',
+        'desc_corta': 'Cruce Aroon Up/Down con fuerza mínima',
+        'generar': _gen_aroon,
+        'descripcion': _desc_aroon,
+        'defaults_setup': {'stop_atr': 0.0},
+        'params': [
+            {'clave': 'periodo', 'etiqueta': 'Periodo', 'tipo': 'int',
+             'defecto': 25, 'min': 2, 'max': 100},
+            {'clave': 'umbral', 'etiqueta': 'Umbral de fuerza', 'tipo': 'float',
+             'defecto': 70.0, 'min': 50.0, 'max': 100.0},
+            {'clave': 'direccion', 'etiqueta': 'Dirección', 'tipo': 'choice',
+             'opciones': _OPCIONES_DIRECCION, 'defecto': 'Ambas'},
+        ],
+    },
+    'CMO': {
+        'color': '#ffa726',
+        'categoria': 'Mean Reversion',
+        'desc_corta': 'Sobrecompra / sobreventa con CMO',
+        'generar': _gen_cmo,
+        'descripcion': _desc_cmo,
+        'params': [
+            {'clave': 'periodo', 'etiqueta': 'Periodo CMO', 'tipo': 'int',
+             'defecto': 14, 'min': 2, 'max': 100},
+            {'clave': 'sobreventa', 'etiqueta': 'Umbral sobreventa',
+             'tipo': 'float', 'defecto': -50.0, 'min': -90.0, 'max': -5.0},
+            {'clave': 'sobrecompra', 'etiqueta': 'Umbral sobrecompra',
+             'tipo': 'float', 'defecto': 50.0, 'min': 5.0, 'max': 90.0},
+            {'clave': 'direccion', 'etiqueta': 'Dirección', 'tipo': 'choice',
+             'opciones': _OPCIONES_DIRECCION, 'defecto': 'Ambas'},
+        ],
+    },
+    'TRIX': {
+        'color': '#ff7043',
+        'categoria': 'Direccional',
+        'desc_corta': 'Cruces del TRIX con el cero',
+        'generar': _gen_trix,
+        'descripcion': _desc_trix,
+        'defaults_setup': {'stop_atr': 0.0},
+        'params': [
+            {'clave': 'periodo', 'etiqueta': 'Periodo', 'tipo': 'int',
+             'defecto': 15, 'min': 2, 'max': 100},
+            {'clave': 'direccion', 'etiqueta': 'Dirección', 'tipo': 'choice',
+             'opciones': _OPCIONES_DIRECCION, 'defecto': 'Ambas'},
+        ],
+    },
+    'StochRSI': {
+        'color': '#fd79a8',
+        'categoria': 'Mean Reversion',
+        'desc_corta': 'Cruce %K/%D del estocástico sobre el RSI',
+        'generar': _gen_stochrsi,
+        'descripcion': _desc_stochrsi,
+        'params': [
+            {'clave': 'periodo', 'etiqueta': 'Periodo RSI', 'tipo': 'int',
+             'defecto': 14, 'min': 2, 'max': 100},
+            {'clave': 'sobreventa', 'etiqueta': 'Umbral sobreventa',
+             'tipo': 'float', 'defecto': 0.2, 'min': 0.05, 'max': 0.45},
+            {'clave': 'sobrecompra', 'etiqueta': 'Umbral sobrecompra',
+             'tipo': 'float', 'defecto': 0.8, 'min': 0.55, 'max': 0.95},
+            {'clave': 'direccion', 'etiqueta': 'Dirección', 'tipo': 'choice',
+             'opciones': _OPCIONES_DIRECCION, 'defecto': 'Ambas'},
+        ],
+    },
+    'Ichimoku': {
+        'color': '#00bcd4',
+        'categoria': 'Direccional',
+        'desc_corta': 'Cruce Tenkan/Kijun de Ichimoku',
+        'generar': _gen_ichimoku,
+        'descripcion': _desc_ichimoku,
+        'defaults_setup': {'stop_atr': 0.0},
+        'params': [
+            {'clave': 'tenkan', 'etiqueta': 'Tenkan (rápida)', 'tipo': 'int',
+             'defecto': 9, 'min': 2, 'max': 50},
+            {'clave': 'kijun', 'etiqueta': 'Kijun (lenta)', 'tipo': 'int',
+             'defecto': 26, 'min': 2, 'max': 100},
+            {'clave': 'senkou', 'etiqueta': 'Senkou B (periodo)', 'tipo': 'int',
+             'defecto': 52, 'min': 10, 'max': 200},
+            {'clave': 'direccion', 'etiqueta': 'Dirección', 'tipo': 'choice',
+             'opciones': _OPCIONES_DIRECCION, 'defecto': 'Ambas'},
+        ],
+    },
+    'Keltner': {
+        'color': '#26a69a',
+        'categoria': 'Mean Reversion',
+        'desc_corta': 'Reversión con bandas de Keltner',
+        'generar': _gen_keltner,
+        'descripcion': _desc_keltner,
+        'params': [
+            {'clave': 'periodo', 'etiqueta': 'Periodo', 'tipo': 'int',
+             'defecto': 20, 'min': 5, 'max': 200},
+            {'clave': 'mult', 'etiqueta': 'Multiplicador ATR', 'tipo': 'float',
+             'defecto': 2.0, 'min': 0.5, 'max': 4.0},
+            {'clave': 'direccion', 'etiqueta': 'Dirección', 'tipo': 'choice',
+             'opciones': _OPCIONES_DIRECCION, 'defecto': 'Ambas'},
+        ],
+    },
+    'TTM Squeeze': {
+        'color': '#ffb300',
+        'categoria': 'Direccional',
+        'desc_corta': 'Breakout al liberarse el squeeze de volatilidad',
+        'generar': _gen_ttm,
+        'descripcion': _desc_ttm,
+        'defaults_setup': {'stop_atr': 0.0},
+        'params': [
+            {'clave': 'periodo', 'etiqueta': 'Periodo', 'tipo': 'int',
+             'defecto': 20, 'min': 5, 'max': 50},
+            {'clave': 'mult_bb', 'etiqueta': 'Bollinger ×', 'tipo': 'float',
+             'defecto': 2.0, 'min': 1.5, 'max': 3.0},
+            {'clave': 'mult_kc', 'etiqueta': 'Keltner ×', 'tipo': 'float',
+             'defecto': 1.5, 'min': 1.0, 'max': 3.0},
+            {'clave': 'direccion', 'etiqueta': 'Dirección', 'tipo': 'choice',
+             'opciones': _OPCIONES_DIRECCION, 'defecto': 'Ambas'},
+        ],
+    },
+    'VWAP': {
+        'color': '#2962ff',
+        'categoria': 'Mean Reversion',
+        'desc_corta': 'Reversión a la media del VWAP con bandas',
+        'generar': _gen_vwap,
+        'descripcion': _desc_vwap,
+        'params': [
+            {'clave': 'anclaje', 'etiqueta': 'Anclaje', 'tipo': 'choice',
+             'opciones': list(_ETIQUETAS_ANCLAJE),
+             'defecto': 'W'},
+            {'clave': 'modo', 'etiqueta': 'Modo de banda', 'tipo': 'choice',
+             'opciones': ['sd', 'pct'], 'defecto': 'sd'},
+            {'clave': 'k', 'etiqueta': 'Desviación (k)', 'tipo': 'float',
+             'defecto': 2.0, 'min': 0.5, 'max': 5.0},
+            {'clave': 'direccion', 'etiqueta': 'Dirección', 'tipo': 'choice',
+             'opciones': _OPCIONES_DIRECCION, 'defecto': 'Ambas'},
+        ],
+    },
     'Custom (reglas)': {
         'color': '#78909c',
         'categoria': None,
@@ -1148,6 +2104,12 @@ def _filtros_por_defecto():
         # tipo: 'ninguna'|'overnight'|'londres'|'ny'|'personalizada' (horas UTC en 'personalizada')
         'condiciones_entrada': [],   # lista de {'izq':spec,'op':...,'der':spec}; AND; [] = sin restricción
         'condiciones_salida': [],    # idem, pero se aplica sobre la señal de SALIDA del setup
+        'tf_superior': {
+            'indicador': 'ninguno',  # 'ninguno'|'SMA'|'EMA'|'SUPERTREND'
+            'tf': '1h',              # etiqueta de TF_LABELS mayor que la vela base
+            'periodo': 200,
+            'relacion': 'ambos',     # 'long'|'short'|'ambos'
+        },
         'noticias': {
             'activo': False,
             'minutos_antes': 30,
@@ -1191,6 +2153,100 @@ def _mascara_evitar_ventanas(ts_velas, ts_eventos, antes_s, despues_s):
         if fin > ini:
             admitida[ini:fin] = False
     return admitida
+
+
+# ══════════════ filtro de tendencia de TF superior (multi-timeframe) ══════════════
+
+_REGLA_RESAMPLE_TF = {
+    '30s': '30s', '1m': '1min', '3m': '3min', '5m': '5min', '15m': '15min',
+    '30m': '30min', '1h': '1h', '2h': '2h', '4h': '4h', '1d': '1D',
+}
+INDICADORES_TF_SUPERIOR = ('SMA', 'EMA', 'SUPERTREND')
+
+
+def _minutos_vela_df(df):
+    """Minutos por vela del df, por la mediana del paso temporal (o None si
+    no se puede determinar)."""
+    ts = df['timestamp'].values.astype('datetime64[s]').astype(np.int64)
+    deltas = np.diff(ts)
+    if not len(deltas):
+        return None
+    return float(np.median(deltas)) / 60.0
+
+
+def _tendencia_tf_superior(df, cfg, avisos=None):
+    """Máscaras direccionales del filtro «tendencia de TF superior».
+
+    cfg: {'indicador': 'SMA'|'EMA'|'SUPERTREND'|'ninguno', 'tf': etiqueta,
+          'periodo': int, 'relacion': 'long'|'short'|'ambos'}.
+
+    Resamplea el cierre (y alto/bajo para el Supertrend) al TF superior,
+    calcula el indicador sobre esa serie y lo alinea a las velas base SIN
+    lookahead: el valor de la vela HTF [t0, t1) solo se conoce al cerrar,
+    así que se desplaza una vela HTF y se rellena hacia delante.
+
+    Devuelve (m_up, m_dn) bool[n]: m_up = precio >= tendencia, m_dn =
+    precio <= tendencia. Los NaN del calentamiento no filtran (False), igual
+    que el resto de filtros, y si el filtro no se pudo aplicar se avisa y se
+    devuelve todo True (sin restricción)."""
+    n = len(df)
+    m_up = np.ones(n, dtype=bool)
+    m_dn = np.ones(n, dtype=bool)
+
+    def _avisar(texto):
+        if avisos is not None and texto not in avisos:
+            avisos.append(texto)
+
+    if not cfg:
+        return m_up, m_dn
+    indicador = (cfg.get('indicador') or 'ninguno')
+    tf = str(cfg.get('tf') or '')
+    if indicador == 'ninguno' or not tf:
+        return m_up, m_dn
+    if indicador not in INDICADORES_TF_SUPERIOR:
+        _avisar(f"Filtro TF superior: indicador «{indicador}» no soportado — "
+                f"el backtest ha corrido SIN ese filtro.")
+        return m_up, m_dn
+    regla = _REGLA_RESAMPLE_TF.get(tf)
+    base_min = _minutos_vela_df(df)
+    htf_min = tf_to_minutes(tf)
+    if regla is None or htf_min is None:
+        _avisar(f"Filtro TF superior: «{tf}» no es un timeframe soportado — "
+                f"el backtest ha corrido SIN ese filtro.")
+        return m_up, m_dn
+    if base_min is not None and htf_min <= base_min:
+        _avisar(f"Filtro TF superior: el timeframe elegido ({tf}) no es mayor "
+                f"que el de las velas del activo — el backtest ha corrido SIN "
+                f"ese filtro.")
+        return m_up, m_dn
+
+    idx = pd.DatetimeIndex(df['timestamp'])
+    c_htf = pd.Series(df['close'].values, index=idx).resample(regla).last()
+    periodo = max(int(cfg.get('periodo') or 200), 2)
+    if indicador == 'SMA':
+        trend = sma(c_htf.values, periodo)
+    elif indicador == 'EMA':
+        trend = ema(c_htf.values, periodo)
+    else:  # SUPERTREND
+        h_htf = pd.Series(df['high'].values, index=idx).resample(regla).max()
+        l_htf = pd.Series(df['low'].values, index=idx).resample(regla).min()
+        trend, _ = _supertrend_serie(h_htf.values, l_htf.values,
+                                     c_htf.values, periodo, 3.0)
+
+    # alineación sin lookahead: la vela HTF [t0, t1) cierra en t1, así que su
+    # indicador solo vale desde t1 → shift(1) + ffill sobre timestamps base
+    alineado = pd.Series(trend, index=c_htf.index).shift(1)
+    alineado = alineado.reindex(idx, method='ffill').values.astype(float)
+    close = df['close'].values.astype(float)
+    validos = np.isfinite(alineado) & np.isfinite(close)
+    if not validos.any():
+        _avisar(f"Filtro TF superior: el indicador {indicador}({periodo}) de "
+                f"{tf} no se pudo calcular sobre {n:,} velas — el backtest ha "
+                f"corrido SIN ese filtro.")
+        return m_up, m_dn
+    m_up = validos & (close >= alineado)
+    m_dn = validos & (close <= alineado)
+    return m_up, m_dn
 
 
 def _mascara_filtros_setup(df, filtros, eventos_noticias=None, avisos=None):
@@ -1351,7 +2407,21 @@ def _mascara_filtros_setup(df, filtros, eventos_noticias=None, avisos=None):
                 m_forzar_salida = ~m_noticias
 
     mc_long, mc_short = _mascaras_condiciones_dir(df, filtros.get('condiciones_entrada'))
-    return m & mc_long, m & mc_short, m_forzar_salida
+    m_long = m & mc_long
+    m_short = m & mc_short
+
+    # tendencia de TF superior: direccional, como el resto de filtros solo
+    # condiciona NUEVAS entradas (las salidas nunca se filtran)
+    tfs = filtros.get('tf_superior') or {}
+    if tfs.get('indicador', 'ninguno') != 'ninguno':
+        m_up, m_dn = _tendencia_tf_superior(df, tfs, avisos=avisos)
+        relacion = tfs.get('relacion', 'ambos')
+        if relacion in ('long', 'ambos'):
+            m_long &= m_up
+        if relacion in ('short', 'ambos'):
+            m_short &= m_dn
+
+    return m_long, m_short, m_forzar_salida
 
 
 # ══════════════ tipo de entrada del setup (mercado / límite Fib) ══════════════
@@ -1790,6 +2860,104 @@ def filas_plantilla(plantilla, params=None, salida=False):
                 f"{firma} gira a alcista" if salida else
                 f"{firma} gira a bajista", 'short'))
 
+    elif plantilla == 'Aroon':
+        for lado, arriba, abajo, fuerza in (
+                ('long', 'Aroon Up', 'Aroon Down', p['umbral']),
+                ('short', 'Aroon Down', 'Aroon Up', p['umbral'])):
+            if (lado == 'long' and not hace_long) or \
+               (lado == 'short' and not hace_short):
+                continue
+            filas.append(_fila_texto(
+                f"{arriba} cruza {'ABAJO' if salida else 'ARRIBA'} {abajo}"
+                + ('' if salida else f' con {arriba} > {fuerza:g}'),
+                lado))
+
+    elif plantilla == 'CMO':
+        for lado, (umbral, es_salida) in (
+                ('long', (p['sobreventa'], salida)),
+                ('short', (p['sobrecompra'], salida))):
+            if (lado == 'long' and not hace_long) or \
+               (lado == 'short' and not hace_short):
+                continue
+            op = ('>' if es_salida else '<') if lado == 'long' else \
+                 ('<' if es_salida else '>')
+            val = '0' if es_salida else f'{umbral:g}'
+            filas.append(_fila_texto(f"CMO({p['periodo']}) {op} {val}", lado))
+
+    elif plantilla == 'TRIX':
+        for lado, op_ent, op_sal in (('long', 'ARRIBA', 'ABAJO'),
+                                     ('short', 'ABAJO', 'ARRIBA')):
+            if (lado == 'long' and not hace_long) or \
+               (lado == 'short' and not hace_short):
+                continue
+            filas.append(_fila_texto(
+                f"TRIX({p['periodo']}) cruza {op_sal if salida else op_ent} "
+                f"el cero", lado))
+
+    elif plantilla == 'StochRSI':
+        for lado, (umbral, es_salida) in (
+                ('long', (p['sobreventa'], salida)),
+                ('short', (p['sobrecompra'], salida))):
+            if (lado == 'long' and not hace_long) or \
+               (lado == 'short' and not hace_short):
+                continue
+            if es_salida:
+                filas.append(_fila_texto(
+                    f"%K {'>' if lado == 'long' else '<'} 0.5", lado))
+            else:
+                filas.append(_fila_texto(
+                    f"%K cruza ARRIBA %D con %K "
+                    f"{'<' if lado == 'long' else '>'} {umbral:g}", lado))
+
+    elif plantilla == 'Ichimoku':
+        for lado, op_ent, op_sal in (('long', 'ARRIBA', 'ABAJO'),
+                                       ('short', 'ABAJO', 'ARRIBA')):
+            if (lado == 'long' and not hace_long) or \
+               (lado == 'short' and not hace_short):
+                continue
+            filas.append(_fila_texto(
+                f"Tenkan cruza {op_sal if salida else op_ent} Kijun "
+                f"(T {p['tenkan']}, K {p['kijun']})", lado))
+
+    elif plantilla == 'Keltner':
+        for lado, (umbral, es_salida) in (
+                ('long', ('inferior', salida)),
+                ('short', ('superior', salida))):
+            if (lado == 'long' and not hace_long) or \
+               (lado == 'short' and not hace_short):
+                continue
+            banda = 'media' if es_salida else f'banda {umbral}'
+            op = '>' if lado == 'long' else '<'
+            filas.append(_fila_texto(
+                f"cierre {op} {banda} Keltner({p['periodo']},×{p['mult']:g})",
+                lado))
+
+    elif plantilla == 'TTM Squeeze':
+        for lado, op_ent, op_sal in (('long', 'ARRIBA', 'ABAJO'),
+                                       ('short', 'ABAJO', 'ARRIBA')):
+            if (lado == 'long' and not hace_long) or \
+               (lado == 'short' and not hace_short):
+                continue
+            filas.append(_fila_texto(
+                f"momentum cruza {op_sal if salida else op_ent} 0"
+                + ('' if salida else ' con el squeeze liberado'), lado))
+
+    elif plantilla == 'VWAP':
+        anclaje_txt = _ETIQUETAS_ANCLAJE.get(p['anclaje'], p['anclaje'])
+        banda = f"{p['k']:g}{'σ' if p['modo'] == 'sd' else '%'}"
+        for lado, op_ent, op_sal in (('long', '≤', '≥'),
+                                     ('short', '≥', '≤')):
+            if (lado == 'long' and not hace_long) or \
+               (lado == 'short' and not hace_short):
+                continue
+            if salida:
+                filas.append(_fila_texto(
+                    f"cierre {op_sal} el VWAP({anclaje_txt}) (media)", lado))
+            else:
+                filas.append(_fila_texto(
+                    f"cierre {op_ent} banda {'inferior' if lado == 'long' else 'superior'} "
+                    f"VWAP({anclaje_txt}, {banda})", lado))
+
     elif plantilla == 'Patrones de velas':
         if salida:
             filas.append(_fila_texto(f"a +{p['lag_salida']} velas de la entrada"))
@@ -2099,6 +3267,15 @@ def _desc_filtros(filtros):
         if conds:
             texto = " Y ".join(_desc_condicion_dir(c) for c in conds)
             lineas.append(f"{etiqueta}: {texto}")
+    tfs = filtros.get('tf_superior') or {}
+    if tfs.get('indicador', 'ninguno') != 'ninguno':
+        relacion_txt = {'long': 'solo largos', 'short': 'solo cortos',
+                        'ambos': 'largos y cortos alineados'}.get(
+            tfs.get('relacion', 'ambos'), 'ambos')
+        lineas.append(
+            f"Tendencia TF superior: {relacion_txt} con "
+            f"{tfs['indicador']}({tfs.get('periodo', 200)}) de {tfs.get('tf', '1h')} "
+            f"(precio por encima = largos, por debajo = cortos)")
     noticias = filtros.get('noticias') or {}
     if noticias.get('activo'):
         monedas = noticias.get('monedas')
@@ -2325,8 +3502,11 @@ def describir_setup(setup):
         activos.append('sesión')
     if filtros.get('condiciones_entrada') or filtros.get('condiciones_salida'):
         activos.append('condición')
+    if (filtros.get('tf_superior') or {}).get('indicador', 'ninguno') != 'ninguno':
+        activos.append('TF superior')
     if (filtros.get('noticias') or {}).get('activo'):
         activos.append('noticias')
     if activos:
         partes.append(f"filtros: {'+'.join(activos)}")
     return " · ".join(partes)
+

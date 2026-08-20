@@ -17,6 +17,7 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                               QListWidgetItem, QFrame, QGroupBox, QButtonGroup,
                               QRadioButton, QDateEdit, QCheckBox)
 from PyQt6.QtCore import Qt, pyqtSignal, QDate, QThread, QTimer
+from gui.widgets import STYLE_ETIQUETA_SIN_CAJA
 from gui.widgets.console_widget import ConsoleWidget
 from gui.widgets.progress_animada import ProgressBarAnimada
 from core.config import SCRIPTS_DIR
@@ -156,6 +157,30 @@ class _SymbolSearchThread(QThread):
         self.results_ready.emit(self._query, results)
 
 
+class _CatalogLoadThread(QThread):
+    """Carga el catalogo del proveedor fuera del hilo de la UI.
+
+    Algunos proveedores resuelven el catalogo contra su API en vivo
+    (timeouts de 15-60 s si la red falla): hacerlo en el constructor de la
+    pestaña congelaba el splash/ventana y Windows mostraba copias
+    "no responde". Emite el resultado con el nombre del proveedor para
+    descartar respuestas obsoletas si el usuario cambia de proveedor.
+    """
+    listo = pyqtSignal(str, list)
+
+    def __init__(self, provider, provider_name, parent=None):
+        super().__init__(parent)
+        self._provider = provider
+        self._provider_name = provider_name
+
+    def run(self):
+        try:
+            results = self._provider.get_catalog()
+        except Exception:
+            results = []
+        self.listo.emit(self._provider_name, results)
+
+
 class _ReorganizarCategoriasThread(QThread):
     """Mueve en segundo plano los activos descargados de <proveedor>/<activo>/
     a <proveedor>/<categoria>/<activo>/, y a continuación hace lo mismo con
@@ -203,6 +228,7 @@ class TabDescargar(QWidget):
         self._search_timer.setSingleShot(True)
         self._search_timer.timeout.connect(self._run_live_search)
         self._search_thread = None
+        self._catalog_thread = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
@@ -212,7 +238,9 @@ class TabDescargar(QWidget):
         toolbar = QHBoxLayout()
         toolbar.setSpacing(8)
 
-        toolbar.addWidget(QLabel("Fuente:"))
+        lbl_fuente = QLabel("Fuente:")
+        lbl_fuente.setStyleSheet(STYLE_ETIQUETA_SIN_CAJA)
+        toolbar.addWidget(lbl_fuente)
         self.provider_combo = QComboBox()
         self._rebuild_provider_combo()
         self.provider_combo.currentTextChanged.connect(self._on_provider_changed)
@@ -426,11 +454,30 @@ class TabDescargar(QWidget):
                     self.provider_combo.setCurrentIndex(idx)
 
     def _load_catalog(self):
-        """Carga el catalogo del provider seleccionado."""
+        """Carga el catalogo del provider seleccionado EN SEGUNDO PLANO.
+
+        La carga se lanza en un QThread: los proveedores resuelven el
+        catalogo contra su API en vivo y pueden tardar decenas de segundos
+        (o agotar el timeout) si la red falla; hacerlo en el hilo de la UI
+        congelaba la ventana y Windows mostraba copias "no responde".
+        """
         provider = self._current_provider()
         if not provider:
+            self._catalog = []
+            self._populate_list()
             return
-        self._catalog = provider.get_catalog()
+        nombre = self.provider_combo.currentText()
+        th = _CatalogLoadThread(provider, nombre, parent=self)
+        th.listo.connect(self._on_catalog_listo)
+        self._catalog_thread = th
+        th.start()
+
+    def _on_catalog_listo(self, nombre, results):
+        # El usuario pudo cambiar de proveedor mientras la carga volaba:
+        # descartar el resultado obsoleto en vez de mostrarlo fuera de sitio.
+        if nombre != self.provider_combo.currentText():
+            return
+        self._catalog = results
         self._populate_list()
 
     def _refresh_catalog(self):

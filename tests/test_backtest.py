@@ -1948,3 +1948,159 @@ def test_resultado_filtrado_respeta_la_ventana_is_oos():
     assert is_['n_trades'] == int((tr['idx_entrada'] < corte).sum())
     assert oos['n_trades'] == int((tr['idx_entrada'] >= corte).sum())
     assert is_['n_trades'] + oos['n_trades'] == f['n_trades']
+
+
+# ══════════════ métricas nuevas: estructura de trades y riesgo de cola ══════════════
+
+def _resultado_con_trades(trades):
+    """Resultado mínimo con el que calcular_metricas puede operar."""
+    n = 40
+    return {'equity': np.full(n, 10000.0),
+            'trades': trades,
+            'drawdown': np.zeros(n), 'capital_final': 10000.0,
+            'n_trades': len(trades['pnl'])}
+
+
+def _trades_estructura():
+    """Secuencia conocida: +, -, +, -, + (3 largos, 2 cortos)."""
+    return {
+        'idx_entrada': np.array([1, 2, 3, 4, 5], dtype=np.int64),
+        'idx_salida': np.array([6, 7, 8, 9, 10], dtype=np.int64),
+        'dir': np.array([1, 1, -1, -1, 1], dtype=np.int8),
+        'pnl': np.array([100.0, -50.0, 80.0, -30.0, 200.0]),
+        'ret_pct': np.array([0.01, -0.005, 0.008, -0.003, 0.02]),
+        'r_multiple': np.array([1.0, -0.5, 0.8, -0.3, 2.0]),
+        'setup': np.zeros(5, dtype=np.int64),
+        'notional_redondo': np.array([10000.0] * 5),
+        'costo_comision': np.array([1.0] * 5),
+        'mfe_r': np.array([1.0] * 5), 'mae_r': np.array([0.5] * 5),
+        'etd_r': np.array([0.1] * 5),
+        'eficiencia_entrada': np.array([0.5] * 5),
+        'eficiencia_salida': np.array([0.5] * 5),
+    }
+
+
+def test_win_rate_por_direccion_y_conteos():
+    r = _resultado_con_trades(_trades_estructura())
+    m = calcular_metricas(r, 0, 40, 365.0, 1440.0)
+    assert m['win_rate_long'] == pytest.approx(2 / 3)
+    assert m['win_rate_short'] == pytest.approx(1 / 2)
+    assert m['longs_count'] == 3 and m['shorts_count'] == 2
+    assert m['longs_pct'] == pytest.approx(60.0)
+
+
+def test_racha_ganadora_maxima():
+    # + - + - + -> máx racha ganadora 1
+    m = calcular_metricas(_resultado_con_trades(_trades_estructura()), 0, 40)
+    assert m['racha_ganadora'] == 1
+    # serie con racha de 3 ganadoras
+    tr = _trades_estructura()
+    tr['pnl'] = np.array([10.0, 20.0, 30.0, -40.0, 5.0])
+    m2 = calcular_metricas(_resultado_con_trades(tr), 0, 40)
+    assert m2['racha_ganadora'] == 3
+
+
+def test_mayor_ganancia_perdida_y_brutas():
+    m = calcular_metricas(_resultado_con_trades(_trades_estructura()), 0, 40)
+    assert m['mayor_ganancia'] == pytest.approx(200.0)
+    assert m['mayor_perdida'] == pytest.approx(-50.0)
+    assert m['ganancia_bruta'] == pytest.approx(380.0)   # 100+80+200
+    assert m['perdida_bruta'] == pytest.approx(80.0)     # 50+30
+
+
+def test_avg_trades_por_dia_requiere_velas_por_dia():
+    r = _resultado_con_trades(_trades_estructura())
+    assert calcular_metricas(r, 0, 40)['avg_trades_por_dia'] is None
+    m = calcular_metricas(r, 0, 40, 365.0, 1440.0)
+    # 40 velas a 1440/día = 0.0278 días; 5 trades
+    assert m['avg_trades_por_dia'] == pytest.approx(5.0 / (40.0 / 1440.0))
+
+
+def test_dict_de_trades_sin_dir_no_rompe():
+    tr = _trades_estructura()
+    del tr['dir']
+    m = calcular_metricas(_resultado_con_trades(tr), 0, 40)
+    assert m['win_rate_long'] is None
+    assert m['win_rate_short'] is None
+    assert m['longs_count'] == 0 and m['shorts_count'] == 0
+    assert m['racha_ganadora'] == 1   # la racha no depende de dir
+
+
+def _resultado_equity_con_trades():
+    """Equity con variación (retornos no constantes) para CVaR/Serenity."""
+    n = 120
+    equity = 10000.0 * np.exp(np.linspace(0, 0.05, n)
+                              + 0.004 * np.sin(np.arange(n)))
+    trades = {
+        'idx_entrada': np.array([1, 2], dtype=np.int64),
+        'idx_salida': np.array([10, 11], dtype=np.int64),
+        'dir': np.array([1, -1], dtype=np.int8),
+        'pnl': np.array([50.0, -30.0]),
+        'ret_pct': np.array([0.005, -0.003]),
+        'r_multiple': np.array([0.5, -0.3]),
+        'setup': np.zeros(2, dtype=np.int64),
+        'notional_redondo': np.array([10000.0] * 2),
+        'costo_comision': np.array([1.0] * 2),
+        'mfe_r': np.array([0.5] * 2), 'mae_r': np.array([0.3] * 2),
+        'etd_r': np.array([0.05] * 2),
+        'eficiencia_entrada': np.array([0.5] * 2),
+        'eficiencia_salida': np.array([0.5] * 2),
+    }
+    return {'equity': equity, 'trades': trades,
+            'drawdown': np.zeros(n), 'capital_final': float(equity[-1]),
+            'n_trades': 2}
+
+
+def test_cvar_retorno_es_la_media_de_la_cola():
+    r = _resultado_equity_con_trades()
+    m = calcular_metricas(r, 0, len(r['equity']))
+    ret = np.diff(np.log(np.maximum(r['equity'], 1e-12)))
+    # CVaR = media de los int(0.05*n) peores retornos (definición de jesse)
+    esperado = np.sort(ret)[:int(0.05 * len(ret))].mean() * 100.0
+    assert m['cvar_ret_pct'] == pytest.approx(esperado)
+    assert m['cvar_ret_pct'] < 0
+    # la media de la cola es peor (más negativa) que el percentil 5
+    assert abs(m['cvar_ret_pct']) >= abs(np.percentile(ret, 5) * 100.0)
+
+
+def test_cvar_drawdown_no_supera_el_maximo():
+    r = _resultado_equity_con_trades()
+    m = calcular_metricas(r, 0, len(r['equity']))
+    assert m['cvar_dd_pct'] <= 0
+    # media del peor 5% de los dd: no puede ser peor que el mínimo
+    assert m['cvar_dd_pct'] >= m['max_dd_pct']
+
+
+def test_serenity_y_sharpe_smart_en_serie_con_autocorrelacion():
+    r = _resultado_equity_con_trades()
+    m = calcular_metricas(r, 0, len(r['equity']))
+    assert m['sharpe'] is not None
+    assert m['sharpe_smart'] is not None
+    # la sinusoidad mete autocorrelación: el smart debe penalizar
+    assert m['sharpe_smart'] < m['sharpe']
+    assert m['serenity_index'] is not None
+    assert np.isfinite(m['serenity_index'])
+
+
+def test_sortino_calmar_omega_se_calculan():
+    r = _resultado_equity_con_trades()
+    m = calcular_metricas(r, 0, len(r['equity']), 365.0)
+    assert m['sortino'] is not None
+    assert m['omega'] is not None and m['omega'] > 0
+    assert m['calmar'] is not None
+    # calmar = retorno anualizado / |max dd| (coherente con el informe)
+    assert m['calmar'] == pytest.approx(
+        m['retorno_anual_pct'] / abs(m['max_dd_pct']))
+    # con equity plana no hay downside ni drawdown
+    m0 = calcular_metricas(_resultado_con_trades(_trades_estructura()), 0, 40)
+    assert m0['sortino'] is None
+    assert m0['omega'] is None
+    assert m0['calmar'] is None
+
+
+def test_serenity_y_cvar_en_equity_plana():
+    m = calcular_metricas(_resultado_con_trades(_trades_estructura()), 0, 40)
+    assert m['serenity_index'] is None
+    assert m['cvar_ret_pct'] == pytest.approx(0.0)
+    assert m['cvar_dd_pct'] == pytest.approx(0.0)
+    assert m['sharpe_smart'] is None

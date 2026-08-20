@@ -74,7 +74,7 @@ from core.strategies import (
 
 LADOS = ('entradas_long', 'entradas_short', 'salidas_long', 'salidas_short')
 
-OPS_COMPARACION = ('>', '<', 'cruza arriba', 'cruza abajo')
+OPS_COMPARACION = ('>', '<', '>=', '<=', 'cruza arriba', 'cruza abajo')
 OPS_LOGICOS = ('Y', 'O', 'NO')
 OPS_ESPECIALES = ('giro_sar', 'patron')
 
@@ -83,7 +83,16 @@ OPS_ESPECIALES = ('giro_sar', 'patron')
 # (y no en cada emisor) porque la lista depende de nuestras fórmulas, no del
 # lenguaje destino.
 SERIES_RUNTIME = ('KAMA', 'ER', 'HURST', 'SAR', 'ZIGZAG',
-                  'PCT_ATR', 'PCT_STDEV')
+                  'PCT_ATR', 'PCT_STDEV',
+                  'SUPERTREND', 'MACD_LINEA', 'MACD_SENAL', 'MACD_HIST',
+                  'ADX', 'DI_PLUS', 'DI_MINUS',
+                  'AROON_UP', 'AROON_DN', 'CMO', 'TRIX', 'STOCHRSI',
+                  'STOCHRSI_D',
+                  'ICHIMOKU_TENKAN', 'ICHIMOKU_KIJUN', 'ICHIMOKU_SENKOU_A',
+                  'ICHIMOKU_SENKOU_B', 'ICHIMOKU_CHIKOU',
+                  'KELTNER_SUP', 'KELTNER_INF', 'KELTNER_MEDIA',
+                  'TTM_SQUEEZE', 'TTM_MOMENTUM',
+                  'VWAP_MEDIA', 'VWAP_SD', 'VWAP_SUP', 'VWAP_INF')
 
 
 # ══════════════ constructores de nodo ══════════════
@@ -295,6 +304,152 @@ def _ir_sar(p):
     return _direccional(p, alcista, bajista, bajista, alcista)
 
 
+def _ir_supertrend(p):
+    st = serie('SUPERTREND', periodo=int(p['periodo']),
+               multiplicador=float(p['multiplicador']),
+               origen={'periodo': 'periodo',
+                       'multiplicador': 'multiplicador'})
+    # giro de tendencia: mismo operador especial que el SAR — el runtime
+    # devuelve (nivel, tendencia) y el giro se detecta con la tendencia
+    alcista = {'op': 'giro_supertrend', 'sentido': +1, 'sar': st}
+    bajista = {'op': 'giro_supertrend', 'sentido': -1, 'sar': st}
+    return _direccional(p, alcista, bajista, bajista, alcista)
+
+
+def _ir_macd(p):
+    linea = serie('MACD_LINEA', rapido=int(p['rapido']),
+                  lento=int(p['lento']), senal=int(p['senal']),
+                  origen={'rapido': 'rapido', 'lento': 'lento',
+                          'senal': 'senal'})
+    senal_linea = serie('MACD_SENAL', rapido=int(p['rapido']),
+                        lento=int(p['lento']), senal=int(p['senal']),
+                        origen={'rapido': 'rapido', 'lento': 'lento',
+                                'senal': 'senal'})
+    arriba = cmp(linea, 'cruza arriba', senal_linea)
+    abajo = cmp(linea, 'cruza abajo', senal_linea)
+    return _direccional(p, arriba, abajo, abajo, arriba)
+
+
+def _ir_adx(p):
+    periodo = int(p['periodo'])
+    pdi = serie('DI_PLUS', periodo=periodo, origen={'periodo': 'periodo'})
+    mdi = serie('DI_MINUS', periodo=periodo, origen={'periodo': 'periodo'})
+    adx = serie('ADX', periodo=periodo, origen={'periodo': 'periodo'})
+    cruza_up = cmp(pdi, 'cruza arriba', mdi)
+    cruza_dn = cmp(pdi, 'cruza abajo', mdi)
+    fuerza = cmp(adx, '>', valor(float(p['umbral_fuerza']),
+                                 origen='umbral_fuerza'))
+    alcista = y(cruza_up, fuerza)
+    bajista = y(cruza_dn, fuerza)
+    return _direccional(p, alcista, bajista, bajista, alcista)
+
+
+def _ir_aroon(p):
+    periodo = int(p['periodo'])
+    up = serie('AROON_UP', periodo=periodo, origen={'periodo': 'periodo'})
+    dn = serie('AROON_DN', periodo=periodo, origen={'periodo': 'periodo'})
+    umbral = valor(float(p['umbral']), origen='umbral')
+    cruza_up = cmp(up, 'cruza arriba', dn)
+    cruza_dn = cmp(up, 'cruza abajo', dn)
+    fuerza_up = cmp(up, '>', umbral)
+    fuerza_dn = cmp(dn, '>', umbral)
+    alcista = y(cruza_up, fuerza_up)
+    bajista = y(cruza_dn, fuerza_dn)
+    return _direccional(p, alcista, bajista, bajista, alcista)
+
+
+def _ir_cmo(p):
+    periodo = int(p['periodo'])
+    cmo = serie('CMO', periodo=periodo, origen={'periodo': 'periodo'})
+    ent_l = cmp(cmo, '<', valor(float(p['sobreventa']),
+                                origen='sobreventa'))
+    sal_l = cmp(cmo, '>', valor(0.0))
+    ent_s = cmp(cmo, '>', valor(float(p['sobrecompra']),
+                                origen='sobrecompra'))
+    sal_s = cmp(cmo, '<', valor(0.0))
+    return _direccional(p, ent_l, ent_s, sal_l, sal_s)
+
+
+def _ir_trix(p):
+    periodo = int(p['periodo'])
+    trix = serie('TRIX', periodo=periodo, origen={'periodo': 'periodo'})
+    cero = valor(0.0)
+    alcista = cmp(trix, 'cruza arriba', cero)
+    bajista = cmp(trix, 'cruza abajo', cero)
+    return _direccional(p, alcista, bajista, bajista, alcista)
+
+
+def _ir_stochrsi(p):
+    periodo = int(p['periodo'])
+    k = serie('STOCHRSI', periodo=periodo, origen={'periodo': 'periodo'})
+    d = serie('STOCHRSI_D', periodo=periodo, origen={'periodo': 'periodo'})
+    cruza_up = cmp(k, 'cruza arriba', d)
+    cruza_dn = cmp(k, 'cruza abajo', d)
+    ent_l = y(cruza_up, cmp(k, '<', valor(float(p['sobreventa']),
+                                          origen='sobreventa')))
+    sal_l = cmp(k, '>', valor(0.5))
+    ent_s = y(cruza_dn, cmp(k, '>', valor(float(p['sobrecompra']),
+                                          origen='sobrecompra')))
+    sal_s = cmp(k, '<', valor(0.5))
+    return _direccional(p, ent_l, ent_s, sal_l, sal_s)
+
+
+def _ir_ichimoku(p):
+    tenkan, kijun, senkou = int(p['tenkan']), int(p['kijun']), int(p['senkou'])
+    kw = {'tenkan': tenkan, 'kijun': kijun, 'senkou': senkou}
+    origen = {'tenkan': 'tenkan', 'kijun': 'kijun', 'senkou': 'senkou'}
+    t = serie('ICHIMOKU_TENKAN', **kw, origen=origen)
+    k = serie('ICHIMOKU_KIJUN', **kw, origen=origen)
+    arriba = cmp(t, 'cruza arriba', k)
+    abajo = cmp(t, 'cruza abajo', k)
+    return _direccional(p, arriba, abajo, abajo, arriba)
+
+
+def _ir_keltner(p):
+    periodo, mult = int(p['periodo']), float(p['mult'])
+    kw = {'periodo': periodo, 'multiplicador': mult}
+    origen = {'periodo': 'periodo', 'multiplicador': 'mult'}
+    media = serie('KELTNER_MEDIA', **kw, origen=origen)
+    sup = serie('KELTNER_SUP', **kw, origen=origen)
+    inf = serie('KELTNER_INF', **kw, origen=origen)
+    ent_l = cmp(precio('close'), '<', inf)
+    sal_l = cmp(precio('close'), '>', media)
+    ent_s = cmp(precio('close'), '>', sup)
+    sal_s = cmp(precio('close'), '<', media)
+    return _direccional(p, ent_l, ent_s, sal_l, sal_s)
+
+
+def _ir_ttm(p):
+    periodo, mb, mk = int(p['periodo']), float(p['mult_bb']), float(p['mult_kc'])
+    kw = {'periodo': periodo, 'mult_bb': mb, 'mult_kc': mk}
+    origen = {'periodo': 'periodo', 'mult_bb': 'mult_bb',
+              'mult_kc': 'mult_kc'}
+    sq = serie('TTM_SQUEEZE', **kw, origen=origen)
+    mom = serie('TTM_MOMENTUM', **kw, origen=origen)
+    liberado = no(cmp(sq, '>', valor(0.5)))   # squeeze off (0/1)
+    cruza_up = cmp(mom, 'cruza arriba', valor(0.0))
+    cruza_dn = cmp(mom, 'cruza abajo', valor(0.0))
+    alcista = y(cruza_up, liberado)
+    bajista = y(cruza_dn, liberado)
+    return _direccional(p, alcista, bajista, bajista, alcista)
+
+
+def _ir_vwap(p):
+    kw = {'anclaje': p['anclaje'], 'k': float(p['k']), 'modo': p['modo']}
+    # anclaje/modo son cadenas: se emiten como literales fijos (el export
+    # reproduce exactamente la configuración del backtest). 'k' sí es un
+    # número y queda editable como input en la plataforma.
+    origen = {'k': 'k'}
+    media = serie('VWAP_MEDIA', **kw, origen=origen)
+    sup = serie('VWAP_SUP', **kw, origen=origen)
+    inf = serie('VWAP_INF', **kw, origen=origen)
+    ent_l = cmp(precio('close'), '<=', inf)
+    sal_l = cmp(precio('close'), '>=', media)
+    ent_s = cmp(precio('close'), '>=', sup)
+    sal_s = cmp(precio('close'), '<=', media)
+    return _direccional(p, ent_l, ent_s, sal_l, sal_s)
+
+
 def _ir_patrones(p):
     """Un nodo por patrón elegido, unidos por O. La dirección de cada uno la
     decide el sesgo del patrón, no un parámetro del setup, así que esta
@@ -369,6 +524,27 @@ def _spec_a_serie(spec):
         return serie(tipo, periodo=periodo, fuente='high/low')
     if tipo in ('SMA', 'EMA', 'RSI', 'ATR', 'ER'):
         return serie(tipo, periodo=periodo)
+    if tipo == 'SUPERTREND':
+        return serie('SUPERTREND', periodo=periodo, multiplicador=3.0)
+    if tipo in ('MACD_LINEA', 'MACD_SENAL', 'MACD_HIST'):
+        return serie(tipo, rapido=12, lento=26, senal=9)
+    if tipo in ('ADX', 'DI_PLUS', 'DI_MINUS'):
+        return serie(tipo, periodo=periodo)
+    if tipo in ('AROON_UP', 'AROON_DN', 'CMO', 'OBV', 'TRIX', 'STOCHRSI',
+                'VWAP'):
+        # AROON/CMO/TRIX/STOCHRSI ya tienen port de runtime; OBV/VWAP siguen
+        # bloqueados en fidelidad (indicadores_editor_pendientes)
+        return serie(tipo, periodo=periodo)
+    if tipo in ('ICHIMOKU_TENKAN', 'ICHIMOKU_KIJUN', 'ICHIMOKU_SENKOU_A',
+                'ICHIMOKU_SENKOU_B', 'ICHIMOKU_CHIKOU'):
+        return serie(tipo, tenkan=9, kijun=26, senkou=52)
+    if tipo in ('KELTNER_SUP', 'KELTNER_INF', 'KELTNER_MEDIA'):
+        return serie(tipo, periodo=periodo, multiplicador=2.0)
+    if tipo in ('TTM_SQUEEZE', 'TTM_MOMENTUM'):
+        return serie(tipo, periodo=periodo, mult_bb=2.0, mult_kc=1.5)
+    if tipo in ('VWAP_MEDIA', 'VWAP_SD', 'VWAP_SUP', 'VWAP_INF'):
+        return serie(tipo, anclaje=spec.get('anclaje', 'W'),
+                     k=float(spec.get('k', 1.0)), modo=spec.get('modo', 'sd'))
     raise ValueError(f"Indicador desconocido en el IR: {tipo}")
 
 
@@ -394,6 +570,17 @@ _CONSTRUCTORES = {
     'KAMA': _ir_kama,
     'Breakout de canal (Donchian)': _ir_breakout,
     'Parabolic SAR': _ir_sar,
+    'Supertrend': _ir_supertrend,
+    'MACD': _ir_macd,
+    'ADX (fuerza de tendencia)': _ir_adx,
+    'Aroon': _ir_aroon,
+    'CMO': _ir_cmo,
+    'TRIX': _ir_trix,
+    'StochRSI': _ir_stochrsi,
+    'Ichimoku': _ir_ichimoku,
+    'Keltner': _ir_keltner,
+    'TTM Squeeze': _ir_ttm,
+    'VWAP': _ir_vwap,
     'Patrones de velas': _ir_patrones,
     'Custom (reglas)': _ir_custom,
 }
@@ -532,6 +719,9 @@ def filtros_setup(filtros):
         'noticias': _ir_noticias(f.get('noticias')),
         'condiciones_entrada': _ir_condiciones(f.get('condiciones_entrada')),
         'condiciones_salida': _ir_condiciones(f.get('condiciones_salida')),
+        'tf_superior': (f.get('tf_superior') or {})
+        if (f.get('tf_superior') or {}).get('indicador', 'ninguno') != 'ninguno'
+        else None,
     }
 
 
@@ -665,7 +855,7 @@ def recorrer_series(nodo, vistas=None):
     if op in OPS_LOGICOS:
         for parte in nodo['partes']:
             recorrer_series(parte, vistas)
-    elif op == 'giro_sar':
+    elif op in ('giro_sar', 'giro_supertrend'):
         recorrer_series(nodo['sar'], vistas)
     elif op == 'patron':
         pass

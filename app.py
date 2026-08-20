@@ -152,6 +152,20 @@ def main():
     app.setApplicationName("Analytics System for Assets")
     app.setStyle("Fusion")
 
+    # Tema oscuro global para los diálogos y ventanas auxiliares sin estilo
+    # propio (QMessageBox, QInputDialog, QFileDialog no nativo, calendarios,
+    # menús, tooltips y scrollbars). Los widgets con su propio setStyleSheet
+    # conservan su aspecto: el QSS del widget tiene prioridad sobre el global.
+    from gui.dialogs.estilo import ESTILO_GLOBAL
+    app.setStyleSheet(ESTILO_GLOBAL)
+
+    # Tema oscuro global para los diálogos y ventanas auxiliares sin estilo
+    # propio (QMessageBox, QInputDialog, QFileDialog no nativo, calendarios,
+    # menús, tooltips y scrollbars). Los widgets con su propio setStyleSheet
+    # conservan su aspecto: el QSS del widget tiene prioridad sobre el global.
+    from gui.dialogs.estilo import ESTILO_GLOBAL
+    app.setStyleSheet(ESTILO_GLOBAL)
+
     # Fusion no define paleta propia: sin esto, el color de selección de
     # texto/tablas/listas sin :selected explícito hereda el acento del
     # sistema (en Windows puede salir rosa). Se fija al mismo azul cielo
@@ -288,7 +302,10 @@ def main():
     # Dejar que la ventana complete su PRIMER pintado (incluida la aplicación
     # de la hoja de estilos) antes de empezar la precarga de pestañas: sin
     # esto, la zona central puede mostrarse en blanco/gris durante la carga
-    # y verse como una copia fantasma de la ventana.
+    # y verse como una copia fantasma de la ventana. repaint() fuerza el
+    # pintado síncrono del frame inicial; los processEvents dejan respirar al
+    # bucle (fade del taskbar, primer layout, etc.).
+    window.repaint()
     for _ in range(4):
         app.processEvents()
 

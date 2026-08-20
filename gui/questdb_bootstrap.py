@@ -6,11 +6,12 @@ disponible, ensure_running() es instantáneo y no se muestra nada.
 """
 from PyQt6.QtCore import QThread, pyqtSignal, Qt, QTimer, QPropertyAnimation, QEasingCurve
 from PyQt6.QtGui import QPainter, QPen, QColor
-from PyQt6.QtWidgets import (QDialog, QLabel, QMessageBox, QWidget, QHBoxLayout,
+from PyQt6.QtWidgets import (QDialog, QLabel, QWidget, QHBoxLayout,
                              QVBoxLayout)
 
 from gui.widgets.plot_common import PanelFlotanteDialog, montar_panel_flotante
 from core.questdb_manager import ensure_running, is_reachable
+from gui.dialogs.mensajes import aviso
 
 # cuánto se deja visible el mensaje final de éxito antes de cerrar solo —
 # para que no parezca que el diálogo "desaparece de golpe" sin confirmar
@@ -172,7 +173,7 @@ def mostrar_bootstrap_questdb(parent=None) -> bool:
     th.wait()
 
     if not resultado['ok']:
-        QMessageBox.warning(
+        aviso(
             parent, "QuestDB no disponible",
             f"{resultado['mensaje']}\n\n"
             "El paso «Limpiar» necesita QuestDB para funcionar.")

@@ -19,7 +19,8 @@ META = {'sistema': 'sistema de prueba', 'activo': 'ZCMAIZ', 'tf': '1d'}
 
 # plantillas cuya señal el núcleo todavía no emite: se bloquean antes de
 # llegar al emisor (ver fidelidad.bloquea_setup)
-PLANTILLAS_EMITIBLES = [p for p in ESTRATEGIAS if p != 'Patrones de velas']
+PLANTILLAS_EMITIBLES = [p for p in ESTRATEGIAS
+                        if p not in fidelidad.PLANTILLAS_SIN_EMISOR]
 
 
 def _generar(plantilla='RSI', **extra):
@@ -219,6 +220,28 @@ def test_el_break_even_en_r_usa_la_distancia_y_en_atr_el_atr():
     assert 'refBe = atrGestion' in _generar('RSI', be_atr=1.0, be_unidad='atr')
 
 
+def test_la_entrada_escalonada_emite_tramos():
+    """Cada tramo adicional añade posición con strategy.order y un tamaño de
+    riesgo × pct/100 sobre la distancia al stop."""
+    tramos = [{'pct': 50.0, 'trigger': 'senal', 'val': 0.0, 'condiciones': []},
+              {'pct': 50.0, 'trigger': 'retroceso', 'val': 1.0,
+               'condiciones': []}]
+    codigo = _generar('RSI', tramos=tramos)
+    assert 'strategy.order("T1"' in codigo
+    assert 'tramoActual' in codigo
+    assert 'p_riesgo_pct * 0.5' in codigo
+    assert 'distTramo' in codigo
+    assert 'low <= precioIn - 1.0 * atrGestion' in codigo
+
+
+def test_un_solo_tramo_no_genera_escalonado():
+    """El tramo implícito al 100% es la entrada normal; no debe meter lógica
+    de escalonado que no se configuró."""
+    codigo = _generar('RSI')
+    assert 'strategy.order("T' not in codigo
+    assert 'tramoActual' not in codigo
+
+
 def test_el_sizing_usa_el_equity_actual_no_el_capital_inicial():
     """El motor arriesga un % del equity vivo: con capital fijo el tamaño no
     crecería ni se reduciría con la cuenta."""
@@ -300,16 +323,16 @@ def test_el_runtime_va_insertado_en_el_script():
         assert funcion in codigo, funcion
 
 
-def test_el_atr_del_runtime_es_media_simple_no_wilder():
-    """ta.atr usa el suavizado de Wilder y el motor una media simple. La
-    diferencia mueve la distancia del stop y con ella el tamaño de TODAS las
-    operaciones."""
+def test_el_atr_del_runtime_es_suavizado_de_wilder():
+    """El motor y el runtime generado usan ta.atr (suavizado de Wilder del TR),
+    igual que las plataformas de referencia. Antes era una media simple."""
     codigo = _generar()
-    assert 'ta.sma(ta.tr(true), periodo)' in codigo
+    assert 'ta.atr(periodo)' in codigo
     assert 'zcsAtr(int periodo)' in codigo
 
 
-def test_las_bandas_de_bollinger_usan_desviacion_muestral():
-    """pandas .std() divide por n-1; ta.stdev divide por n salvo biased=false."""
+def test_las_bandas_de_bollinger_usan_desviacion_poblacional():
+    """pandas .std(ddof=0) divide por n; ta.stdev con biased=true divide por
+    n (poblacional), que es la definición estándar de Bollinger."""
     codigo = _generar('Bollinger + ATR')
-    assert 'ta.stdev(src, periodo, false)' in codigo
+    assert 'ta.stdev(src, periodo, true)' in codigo

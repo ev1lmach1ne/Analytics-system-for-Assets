@@ -1,0 +1,42 @@
+{
+  "etiqueta": "resumen_diario",
+  "fecha": "2026-08-18",
+  "resumen_diario": "12 cambio(s) técnico(s) consolidados el 2026-08-18.",
+  "temas_principales": [
+    "cambio_tecnico",
+    "pine",
+    "ir",
+    "mql",
+    "metrics"
+  ],
+  "modulos_afectados": [
+    "exportador de código Pine/MQL5 (core/codegen/)",
+    "módulos no mapeados automáticamente",
+    "pestañas y widgets de la GUI (gui/widgets/)",
+    "configuración global y rutas (core/config.py)",
+    "métricas cuantitativas (core/metrics.py)",
+    "pestaña de backtest (gui/widgets/tab_backtest.py)",
+    "suite de pruebas (tests/)"
+  ],
+  "decisiones_clave": [
+    "Cambio en 4 archivo(s) (437+ / 51- líneas).",
+    "Cambio en 1 archivo(s) (588+ / 36- líneas).",
+    "Cambio en 0 archivo(s) (146+ / 3- líneas).",
+    "Cambio en 0 archivo(s) (451+ / 43- líneas).",
+    "Cambio en 1 archivo(s) (340+ / 18- líneas).",
+    "Cambio en 0 archivo(s) (549+ / 5- líneas).",
+    "Cambio en 3 archivo(s) (686+ / 34- líneas).",
+    "Cambio en 3 archivo(s) (329+ / 4- líneas).",
+    "Cambio en 2 archivo(s) (687+ / 11- líneas).",
+    "Cambio en 2 archivo(s) (593+ / 49- líneas).",
+    "Cambio en 2 archivo(s) (377+ / 25- líneas).",
+    "Cambio en 0 archivo(s) (515+ / 0- líneas)."
+  ],
+  "tags": [
+    "cambio_tecnico",
+    "pine",
+    "ir",
+    "mql",
+    "metrics"
+  ]
+}

@@ -52,16 +52,15 @@ def test_rsi_caso_normal():
     assert r[2] == pytest.approx(100 - 100 / 3, abs=1e-6)
 
 
-def test_rsi_sin_perdidas_da_50_no_100():
-    # PIN: cuando la ventana de pérdidas está en 0 (solo subidas hasta ahí),
-    # perdida=0 -> rs=NaN (por el replace(0,nan)) -> rsi cae a 50 vía
-    # fillna(50.0). La definición estándar de RSI dice que debería ser 100
-    # (fuerza alcista pura), no 50 (neutro). Se deja documentado, no se
-    # corrige en esta tarea.
+def test_rsi_sin_perdidas_da_100_no_50():
+    # Con la ventana de pérdidas en 0 (solo subidas hasta ahí) el RSI debe ser
+    # 100 (fuerza alcista pura), no 50. Antes el código hacía perdida=0 ->
+    # rs=NaN -> fillna(50.0); ahora se devuelve 100 para ese caso y el 50
+    # neutro queda reservado a la serie plana y al warm-up.
     c = np.array([10.0, 11.0, 12.0])   # solo subidas
     r = rsi(c, 2)
-    assert r[1] == pytest.approx(50.0)
-    assert r[2] == pytest.approx(50.0)
+    assert r[1] == pytest.approx(100.0)
+    assert r[2] == pytest.approx(100.0)
 
 
 def test_rsi_primer_valor_es_50():
@@ -71,21 +70,21 @@ def test_rsi_primer_valor_es_50():
 
 
 # ══════════════ ATR ══════════════
-def test_atr_es_media_simple_del_true_range():
-    # PIN: la implementación usa SMA (rolling mean) del True Range, NO el
-    # suavizado de Wilder (que usan TradingView/MT5 y la mayoría de
-    # plataformas). Numéricamente da un ATR más reactivo/distinto. Se deja
-    # documentado, no se corrige en esta tarea (cambiaría las señales de
-    # cualquier estrategia que use ATR para stop/tamaño de posición).
+def test_atr_usa_suavizado_de_wilder():
+    # La implementación usa el suavizado de Wilder (RMA) del True Range, el
+    # mismo que ta.atr de Pine/iATR de MT5: semilla SMA de las primeras
+    # `periodo` velas y recursión atr[i] = (atr[i-1]*(p-1) + tr[i])/p. Antes
+    # promediaba el TR con una media simple, que daba un ATR distinto y
+    # desincronizado de las plataformas de referencia.
     h = np.array([10.0, 12.0, 11.0, 13.0, 12.0])
     l = np.array([9.0, 10.0, 9.0, 11.0, 10.0])
     c = np.array([9.5, 11.0, 10.0, 12.5, 11.5])
     # TR manual: max(h-l, |h-c_prev|, |l-c_prev|), primer TR = h-l (sin prev)
     tr = [1.0, 2.5, 2.0, 3.0, 2.5]
     r = atr(h, l, c, 3)
-    esperado_i2 = sum(tr[0:3]) / 3       # 1.8333...
-    esperado_i3 = sum(tr[1:4]) / 3       # 2.5
-    esperado_i4 = sum(tr[2:5]) / 3       # 2.5
+    esperado_i2 = sum(tr[0:3]) / 3                    # semilla: SMA(1.0,2.5,2.0)=1.8333...
+    esperado_i3 = (esperado_i2 * 2 + tr[3]) / 3       # (1.8333*2+3.0)/3 = 2.2222...
+    esperado_i4 = (esperado_i3 * 2 + tr[4]) / 3       # (2.2222*2+2.5)/3 = 2.3148...
     assert r[2] == pytest.approx(esperado_i2)
     assert r[3] == pytest.approx(esperado_i3)
     assert r[4] == pytest.approx(esperado_i4)
@@ -96,20 +95,20 @@ def test_atr_es_media_simple_del_true_range():
 
 
 # ══════════════ Bollinger ══════════════
-def test_bollinger_usa_desviacion_muestral_ddof1():
-    # PIN: pandas .rolling().std() por defecto usa ddof=1 (muestral). La
-    # definición estándar de Bollinger usa desviación POBLACIONAL (ddof=0),
-    # lo que da bandas ligeramente más angostas. Se deja documentado, no se
-    # corrige en esta tarea (cambiaría las señales de cualquier estrategia
-    # que use Bollinger).
+def test_bollinger_usa_desviacion_poblacional_ddof0():
+    # pandas .rolling().std(ddof=0) usa la desviación POBLACIONAL (divide por
+    # n), la definición estándar de Bollinger (misma que ta.stdev biased=true
+    # en Pine e iBands en MT5). Antes usaba ddof=1 (muestral), que daba
+    # bandas ligeramente más anchas.
     c = np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0])
     media, sup, inf = bollinger(c, periodo=3, desv=2.0)
-    # para 3 enteros consecutivos (a-1,a,a+1): media=a, std muestral=1.0
-    # (std poblacional sería sqrt(2/3)=0.8165, distinto - confirma ddof=1)
+    # para 3 enteros consecutivos (a-1,a,a+1): media=a, std poblacional
+    # = sqrt(2/3)=0.8165 (std muestral sería 1.0, distinto - confirma ddof=0)
+    std_pob = np.sqrt(2.0 / 3.0)
     for i, centro in zip(range(2, 7), [2.0, 3.0, 4.0, 5.0, 6.0]):
         assert media[i] == pytest.approx(centro)
-        assert sup[i] == pytest.approx(centro + 2.0 * 1.0)
-        assert inf[i] == pytest.approx(centro - 2.0 * 1.0)
+        assert sup[i] == pytest.approx(centro + 2.0 * std_pob)
+        assert inf[i] == pytest.approx(centro - 2.0 * std_pob)
 
 
 # ══════════════ Stochastic ══════════════

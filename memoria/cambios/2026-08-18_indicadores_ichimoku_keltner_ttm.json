@@ -1,0 +1,25 @@
+{
+  "resumen_ejecutivo": "Cambio en 3 archivo(s) (686+ / 34- líneas).",
+  "modificaciones_clave": [
+    {
+      "archivo": "core/codegen/ir.py",
+      "motivo": "modificación detectada en el diff (revisar hunks)"
+    },
+    {
+      "archivo": "core/codegen/mql.py",
+      "motivo": "modificación detectada en el diff (revisar hunks)"
+    },
+    {
+      "archivo": "core/codegen/pine.py",
+      "motivo": "modificación detectada en el diff (revisar hunks)"
+    }
+  ],
+  "impacto_tecnico": [
+    "exportador de código Pine/MQL5 (core/codegen/)"
+  ],
+  "tags": [
+    "ir",
+    "mql",
+    "pine"
+  ]
+}

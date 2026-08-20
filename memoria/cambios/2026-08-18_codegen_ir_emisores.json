@@ -1,0 +1,30 @@
+{
+  "resumen_ejecutivo": "Cambio en 4 archivo(s) (437+ / 51- líneas).",
+  "modificaciones_clave": [
+    {
+      "archivo": "core/codegen/fidelidad.py",
+      "motivo": "modificación detectada en el diff (revisar hunks)"
+    },
+    {
+      "archivo": "core/codegen/ir.py",
+      "motivo": "modificación detectada en el diff (revisar hunks)"
+    },
+    {
+      "archivo": "core/codegen/pine.py",
+      "motivo": "modificación detectada en el diff (revisar hunks)"
+    },
+    {
+      "archivo": "core/codegen/runtime/pine_runtime.pine",
+      "motivo": "modificación detectada en el diff (revisar hunks)"
+    }
+  ],
+  "impacto_tecnico": [
+    "exportador de código Pine/MQL5 (core/codegen/)"
+  ],
+  "tags": [
+    "fidelidad",
+    "ir",
+    "pine",
+    "pine_runtime"
+  ]
+}

@@ -19,10 +19,11 @@ from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QCheckBox,
     QScrollArea, QFrame, QTableWidget, QTableWidgetItem, QHeaderView,
-    QSizePolicy, QPushButton, QButtonGroup, QInputDialog, QApplication,
+    QSizePolicy, QPushButton, QButtonGroup, QApplication,
     QGraphicsOpacityEffect,
 )
 from gui.widgets.bombear import bombear_eventos
+from gui.dialogs.mensajes import pedir_texto
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.patches import Rectangle
@@ -978,6 +979,26 @@ class TabPatrones(QWidget):
         bombear_eventos()
 
         self._cards = {}
+        # Las 32 tarjetas (13 clásicos + 19 extra), cada una con DOS canvases
+        # matplotlib (icono + evolución), se construían aquí: 64 figuras de
+        # una pestaña OCULTA en cada arranque, bloqueando la UI >1 s durante
+        # la precarga. Se construyen la primera vez que la pestaña se hace
+        # visible (_asegurar_cards).
+        self._cont_lay.addStretch()
+        bombear_eventos()
+
+        scroll.setWidget(cont)
+        root.addWidget(scroll, 1)
+        self._ajustar_altura_tabla(len(PATRONES_ORIGINALES))
+
+    def _asegurar_cards(self):
+        """Construye las tarjetas de patrones la primera vez que se
+        necesitan (pestaña visible o primera pintada de estadísticas)."""
+        if self._cards:
+            return
+        ultimo = self._cont_lay.count() - 1
+        if ultimo >= 0 and self._cont_lay.itemAt(ultimo).spacerItem() is not None:
+            self._cont_lay.takeAt(ultimo)
         for i, nombre in enumerate(PATRONES_INFO):
             if i and i % 5 == 0:
                 bombear_eventos()
@@ -987,11 +1008,6 @@ class TabPatrones(QWidget):
             self._cards[nombre] = card
             self._cont_lay.addWidget(card)
         self._cont_lay.addStretch()
-        bombear_eventos()
-
-        scroll.setWidget(cont)
-        root.addWidget(scroll, 1)
-        self._ajustar_altura_tabla(len(PATRONES_ORIGINALES))
 
     def _ajustar_altura_tabla(self, filas):
         alto = self.tabla.horizontalHeader().height() \
@@ -1000,6 +1016,7 @@ class TabPatrones(QWidget):
 
     @_no_crash
     def _on_toggle_extra(self, checked):
+        self._asegurar_cards()
         self._mostrar_extra = checked
         self.btn_mas_patrones.setText("Menos patrones ▲" if checked else "Más patrones ▾")
         for nombre, card in self._cards.items():
@@ -1057,6 +1074,7 @@ class TabPatrones(QWidget):
 
     def showEvent(self, ev):
         super().showEvent(ev)
+        self._asegurar_cards()
         if self._needs_scan and self._csv_path:
             self._start_scan()
 
@@ -1205,6 +1223,7 @@ class TabPatrones(QWidget):
     def _on_scan_done(self, path, payload):
         if path != self._csv_path:
             return  # resultado obsoleto: el activo cambió durante el escaneo
+        self._asegurar_cards()
         self._actualizar_habilitacion_botones()
         if 'error' in payload:
             self.lbl_estado.setText(f"Error leyendo el CSV: {payload['error']}")
@@ -1276,10 +1295,10 @@ class TabPatrones(QWidget):
     @_no_crash
     def _on_tf_custom_clicked(self):
         previo = self._tf_actual
-        texto, ok = QInputDialog.getText(
+        texto, ok = pedir_texto(
             self, "Temporalidad personalizada",
             "Temporalidad (p.ej. 20m, 90m, 2h, 3d, 5d, 2w):",
-            text=self._tf_custom or "")
+            inicial=self._tf_custom or "")
         if not ok:
             self._restaurar_boton_tf(previo)
             return
@@ -1369,6 +1388,7 @@ class TabPatrones(QWidget):
     def _refresh_stats(self, motivo=None):
         if self._payload is None:
             return
+        self._asegurar_cards()
         p = self._payload
         if motivo:
             # el refresco es síncrono en el hilo de la GUI: sin el repaint()

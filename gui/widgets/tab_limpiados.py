@@ -2,7 +2,7 @@ import os, json, re
 import pandas as pd
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                              QLabel, QLineEdit, QFrame, QTableWidget, QTableWidgetItem,
-                             QHeaderView, QMessageBox, QAbstractItemView, QSplitter,
+                             QHeaderView, QAbstractItemView, QSplitter,
                              QComboBox, QStackedWidget, QSizePolicy,
                              QApplication)
 from PyQt6.QtCore import Qt, pyqtSignal, QThread
@@ -12,6 +12,7 @@ from gui.widgets.rango_dialog import RangoAnalisisDialog
 from gui.widgets.bombear import bombear_eventos
 from gui.widgets import STYLE_ETIQUETA_SIN_CAJA
 from gui.widgets.progress_animada import ProgressBarAnimada
+from gui.dialogs.mensajes import error, confirmar
 
 from core.config import get_base_data, SCRIPTS_DIR, TF_PATTERN
 from core.rf_registry import leer_rf as leer_rf_registro
@@ -633,17 +634,13 @@ class TabLimpiados(QWidget):
             )
             self.preview_table.horizontalHeader().setStretchLastSection(True)
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"No se pudo leer el CSV:\n{e}")
+            error(self, "Error", f"No se pudo leer el CSV:\n{e}")
 
     def _delete(self):
         if not self._selected_path or not os.path.exists(self._selected_path):
             return
-        reply = QMessageBox.question(
-            self, "Confirmar eliminacion",
-            f"Eliminar {os.path.basename(self._selected_path)}?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
-        if reply == QMessageBox.StandardButton.Yes:
+        if confirmar(self, "Confirmar eliminacion",
+                 f"Eliminar {os.path.basename(self._selected_path)}?"):
             try:
                 os.remove(self._selected_path)
                 meta_path = self._selected_path + '.meta.json'
@@ -669,7 +666,7 @@ class TabLimpiados(QWidget):
                 self.explorer.set_root_path(self._limpiados_dir)
                 self._scan_assets()
             except Exception as e:
-                QMessageBox.critical(self, "Error", f"No se pudo eliminar:\n{e}")
+                error(self, "Error", f"No se pudo eliminar:\n{e}")
 
     # ── Analysis ──
 

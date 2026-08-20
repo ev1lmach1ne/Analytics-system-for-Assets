@@ -217,13 +217,25 @@ CARACTERISTICAS = {
                            "precio; TradingView lo mide en ticks, y cuántos "
                            "ticks equivalen a ese porcentaje depende del "
                            "instrumento, así que no se puede rellenar solo.",
+            'mt4': "El backtest suma un slippage fijo en PORCENTAJE del "
+                   "precio a cada relleno; MQL4 solo admite un deslizamiento "
+                   "en puntos al enviar la orden, que además no garantiza el "
+                   "precio, así que el porcentaje del backtest no se puede "
+                   "aplicar tal cual.",
+            'mt5': "El backtest suma un slippage fijo en PORCENTAJE del "
+                   "precio a cada relleno; MQL5 solo admite un deslizamiento "
+                   "en puntos al enviar la orden, que además no garantiza el "
+                   "precio, así que el porcentaje del backtest no se puede "
+                   "aplicar tal cual.",
         },
         'consecuencia': {
             NIVEL_APROXIMADO:
-                "El script se genera SIN slippage: sus resultados saldrán "
-                "algo mejores que los del backtest. Ponlo a mano en las "
-                "propiedades del script (el valor del backtest está en la "
-                "cabecera del archivo y en INSTALAR.md).",
+                "El código se genera SIN el slippage del backtest: cada "
+                "relleno ocurre al precio del mercado en ese momento (spread "
+                "real del bróker y deslizamiento real), así que las entradas "
+                "y salidas saldrán algo distintas a las del backtest. El "
+                "valor del backtest está en la cabecera del archivo y en "
+                "INSTALAR.md.",
         },
     },
     'redondeo_lotes': {
@@ -242,6 +254,27 @@ CARACTERISTICAS = {
                 "lote. En cuentas pequeñas o con lote mínimo alto el "
                 "redondeo puede ser grande, y con un riesgo por debajo del "
                 "lote mínimo el EA no abrirá la operación.",
+        },
+    },
+    'comision': {
+        'etiqueta': 'Comisión del backtest',
+        'motivos': {
+            'mt4': "La comisión no se puede fijar desde el código del EA: "
+                   "en vivo la cobra el bróker según el esquema de la cuenta, "
+                   "y en el probador la aplica la configuración del símbolo "
+                   "y de la ficha de contrato, no el porcentaje del backtest.",
+            'mt5': "La comisión no se puede fijar desde el código del EA: "
+                   "en vivo la cobra el bróker según el esquema de la cuenta, "
+                   "y en el probador la aplica la configuración del símbolo "
+                   "y de la ficha de contrato, no el porcentaje del backtest.",
+        },
+        'consecuencia': {
+            NIVEL_APROXIMADO:
+                "El EA no impone la comisión del backtest: en vivo se cobra "
+                "la del bróker (que puede no coincidir), y en el probador "
+                "hay que configurarla a mano para que coincida con la del "
+                "backtest. Con una comisión distinta, la curva de resultados "
+                "cambiará.",
         },
     },
     'cuenta_netting': {
@@ -263,7 +296,6 @@ CARACTERISTICAS = {
     # ── pendientes: el generador todavía no las emite (fase avanzada) ──
     'tramos_escalonados': {
         'etiqueta': 'Entrada escalonada por tramos',
-        'pendiente': True,
         'motivo_comun': "El generador todavía no emite la entrada escalonada "
                         "(cada tramo recalcula su tamaño con su propia "
                         "distancia al stop y reajusta el precio medio); está "
@@ -321,8 +353,6 @@ CARACTERISTICAS = {
     },
     'zigzag': {
         'etiqueta': 'Indicador ZigZag en las reglas',
-        'pendiente': True,
-        'bloquea_setup': True,
         'motivo_comun': "El generador todavía no emite el ZigZag no "
                         "repintante del Backtester, que confirma cada pivote "
                         "con retraso de media pierna.",
@@ -347,6 +377,48 @@ CARACTERISTICAS = {
                 "donde el backtest no llegó a entrar, y a peor precio.",
         },
     },
+    'tf_superior': {
+        'etiqueta': 'Filtro de tendencia de TF superior',
+        'pendiente': True,
+        'motivo_comun': "El generador todavía no resamplea la serie al "
+                        "timeframe superior para calcular la tendencia de "
+                        "fondo (en Pine sería request.security() y en MQL5 "
+                        "un indicador sobre el TF mayor).",
+        'consecuencia': {
+            NIVEL_OMITIDO:
+                "El código generado ignora el filtro: entrará también cuando "
+                "el precio NO esté alineado con la tendencia del TF "
+                "superior, por lo que generará más operaciones de las que "
+                "backtesteaste.",
+        },
+    },
+    'indicadores_editor_pendientes': {
+        'etiqueta': 'Indicadores nuevos en las reglas sin port de runtime',
+        'pendiente': True,
+        'bloquea_setup': True,
+        'motivo_comun': "El generador todavía no emite OBV ni VWAP (llegaron "
+                        "al editor de reglas sin su port de runtime; requieren "
+                        "volumen, que el backtest no transporta).",
+        'consecuencia': {
+            NIVEL_OMITIDO:
+                "La regla que los usa forma parte de la señal, así que ESTE "
+                "SETUP NO SE EXPORTA en vez de generar un archivo que opere "
+                "por criterios distintos a los que backtesteaste.",
+        },
+    },
+    'vwap': {
+        'etiqueta': 'VWAP con anclaje y bandas',
+        'motivo_comun': "El VWAP acumula hlc3·vol/vol por anclaje de "
+                        "calendario y resetea en cada borde.",
+        'consecuencia': {
+            NIVEL_APROXIMADO:
+                "En MetaTrader la alineación exacta barra/volumen del anclaje "
+                "depende de la plataforma: el acumulado se detecta con "
+                "iTime/iVolume y puede diferir del backtest en el momento "
+                "exacto del reinicio. En TradingView es exacto (timeframe."
+                "change + ta.vwap).",
+        },
+    },
 }
 
 
@@ -361,12 +433,11 @@ CARACTERISTICAS = {
 # implementando; el test de cobertura inversa impide que ninguna se declare
 # sin registrar antes un setup que la dispare.
 _PENDIENTES_NUCLEO = {
-    'tramos_escalonados': NIVEL_OMITIDO,
     'salidas_parciales': NIVEL_OMITIDO,
     'mecanismos_parciales': NIVEL_OMITIDO,
     'patrones_velas': NIVEL_OMITIDO,
-    'zigzag': NIVEL_OMITIDO,
     'entrada_limite_fib': NIVEL_OMITIDO,
+    'indicadores_editor_pendientes': NIVEL_OMITIDO,
 }
 
 CAPACIDADES = {
@@ -376,9 +447,13 @@ CAPACIDADES = {
         'sesion_utc': NIVEL_APROXIMADO,
         'dias_semana': NIVEL_APROXIMADO,
         'hurst': NIVEL_OMITIDO,          # PENDIENTE (la plataforma sí puede)
+        'vwap': NIVEL_APROXIMADO,
+        'tf_superior': NIVEL_OMITIDO,    # PENDIENTE
         'relleno_open_siguiente': NIVEL_APROXIMADO,
         'redondeo_lotes': NIVEL_APROXIMADO,
         'atr_de_la_vela_de_entrada': NIVEL_APROXIMADO,
+        'slippage_en_ticks': NIVEL_APROXIMADO,
+        'comision': NIVEL_APROXIMADO,
         'stop_atr_dinamico': NIVEL_OMITIDO,
         **_PENDIENTES_NUCLEO,
     },
@@ -387,10 +462,13 @@ CAPACIDADES = {
         'sesion_dst': NIVEL_APROXIMADO,
         'sesion_utc': NIVEL_APROXIMADO,
         'dias_semana': NIVEL_APROXIMADO,
-        'hurst': NIVEL_OMITIDO,          # PENDIENTE (la plataforma sí puede)
+        'vwap': NIVEL_APROXIMADO,
+        'tf_superior': NIVEL_OMITIDO,    # PENDIENTE
         'relleno_open_siguiente': NIVEL_APROXIMADO,
         'redondeo_lotes': NIVEL_APROXIMADO,
         'atr_de_la_vela_de_entrada': NIVEL_APROXIMADO,
+        'slippage_en_ticks': NIVEL_APROXIMADO,
+        'comision': NIVEL_APROXIMADO,
         'stop_atr_dinamico': NIVEL_OMITIDO,
         'cuenta_netting': NIVEL_APROXIMADO,
         **_PENDIENTES_NUCLEO,
@@ -401,6 +479,7 @@ CAPACIDADES = {
         'sesion_utc': NIVEL_EXACTO,
         'dias_semana': NIVEL_EXACTO,
         'hurst': NIVEL_OMITIDO,          # aquí NO es pendiente: no cabe
+        'tf_superior': NIVEL_OMITIDO,    # PENDIENTE (request.security)
         'relleno_open_siguiente': NIVEL_EXACTO,
         'atr_de_la_vela_de_entrada': NIVEL_APROXIMADO,
         'stop_atr_dinamico': NIVEL_OMITIDO,
@@ -409,12 +488,12 @@ CAPACIDADES = {
     },
 }
 
-# El Hurst está omitido en las tres, pero por razones distintas: en Pine no
-# cabe en el presupuesto de ejecución por barra (y no cabrá nunca), mientras
-# que en MQL sí cabe y solo falta implementarlo. El motivo que se le enseña al
-# usuario tiene que decir cuál de las dos cosas es.
+# El Hurst está omitido en Pine (no cabe en el presupuesto de ejecución por
+# barra) y pendiente en MQL4 (la plataforma sí puede, pero el generador aún no
+# lo emite para ese lenguaje). En MQL5 ya se porta entero (zcsHurst del
+# runtime) y se considera exacto.
 _PENDIENTE_POR_PLATAFORMA = {
-    'hurst': ('mt4', 'mt5'),
+    'hurst': ('mt4',),
 }
 
 
@@ -425,6 +504,15 @@ def es_pendiente(plataforma, clave):
     if clave in _PENDIENTE_POR_PLATAFORMA:
         return plataforma in _PENDIENTE_POR_PLATAFORMA[clave]
     return bool(cat.get('pendiente'))
+
+
+# Plantillas cuyo IR usa indicadores sin port de runtime: el aviso de
+# fidelidad las BLOQUEA al exportar, así que los emisores nunca las ven. La
+# lista la comparten los tests de emisores (PLANTILLAS_EMITIBLES) para no
+# parametrizar plantillas que jamás llegarían a emitirse.
+PLANTILLAS_SIN_EMISOR = frozenset((
+    'Patrones de velas',
+))
 
 
 def bloquea_setup(clave):
@@ -441,10 +529,11 @@ def nivel(plataforma, clave):
 
 # ══════════════ análisis de un sistema ══════════════
 
-def _caracteristicas_usadas(ir_st):
+def _caracteristicas_usadas(ir_st, cuenta):
     """Claves del catálogo que este setup activa de verdad, con el detalle
     concreto que se le enseñará al usuario ("sesión Nueva York", no
-    "sesión")."""
+    "sesión"). `cuenta` es el dict de cuenta global del sistema, para los
+    avisos que dependen de él (comisión)."""
     usadas = []
     filtros = ir_st['filtros']
     gestion = ir_st['gestion']
@@ -477,6 +566,12 @@ def _caracteristicas_usadas(ir_st):
         usadas.append(('hurst',
                        f"método {reg['metodo']}, ventana {reg['periodo']}"))
 
+    tfs = filtros['tf_superior']
+    if tfs:
+        usadas.append(('tf_superior',
+                       f"{tfs.get('indicador')}({tfs.get('periodo')}) de "
+                       f"{tfs.get('tf')}"))
+
     if gestion['entrada']['tipo'] == 'limite_fib':
         usadas.append(('entrada_limite_fib',
                        f"nivel {gestion['entrada']['nivel_fib']:g}"))
@@ -508,12 +603,30 @@ def _caracteristicas_usadas(ir_st):
     if any(s['tipo'] == 'ZIGZAG' for s in ir_st['series']):
         usadas.append(('zigzag', ''))
 
+    # Aroon/CMO/TRIX/StochRSI ya tienen port de runtime; OBV y VWAP siguen
+    # pendientes (necesitan volumen y son de uso marginal en reglas)
+    pendientes = ('OBV', 'VWAP')
+    tipos_pendientes = [s['tipo'] for s in ir_st['series']
+                        if s['tipo'] in pendientes]
+    if tipos_pendientes:
+        usadas.append(('indicadores_editor_pendientes',
+                       ", ".join(sorted(set(tipos_pendientes)))))
+
+    if any(s['tipo'] in ('VWAP_MEDIA', 'VWAP_SD', 'VWAP_SUP', 'VWAP_INF')
+           for s in ir_st['series']):
+        usadas.append(('vwap',
+                       ", ".join(sorted({f"{s.get('anclaje', 'W')}·{s.get('k', 1.0):g}"
+                                         for s in ir_st['series']
+                                         if s['tipo'] in ('VWAP_MEDIA', 'VWAP_SD',
+                                                          'VWAP_SUP', 'VWAP_INF')}))))
+
     # afectan a cualquier sistema, siempre
     usadas.append(('relleno_open_siguiente', ''))
     usadas.append(('redondeo_lotes', f"riesgo {gestion['riesgo_pct'] * 100:g}% por operación"))
     usadas.append(('atr_de_la_vela_de_entrada',
                    f"ATR({gestion['periodo_atr']})"))
     usadas.append(('slippage_en_ticks', ''))
+    usadas.append(('comision', f"{cuenta.get('comision_pct', 0.0) * 100:g}% por lado"))
     return usadas
 
 
@@ -547,7 +660,7 @@ def analizar(ir_sistema, plataforma):
     un aviso signifique siempre algo."""
     avisos = []
     for ir_st in ir_sistema['setups']:
-        for clave, detalle in _caracteristicas_usadas(ir_st):
+        for clave, detalle in _caracteristicas_usadas(ir_st, ir_sistema['cuenta']):
             aviso = _aviso(plataforma, clave, detalle,
                            ir_st['indice'], ir_st['nombre'])
             if aviso is not None:

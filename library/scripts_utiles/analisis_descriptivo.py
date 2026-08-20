@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from core.config import CONFIG_PATH, INFORMES_DIR, LIMPIADOS_DIR, BASE_DATA, tf_to_minutes
 from core.metrics import (calcular_er_series, calcular_kama_numba,
                           calcular_umbrales_er, contar_regimen_hurst,
-                          calcular_hurst_array)
+                          calcular_hurst_array, curvas_cambio_acumulado)
 from core.candle_patterns import SESIONES
 from scipy import stats
 from scipy.signal import fftconvolve
@@ -468,6 +468,9 @@ if __name__ == "__main__":
     r_std   = r.std()
     p05_r   = np.percentile(r, 5)
     p01_r   = np.percentile(r, 1)
+    # CVaR de todo el periodo: media de los retornos por debajo del percentil 5
+    _cola_r = r[r <= p05_r]
+    p05_cola_r = float(_cola_r.mean()) if len(_cola_r) else float(p05_r)
 
     # endregion
     # region ── 7. AUDITORÍA DE CALIDAD Y CONTROL DE INTERPOLACIÓN ───────────────────────
@@ -778,13 +781,24 @@ if __name__ == "__main__":
         var_95 = np.percentile(r_clean, 5)
         var_99 = np.percentile(r_clean, 1)
         lbl_var_95, lbl_var_99 = f'VaR 95% Histórico ({tf_actual})', f'VaR 99% Histórico ({tf_actual})'
+        # CVaR histórico: media de la cola más allá del VaR
+        cola95 = r_clean[r_clean <= var_95]
+        cola99 = r_clean[r_clean <= var_99]
+        cvar_95 = float(cola95.mean()) if len(cola95) else float(var_95)
+        cvar_99 = float(cola99.mean()) if len(cola99) else float(var_99)
+        lbl_cvar_95, lbl_cvar_99 = f'CVaR 95% Histórico ({tf_actual})', f'CVaR 99% Histórico ({tf_actual})'
     else:
         z_95, z_99 = stats.norm.ppf(0.05), stats.norm.ppf(0.01)
         var_95 = r_clean.mean() + z_95 * r_clean.std()
         var_99 = r_clean.mean() + z_99 * r_clean.std()
         lbl_var_95, lbl_var_99 = f'VaR 95% Paramétrico ({tf_actual})', f'VaR 99% Paramétrico ({tf_actual})'
+        # CVaR paramétrico: media - std·φ(z)/Φ(z)
+        cvar_95 = r_clean.mean() - r_clean.std() * (stats.norm.pdf(1.645) / 0.95)
+        cvar_99 = r_clean.mean() - r_clean.std() * (stats.norm.pdf(2.326) / 0.99)
+        lbl_cvar_95, lbl_cvar_99 = f'CVaR 95% Paramétrico ({tf_actual})', f'CVaR 99% Paramétrico ({tf_actual})'
     
     val_var_95, val_var_99 = f"{-var_95*100:.4f}%", f"{-var_99*100:.4f}%"
+    val_cvar_95, val_cvar_99 = f"{-cvar_95*100:.4f}%", f"{-cvar_99*100:.4f}%"
     
     # endregion
     # ==========================================================================
@@ -1729,6 +1743,8 @@ if __name__ == "__main__":
     _mostrar_categoria('6. VaR y Riesgo del Activo', {
         lbl_var_95: val_var_95,
         lbl_var_99: val_var_99,
+        lbl_cvar_95: val_cvar_95,
+        lbl_cvar_99: val_cvar_99,
         f'Peor caída en {tf_actual} (Mínimo)': f"{r.min()*100:.4f}%",
         f'Mayor subida en {tf_actual} (Máximo)': f"{r.max()*100:.4f}%",
         'Skewness': f"{r.skew():.4f}",
@@ -2768,9 +2784,33 @@ if __name__ == "__main__":
                         ax.text(val_var, -max(y) * (0.06 if idx == 0 else 0.16), etiqueta,
                                 color=colores_var[idx], fontsize=5.5, ha='center', fontweight='bold',
                                 bbox=dict(facecolor='black', alpha=0.8, edgecolor='none', pad=0.5))
+                    # CVaR (Expected Shortfall): la media de la cola más allá
+                    # del VaR. Paramétrico si la serie pasa normalidad
+                    # (media - std·φ(z)/Φ(z)), histórico si no (media de los
+                    # retornos <= al VaR). Se dibuja en línea discontinua, bajo
+                    # las etiquetas del VaR.
+                    for idx, (conf, z) in enumerate(zip(niveles_var, z_scores_var)):
+                        val_var = media - (z * std) if es_normal_p6 else np.percentile(r, (1-conf)*100)
+                        if es_normal_p6:
+                            val_cvar = media - std * (stats.norm.pdf(z) / conf)
+                        else:
+                            cola = r[r <= val_var]
+                            val_cvar = float(cola.mean()) if len(cola) else float(val_var)
+                        prob_cola = np.mean(r <= val_cvar)
+                        texto_freq_c = f"1 c/{1/prob_cola:.1f}vel" if prob_cola > 0 else "No reg."
+                        etiqueta_c = f"CVaR ({int(conf*100)}%): {val_cvar:.2%}\n({texto_freq_c})"
+                        ax.axvline(val_cvar, color=colores_var[idx], linestyle='--', linewidth=1.5, alpha=0.75)
+                        ax.text(val_cvar, -max(y) * (0.30 if idx == 0 else 0.42), etiqueta_c,
+                                color=colores_var[idx], fontsize=5.5, ha='center', fontweight='bold',
+                                bbox=dict(facecolor='black', alpha=0.8, edgecolor='none', pad=0.5))
     
                 ax.axvline(media, color='white', linestyle='--', linewidth=1, alpha=0.4)
-                ax.set_ylim(-max(y)*0.24, max(y)*1.15)
+                # el límite inferior se abre cuando la campana lleva CVaR (las
+                # etiquetas de la cola cuelgan por debajo de las del VaR)
+                if tipo_grafico == 'var':
+                    ax.set_ylim(-max(y)*0.50, max(y)*1.15)
+                else:
+                    ax.set_ylim(-max(y)*0.24, max(y)*1.15)
                 ax.set_title(titulo, color='white', fontsize=10, pad=6)
                 ax.tick_params(colors='#888780', labelsize=6)
                 ax.grid(True, alpha=0.03)
@@ -2838,6 +2878,17 @@ if __name__ == "__main__":
                                 else np.percentile(r, (1 - _conf) * 100))
                     _vars[str(_conf)] = {'val': float(_val_var),
                                          'prob': float(np.mean(r <= _val_var))}
+                    # CVaR (Expected Shortfall): la media de la cola más allá
+                    # del VaR. Paramétrico si la serie pasa normalidad, histórico
+                    # si no — misma lógica adaptativa que el VaR.
+                    if es_normal_p6:
+                        _val_cvar = r_media - r_std * (stats.norm.pdf(_z) / _conf)
+                    else:
+                        _cola = r[r <= _val_var]
+                        _val_cvar = float(_cola.mean()) if len(_cola) else float(_val_var)
+                    _vars[f'cvar{int(_conf * 100)}'] = {
+                        'val': float(_val_cvar),
+                        'prob': float(np.mean(r <= _val_cvar))}
 
                 _rolling = None
                 if 'r_var95' in locals() and len(r) > rolling_window * 2:
@@ -3234,6 +3285,91 @@ if __name__ == "__main__":
             plt.close()
     
     # endregion
+    # region ── PÁGINA M+8.5 — Cambio Acumulado Medio (Día/Semana/Mes/Año) ─────────
+        try:
+            fig = plt.figure(figsize=(11.69, 8.27))
+            fig.patch.set_facecolor('#0f0f0f')
+
+            _idx_ca = (df.index.tz_localize('UTC') if df.index.tz is None
+                       else df.index.tz_convert('UTC'))
+            if _idx_ca.tz is not None:
+                # a numpy las horas tz-aware no le caben en datetime64: pasar
+                # a UTC naive evita el UserWarning de astype en metrics.py.
+                _idx_ca = _idx_ca.tz_localize(None)
+            dias_semana_ca = 7 if CONFIG['activo'] == 'CRYPTO' else 5
+            curvas_ca = curvas_cambio_acumulado(
+                df['retorno'].to_numpy(), _idx_ca.to_numpy(), dias_semana_ca)
+
+            if not curvas_ca:
+                ax = fig.add_subplot(111)
+                ax.axis('off')
+                ax.set_facecolor('#111111')
+                ax.text(0.5, 0.5, "Cambio acumulado medio no disponible.\nSin retornos con fecha válida.",
+                        ha='center', va='center', fontsize=12, color='#888780', transform=ax.transAxes)
+            else:
+                _NOMBRES_CA = {'dia': 'Día (24h)', 'semana': 'Semana',
+                               'mes': 'Mes', 'anio': 'Año'}
+                gs = gridspec.GridSpec(2, 2, hspace=0.50, wspace=0.22)
+                for i, _clave_ca in enumerate(('dia', 'semana', 'mes', 'anio')):
+                    ax = fig.add_subplot(gs[i])
+                    ax.set_facecolor('#111111')
+                    _c_curva = curvas_ca.get(_clave_ca)
+                    if _c_curva is None:
+                        ax.axis('off')
+                        ax.text(0.5, 0.5, "Sin periodo completo", ha='center',
+                                va='center', fontsize=10, color='#888780',
+                                transform=ax.transAxes)
+                        continue
+                    _x_ca = _c_curva['pasos']
+                    _y_ca = _c_curva['y']
+                    _labels_ca = _c_curva['labels']
+                    if len(_y_ca) >= 2:
+                        _seg_ca = np.array([_x_ca, _y_ca]).T.reshape(-1, 1, 2)
+                        _segs_ca = np.concatenate([_seg_ca[:-1], _seg_ca[1:]], axis=1)
+                        _col_ca = np.where(np.diff(_y_ca) >= 0, '#1D9E75', '#E24B4A')
+                        ax.add_collection(LineCollection(
+                            _segs_ca, colors=_col_ca, linewidth=1.4, alpha=0.95, zorder=2))
+                    ax.plot(_x_ca, _y_ca, 'o', color='#58a6ff', markersize=3,
+                            zorder=3, alpha=0.7)
+                    ax.autoscale()
+                    ax.axhline(0, color='#888780', linewidth=0.6, linestyle='--', alpha=0.6)
+                    ax.plot([_x_ca[-1]], [_y_ca[-1]], 'D', markersize=7, zorder=4,
+                            color='#1D9E75' if _y_ca[-1] >= 0 else '#E24B4A')
+                    ax.text(_x_ca[-1], _y_ca[-1], f"{_c_curva['total']:+.2f}%",
+                            fontsize=8, color='white', fontweight='bold',
+                            ha='left', va='bottom',
+                            bbox=dict(boxstyle='round,pad=0.15', facecolor='#222',
+                                      alpha=0.7, edgecolor='none'))
+                    _paso_ticks_ca = max(1, len(_labels_ca) // 8)
+                    _ticks_ca = list(_x_ca[::_paso_ticks_ca])
+                    if _x_ca[-1] not in _ticks_ca:
+                        _ticks_ca.append(_x_ca[-1])
+                    ax.set_xticks(_ticks_ca)
+                    ax.set_xticklabels([_labels_ca[int(t)] for t in _ticks_ca],
+                                       fontsize=7)
+                    ax.tick_params(colors='#888780', labelsize=7)
+                    ax.grid(True, alpha=0.15, color='#444')
+                    ax.set_title(f"{_NOMBRES_CA[_clave_ca]} — cambio acumulado medio\n"
+                                 f"({_c_curva['n']} periodos completos)",
+                                 color='white', fontsize=10, pad=6)
+                    ax.set_ylabel('Cambio acumulado %', color='#888780', fontsize=7)
+                    for spine in ax.spines.values():
+                        spine.set_edgecolor('#333')
+
+                if _EXPORTAR_PLOT:
+                    _PLOT['cambio_acumulado'] = dict(curvas_ca)
+                    _PLOT['cambio_acumulado']['dias_semana'] = dias_semana_ca
+
+            pdf.savefig(fig, facecolor=fig.get_facecolor(), dpi=150)
+            plt.close()
+            _registrar_pagina('Cambio Acumulado Medio (Día/Semana/Mes/Año)')
+
+        except Exception as e:
+            print(f"ERROR EN PÁGINA M+8.5 (Cambio Acumulado Medio): {e}")
+            traceback.print_exc()
+            plt.close()
+
+    # endregion
     # region ── PÁGINA M+9 — NATR, correlación Multi-TF ─────
         try:
             fig = plt.figure(figsize=(11.69, 8.27))
@@ -3416,12 +3552,22 @@ if __name__ == "__main__":
             if _EXPORTAR_PLOT:
                 _tiene_acf_sq = (not np.isnan(clustering_lag1) and len(r_sq_clean) > 30
                                  and min(20, len(r_sq_clean) // 4 - 1) >= 2)
+                _serie_dia_exp = _arr(series_temporales['dia']).astype(float)
+                # Valores ACF/PACF por lag para el crosshair de la GUI (mismos
+                # defaults que plot_acf/plot_pacf: nlags=15, sin ajuste).
+                _acf_exp = None
+                _pacf_exp = None
+                if len(_serie_dia_exp) > 20:
+                    _acf_exp = np.asarray(acf(_serie_dia_exp, nlags=15), dtype=float)
+                    _pacf_exp = np.asarray(pacf(_serie_dia_exp, nlags=15), dtype=float)
                 _PLOT['dependencia'] = {
                     'escalas': {'labels': [str(i) for i in df_heat.index],
                                 'valores': df_heat.values.ravel().astype(float)},
                     # plot_acf/plot_pacf aceptan un array: la GUI los llama
                     # sobre esta misma serie diaria (pequeña, ya agregada).
-                    'serie_dia': _arr(series_temporales['dia']).astype(float),
+                    'serie_dia': _serie_dia_exp,
+                    'acf': _acf_exp,
+                    'pacf': _pacf_exp,
                     'precio_real': np.asarray(precio_real_sim, dtype=float),
                     'random_walks': _walks_export,
                     'acf_sq': (np.asarray(acf_sq_full, dtype=float) if _tiene_acf_sq else None),
@@ -3774,6 +3920,7 @@ if __name__ == "__main__":
                 'vol_diaria': _f(vol_diaria),
                 'var95': _f(p05_r),
                 'var99': _f(p01_r),
+                'cvar95': _f(p05_cola_r),
                 'total_velas': int(len(df)),
                 # ── forma de la distribución ──
                 'kurtosis': _f(r.kurtosis()),

@@ -57,6 +57,19 @@ _ACTIVADORES = {
     'dias_semana': lambda: _con_filtro(dias_semana=[0, 1, 2]),
     'hurst': lambda: _con_filtro(
         regimen={'metodo': 'hurst_tendencia', 'periodo': 400}),
+    'tf_superior': lambda: _con_filtro(
+        tf_superior={'indicador': 'SMA', 'tf': '1h', 'periodo': 200,
+                     'relacion': 'ambos'}),
+    'indicadores_editor_pendientes': lambda: {
+        'nombre': 'custom obv', 'plantilla': 'Custom (reglas)',
+        'params': {'reglas': {'entradas_long': [{'condiciones': [
+            {'izq': {'tipo': 'OBV', 'periodo': 14}, 'op': '>',
+             'der': {'tipo': 'valor', 'valor': 0.0}}]}]}},
+        'filtros': _filtros_por_defecto()},
+    'vwap': lambda: _setup(
+        plantilla='VWAP',
+        params={'anclaje': 'W', 'modo': 'sd', 'k': 2.0,
+                'direccion': 'Ambas'}),
     'entrada_limite_fib': lambda: _setup(
         entrada={'tipo': 'limite_fib', 'nivel_fib': 0.618}),
     'relleno_open_siguiente': _setup,
@@ -64,6 +77,7 @@ _ACTIVADORES = {
     'atr_de_la_vela_de_entrada': _setup,
     'stop_atr_dinamico': lambda: _setup(stop_atr_modo='dinamico_promedio'),
     'slippage_en_ticks': _setup,
+    'comision': _setup,
     'tramos_escalonados': lambda: _setup(
         tramos=[{'pct': 60.0, 'trigger': 'senal'},
                 {'pct': 40.0, 'trigger': 'retroceso', 'val': 1.0}]),
@@ -129,21 +143,23 @@ def test_lo_pendiente_dice_que_es_del_generador_y_no_de_la_plataforma():
                 assert 'todavía no' not in motivo, (plataforma, clave, motivo)
 
 
-def test_el_hurst_es_pendiente_en_mql_pero_imposible_en_pine():
-    """Mismo ❌, razones opuestas: en MQL cabe y falta implementarlo; en Pine
-    no cabe en el presupuesto de ejecución por barra y no va a caber."""
-    assert fidelidad.es_pendiente('mt5', 'hurst')
+def test_el_hurst_es_exacto_en_mql5_pendiente_en_mql4_e_imposible_en_pine():
+    """El Hurst se porta entero a MQL5 (zcsHurst del runtime) y ya no avisa;
+    en MQL4 sigue pendiente de implementar; en Pine no cabe en el presupuesto
+    de ejecución por barra y no va a caber."""
+    assert fidelidad.nivel('mt5', 'hurst') == fidelidad.NIVEL_EXACTO
     assert fidelidad.es_pendiente('mt4', 'hurst')
     assert not fidelidad.es_pendiente('tradingview', 'hurst')
 
 
 def test_solo_bloquean_el_setup_las_caracteristicas_que_son_la_senal():
     """Perder un filtro degrada el sistema; perder la señal lo deja sin nada
-    que hacer, y entonces no se genera archivo."""
+    que hacer, y entonces no se genera archivo. El ZigZag ya no bloquea: se
+    porta al runtime (zcsZigzag)."""
     assert fidelidad.bloquea_setup('patrones_velas')
-    assert fidelidad.bloquea_setup('zigzag')
+    assert not fidelidad.bloquea_setup('zigzag')
     for clave in ('noticias', 'hurst', 'tramos_escalonados',
-                  'salidas_parciales', 'entrada_limite_fib'):
+                  'salidas_parciales', 'entrada_limite_fib', 'zigzag'):
         assert not fidelidad.bloquea_setup(clave), clave
 
 
@@ -198,13 +214,16 @@ def test_un_sistema_limpio_en_pine_solo_avisa_de_lo_inevitable():
 
 
 def test_metatrader_avisa_siempre_de_lo_inevitable_pero_sin_omitir_nada():
-    """Los tres son inevitables y afectan a cualquier sistema: el EA reacciona
-    al primer tick de la vela, el tamaño se redondea al paso de lote y el ATR
-    de dimensionamiento va una vela por detrás del que usó el backtest."""
+    """Los cinco son inevitables y afectan a cualquier sistema: el EA
+    reacciona al primer tick de la vela, el tamaño se redondea al paso de
+    lote, el ATR de dimensionamiento va una vela por detrás del que usó el
+    backtest, y el slippage y la comisión del backtest no se pueden fijar
+    desde el código (los pone el mercado/probador)."""
     for plataforma in ('mt4', 'mt5'):
         avisos = fidelidad.analizar(_sistema(_setup()), plataforma)
         assert _claves(avisos) == {'relleno_open_siguiente', 'redondeo_lotes',
-                                   'atr_de_la_vela_de_entrada'}
+                                   'atr_de_la_vela_de_entrada',
+                                   'slippage_en_ticks', 'comision'}
         assert fidelidad.nivel_global(avisos) == fidelidad.NIVEL_APROXIMADO
 
 
@@ -231,6 +250,18 @@ def test_el_tramo_unico_al_cien_por_cien_no_avisa_de_escalonado():
     ruido en cada exportación."""
     setup = _setup(tramos=[{'pct': 100.0, 'trigger': 'senal'}])
     for plataforma in PLATAFORMAS:
+        assert 'tramos_escalonados' not in _claves(
+            fidelidad.analizar(_sistema(setup), plataforma))
+
+
+def test_la_entrada_escalonada_ya_no_avisa_porque_se_emite():
+    """El generador ya emite los tramos (zcsTramoActual / strategy.order), así
+    que la entrada escalonada dejó de ser una omisión."""
+    setup = _setup(tramos=[{'pct': 60.0, 'trigger': 'senal'},
+                           {'pct': 40.0, 'trigger': 'retroceso', 'val': 1.0}])
+    for plataforma in PLATAFORMAS:
+        assert fidelidad.nivel(plataforma,
+                               'tramos_escalonados') == fidelidad.NIVEL_EXACTO
         assert 'tramos_escalonados' not in _claves(
             fidelidad.analizar(_sistema(setup), plataforma))
 
@@ -299,15 +330,19 @@ def test_la_sesion_con_huso_propio_es_exacta_en_pine_y_aproximada_en_metatrader(
                          'sesion_dst') == fidelidad.NIVEL_APROXIMADO
 
 
-def test_el_hurst_se_omite_hoy_en_las_tres_pero_por_motivos_distintos():
-    """En MQL está pendiente de implementar y acabará bajando a ✅; en Pine no
-    cabe en el presupuesto de ejecución por barra y se queda en ❌."""
+def test_el_hurst_es_exacto_en_mql5_y_se_omite_en_pine_y_mql4():
+    """MQL5 ya lo porta (zcsHurst del runtime) y no avisa; en Pine no cabe en
+    el presupuesto de ejecución por barra y se queda en ❌; en MQL4 sigue
+    pendiente de implementar."""
     sistema = _sistema(_ACTIVADORES['hurst']())
-    for plataforma in PLATAFORMAS:
-        avisos = fidelidad.analizar(sistema, plataforma)
-        assert _nivel_de(avisos, 'hurst') == fidelidad.NIVEL_OMITIDO, plataforma
-        aviso = [a for a in avisos if a['clave'] == 'hurst'][0]
-        assert aviso['pendiente'] == (plataforma in ('mt4', 'mt5'))
+    assert _nivel_de(fidelidad.analizar(sistema, 'mt5'),
+                     'hurst') is None            # exacto: sin aviso
+    avisos = fidelidad.analizar(sistema, 'mt4')
+    assert _nivel_de(avisos, 'hurst') == fidelidad.NIVEL_OMITIDO
+    assert [a for a in avisos if a['clave'] == 'hurst'][0]['pendiente'] is True
+    avisos = fidelidad.analizar(sistema, 'tradingview')
+    assert _nivel_de(avisos, 'hurst') == fidelidad.NIVEL_OMITIDO
+    assert [a for a in avisos if a['clave'] == 'hurst'][0]['pendiente'] is False
 
 
 def test_el_regimen_por_er_no_se_omite_en_ninguna_plataforma():

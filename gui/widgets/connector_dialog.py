@@ -2,10 +2,11 @@
 
 import os
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
-                              QLineEdit, QComboBox, QPushButton, QMessageBox,
+                              QLineEdit, QComboBox, QPushButton,
                               QFormLayout, QGroupBox, QFrame)
 from PyQt6.QtCore import Qt
 from core.connectors import load_connectors, save_connector, delete_connector
+from gui.dialogs.mensajes import aviso, informacion, error, confirmar
 
 _CHEVRON_SVG = os.path.join(os.path.dirname(__file__), '..', 'assets',
                             'chevron-down.svg').replace('\\', '/')
@@ -183,10 +184,10 @@ class ConnectorDialog(QDialog):
         env = self.env_combo.currentText()
 
         if not api_key:
-            QMessageBox.warning(self, "Error", "API Key requerida")
+            aviso(self, "Error", "API Key requerida")
             return
         if not account_id:
-            QMessageBox.warning(self, "Error", "Account ID requerido")
+            aviso(self, "Error", "Account ID requerido")
             return
 
         self.btn_test.setEnabled(False)
@@ -204,17 +205,17 @@ class ConnectorDialog(QDialog):
             client.request(r)
             alias = r.response.get('account', {}).get('alias', 'Unknown')
             balance = r.response.get('account', {}).get('balance', '?')
-            QMessageBox.information(
+            informacion(
                 self, "Conexion OK",
                 f"Conectado a OANDA {env}\nCuenta: {alias}\nBalance: ${balance}"
             )
         except ImportError:
-            QMessageBox.critical(
+            error(
                 self, "Error",
                 "oandapyV20 no instalado. Ejecuta: pip install oandapyV20"
             )
         except Exception as e:
-            QMessageBox.critical(self, "Error de conexion", str(e))
+            error(self, "Error de conexion", str(e))
         finally:
             self.btn_test.setEnabled(True)
             self.btn_test.setText("  Test Connection")
@@ -222,14 +223,14 @@ class ConnectorDialog(QDialog):
     def _save(self):
         name = self.name_edit.text().strip()
         if not name:
-            QMessageBox.warning(self, "Error", "Nombre requerido")
+            aviso(self, "Error", "Nombre requerido")
             return
 
         existing = load_connectors()
         for c in existing:
             if c.get('name') == name and name != self._edit_name:
-                QMessageBox.warning(self, "Error",
-                                    f"Ya existe un conector '{name}'")
+                aviso(self, "Error",
+                      f"Ya existe un conector '{name}'")
                 return
 
         self._config = {
@@ -243,11 +244,7 @@ class ConnectorDialog(QDialog):
         self.accept()
 
     def _delete(self):
-        r = QMessageBox.question(
-            self, "Confirmar",
-            f"Eliminar conector '{self._edit_name}'?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
-        if r == QMessageBox.StandardButton.Yes:
+        if confirmar(self, "Confirmar",
+                   f"Eliminar conector '{self._edit_name}'?"):
             delete_connector(self._edit_name)
             self.accept()

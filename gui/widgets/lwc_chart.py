@@ -27,6 +27,9 @@ from core.backtest import ORDEN_RELLENADA
 from core.strategies import (
     sma, ema, rsi, atr, bollinger, stochastic, williams_r, cci, _kama_serie,
     _zigzag_pivotes, tramos_zigzag_vigentes, _er_serie, _hurst_serie,
+    _supertrend_serie, _macd_series, _adx_series, _aroon_series, _cmo_serie,
+    _trix_serie, _stochrsi_series, _ichimoku_series, _keltner_series,
+    _ttm_squeeze_series, _vwap_series,
     UMBRAL_ER_TENDENCIA, UMBRAL_ER_RUIDO,
     UMBRAL_HURST_TENDENCIA, UMBRAL_HURST_REVERSION,
 )
@@ -94,6 +97,18 @@ _PAL_STOCH_K = ['#26c6da', '#4fc3f7', '#80deea']
 _PAL_STOCH_D = ['#f06292', '#ec407a', '#f8bbd0']
 _PAL_WILLIAMS = ['#ec407a', '#f06292', '#f8bbd0']
 _PAL_CCI = ['#5c6bc0', '#7986cb', '#9fa8da']
+_COLOR_SUPERTREND = '#d4a5f5'
+_PAL_MACD = ['#4fc3f7', '#f1c40f']
+_PAL_ADX = ['#7986cb', '#2ecc71', '#e74c3c']
+_PAL_AROON = ['#1abc9c', '#16a085']
+_PAL_CMO = ['#ffa726', '#ffb74d']
+_PAL_TRIX = ['#ff7043', '#ff8a65']
+_PAL_STOCHRSI = ['#fd79a8', '#f8bbd0']
+_COLOR_ICH_TENKAN = '#00bcd4'
+_COLOR_ICH_KIJUN = '#ff7043'
+_COLOR_ICH_SENKOU = '#78909c'
+_COLOR_KELTNER = '#26a69a'
+_PAL_VWAP = ['#9aa7b8', '#7a8ba3', '#b8c4d4', '#5d6f8a']
 
 _HTML = """<!doctype html>
 <html><head><meta charset="utf-8">
@@ -146,7 +161,10 @@ osciladores.forEach(function (osc, i) {
   const paneIndex = i + 1;
   let primera = null;
   osc.series.forEach(function (s) {
-    const linea = chart.addSeries(LightweightCharts.LineSeries, {
+    const esHist = s.kind === 'histogram';
+    const linea = chart.addSeries(esHist
+        ? LightweightCharts.HistogramSeries
+        : LightweightCharts.LineSeries, {
       color: s.color, lineWidth: 1, lastValueVisible: false,
       priceLineVisible: false, crosshairMarkerVisible: false,
     }, paneIndex);
@@ -367,7 +385,8 @@ class LwcChart(QWidget):
             })
 
         overlays, bandas, osciladores, patron_markers = (
-            LwcChart._construir_indicadores(unix, c, h, l, o, indicadores))
+            LwcChart._construir_indicadores(unix, c, h, l, o, indicadores,
+                                            payload.get('volume')))
         markers += patron_markers
         overlays += LwcChart._construir_capas_limite(
             unix, h, l, resultado, indicadores, capas)
@@ -496,7 +515,7 @@ class LwcChart(QWidget):
         return overlays
 
     @staticmethod
-    def _construir_indicadores(unix, y, h, l, o, indicadores):
+    def _construir_indicadores(unix, y, h, l, o, indicadores, volume=None):
         """Calcula, a partir del dict que devuelve _recolectar_indicadores
         (tab_backtest.py), las series de overlay (medias/KAMA), bandas
         (Bollinger) y paneles de oscilador para la vista moderna, más
@@ -529,6 +548,36 @@ class LwcChart(QWidget):
         for per_er, rapido, lento in indicadores.get('kamas', ()):
             overlays.append({'color': _KAMA_COLOR,
                               'data': _serie(_kama_serie(y, per_er, rapido, lento))})
+
+        for per, mult in sorted(indicadores.get('supertrends', ()), key=lambda x: (x[0], x[1])):
+            st, _tend = _supertrend_serie(h, l, y, per, mult)
+            overlays.append({'color': _COLOR_SUPERTREND, 'data': _serie(st)})
+
+        for tenkan, kijun, senkou in sorted(indicadores.get('ichimokus', ())):
+            t_v, k_v, sa, sb, _ch = _ichimoku_series(h, l, y, tenkan, kijun, senkou)
+            for color, serie_v in ((_COLOR_ICH_TENKAN, t_v),
+                                   (_COLOR_ICH_KIJUN, k_v),
+                                   (_COLOR_ICH_SENKOU, sa),
+                                   (_COLOR_ICH_SENKOU, sb)):
+                overlays.append({'color': color, 'data': _serie(serie_v)})
+
+        for per, mult in sorted(indicadores.get('keltners', ())):
+            media_kc, sup_kc, inf_kc = _keltner_series(y, h, l, per, mult)
+            for serie_v in (media_kc, sup_kc, inf_kc):
+                overlays.append({'color': _COLOR_KELTNER, 'data': _serie(serie_v)})
+
+        vwaps = indicadores.get('vwaps', ())
+        if vwaps and volume is not None:
+            ts_idx = pd.DatetimeIndex(
+                pd.to_datetime(unix, unit='s', utc=True))
+            df_v = pd.DataFrame({'timestamp': ts_idx, 'high': h, 'low': l,
+                                 'close': y, 'volume': volume})
+            for i, (anclaje, k, modo) in enumerate(sorted(vwaps)):
+                r = _vwap_series(df_v, anclaje, k, modo)
+                color_v = _PAL_VWAP[i % len(_PAL_VWAP)]
+                overlays.append({'color': color_v, 'data': _serie(r['media'])})
+                overlays.append({'color': color_v, 'data': _serie(r['sup'])})
+                overlays.append({'color': color_v, 'data': _serie(r['inf'])})
 
         patrones_set = indicadores.get('patrones', ())
         if patrones_set:
@@ -598,6 +647,110 @@ class LwcChart(QWidget):
                 panel['lines'] += [{'value': sobrecompra, 'color': _ROJO},
                                    {'value': 0, 'color': _GRIS},
                                    {'value': sobreventa, 'color': _VERDE}]
+            osciladores.append(panel)
+
+        macds = indicadores.get('macds', ())
+        if macds:
+            panel = {'height': 120, 'series': [], 'lines': []}
+            for i, (rapido, lento, senal) in enumerate(sorted(macds)):
+                linea, senal_l, hist = _macd_series(y, rapido, lento, senal)
+                # histograma con color por barra (verde/rojo según el signo)
+                datos_hist = [
+                    {'time': int(unix[i]), 'value': float(hist[i]),
+                     'color': _VERDE if hist[i] >= 0 else _ROJO}
+                    for i in range(len(unix)) if np.isfinite(hist[i])]
+                panel['series'].append({'kind': 'histogram',
+                                        'color': _VERDE, 'data': datos_hist})
+                panel['series'].append({'color': _PAL_MACD[0],
+                                        'data': _serie(linea)})
+                panel['series'].append({'color': _PAL_MACD[1],
+                                        'data': _serie(senal_l)})
+                panel['lines'] += [{'value': 0, 'color': _GRIS}]
+            osciladores.append(panel)
+
+        adxs = indicadores.get('adxs', ())
+        if adxs:
+            panel = {'height': 120, 'series': [], 'lines': []}
+            for i, (per, umbral) in enumerate(sorted(adxs)):
+                adx, pdi, mdi = _adx_series(h, l, y, per)
+                panel['series'].append({'color': _PAL_ADX[0], 'data': _serie(adx)})
+                panel['series'].append({'color': _PAL_ADX[1], 'data': _serie(pdi)})
+                panel['series'].append({'color': _PAL_ADX[2], 'data': _serie(mdi)})
+                panel['lines'] += [{'value': umbral, 'color': _AMBAR}]
+            osciladores.append(panel)
+
+        aroones = indicadores.get('aroones', ())
+        if aroones:
+            panel = {'height': 120, 'series': [], 'lines': []}
+            for i, per in enumerate(sorted(aroones)):
+                up, dn = _aroon_series(h, l, per)
+                panel['series'].append({'color': _PAL_AROON[0], 'data': _serie(up)})
+                panel['series'].append({'color': _PAL_AROON[1], 'data': _serie(dn)})
+                panel['lines'] += [{'value': 70, 'color': _ROJO},
+                                   {'value': 30, 'color': _VERDE}]
+            osciladores.append(panel)
+
+        cmos = indicadores.get('cmos', ())
+        if cmos:
+            panel = {'height': 120, 'series': [], 'lines': []}
+            for i, per in enumerate(sorted(cmos)):
+                panel['series'].append({'color': _PAL_CMO[i % len(_PAL_CMO)],
+                                        'data': _serie(_cmo_serie(y, per))})
+                panel['lines'] += [{'value': 0, 'color': _GRIS}]
+            osciladores.append(panel)
+
+        trixes = indicadores.get('trixes', ())
+        if trixes:
+            panel = {'height': 120, 'series': [], 'lines': []}
+            for i, per in enumerate(sorted(trixes)):
+                panel['series'].append({'color': _PAL_TRIX[i % len(_PAL_TRIX)],
+                                        'data': _serie(_trix_serie(y, per))})
+                panel['lines'] += [{'value': 0, 'color': _GRIS}]
+            osciladores.append(panel)
+
+        stochrsis = indicadores.get('stochrsis', ())
+        if stochrsis:
+            panel = {'height': 120, 'series': [], 'lines': []}
+            for i, per in enumerate(sorted(stochrsis)):
+                k, d = _stochrsi_series(y, per)
+                panel['series'].append({'color': _PAL_STOCHRSI[0], 'data': _serie(k)})
+                panel['series'].append({'color': _PAL_STOCHRSI[1], 'data': _serie(d)})
+                panel['lines'] += [{'value': 0.8, 'color': _ROJO},
+                                   {'value': 0.2, 'color': _VERDE}]
+            osciladores.append(panel)
+
+        ttms = indicadores.get('ttms', ())
+        if ttms:
+            panel = {'height': 120, 'series': [], 'lines': []}
+            for i, (per, mult_bb, mult_kc) in enumerate(sorted(ttms)):
+                sq, mom = _ttm_squeeze_series(y, h, l, per, mult_bb, mult_kc)
+                sq_f = np.where(np.isfinite(mom), np.asarray(sq, dtype=float), np.nan)
+                panel['series'].append({'color': _GRIS, 'data': _serie(sq_f)})
+                datos_hist = [
+                    {'time': int(unix[i]), 'value': float(mom[i]),
+                     'color': _VERDE if mom[i] >= 0 else _ROJO}
+                    for i in range(len(unix)) if np.isfinite(mom[i])]
+                panel['series'].append({'kind': 'histogram', 'color': _VERDE,
+                                        'data': datos_hist})
+                panel['lines'] += [{'value': 0, 'color': _GRIS}]
+            osciladores.append(panel)
+
+        vwaps = indicadores.get('vwaps', ())
+        if vwaps and volume is not None:
+            ts_idx = pd.DatetimeIndex(pd.to_datetime(unix, unit='s', utc=True))
+            df_v = pd.DataFrame({'timestamp': ts_idx, 'high': h, 'low': l,
+                                 'close': y, 'volume': volume})
+            panel = {'height': 120, 'series': [], 'lines': []}
+            for i, (anclaje, k, modo) in enumerate(sorted(vwaps)):
+                r = _vwap_series(df_v, anclaje, k, modo)
+                sd_pos = np.where(r['sd'] > 0, r['sd'], np.nan)
+                dist = (y - r['media']) / sd_pos
+                color_v = _PAL_VWAP[i % len(_PAL_VWAP)]
+                panel['series'].append({'color': color_v, 'data': _serie(dist)})
+            for ref in (1, 2, 3):
+                panel['lines'] += [{'value': ref, 'color': _ROJO},
+                                   {'value': -ref, 'color': _VERDE}]
+            panel['lines'] += [{'value': 0, 'color': _GRIS}]
             osciladores.append(panel)
 
         # régimen ER / Hurst: mismas series y umbrales que la vista clásica

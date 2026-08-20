@@ -1,10 +1,11 @@
 import os
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
-                              QLineEdit, QPushButton, QFileDialog, QFrame)
+                              QLineEdit, QPushButton, QFrame)
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QIcon
 
 from core.config import get_base_data, set_base_data, PROJECT_ROOT
+from gui.dialogs.mensajes import elegir_directorio
 
 STYLE = """
 QDialog { background-color: #141e30; }
@@ -114,9 +115,7 @@ class FirstLaunchDialog(QDialog):
         cur = self.path_input.text() or get_base_data()
         if not os.path.isdir(cur):
             cur = ""
-        path = QFileDialog.getExistingDirectory(
-            self, "Seleccionar carpeta de datos", cur
-        )
+        path = elegir_directorio(self, "Seleccionar carpeta de datos", cur)
         if path:
             self.path_input.setText(path)
 

@@ -51,9 +51,12 @@ def test_atr_bajo_admite_la_calma_posterior_al_pico():
     """Tras el pico el ATR vuelve al suelo mientras la ventana aún recuerda la
     volatilidad alta: eso es percentil bajo. El corte no puede ser muy
     estricto porque el suelo empata consigo mismo en la mayoría de la ventana,
-    y los empates cuentan a mitad de rango."""
+    y los empates cuentan a mitad de rango. El ATR usa el suavizado de Wilder
+    (recursivo), que decae despacio tras el pico: la calma se lee como
+    percentil bajo algo más tarde que con una media simple (desde ~260 en
+    esta serie en vez de ~240)."""
     m = _mascara(_df_con_pico(), 'atr_percentil_bajo', percentil=40.0)
-    assert m[PICO_FIN + 20:PICO_INI + VENTANA].all()
+    assert m[260:PICO_INI + VENTANA].all()
     assert not m[PICO_INI + 5:PICO_FIN].any()
 
 

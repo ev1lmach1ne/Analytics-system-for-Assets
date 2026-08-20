@@ -1,0 +1,15 @@
+{
+  "resumen_ejecutivo": "Cambio en 1 archivo(s) (340+ / 18- líneas).",
+  "modificaciones_clave": [
+    {
+      "archivo": "gui/widgets/tab_comparador.py",
+      "motivo": "modificación detectada en el diff (revisar hunks)"
+    }
+  ],
+  "impacto_tecnico": [
+    "pestañas y widgets de la GUI (gui/widgets/)"
+  ],
+  "tags": [
+    "tab_comparador"
+  ]
+}

@@ -1,5 +1,5 @@
 import pandas as pd
-from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
+from PyQt6.QtWidgets import (QVBoxLayout, QHBoxLayout, QLabel,
                              QDateEdit, QCheckBox, QPushButton, QFormLayout,
                              QFrame)
 from PyQt6.QtCore import Qt, QDate
@@ -8,6 +8,8 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.widgets import RangeSlider, Button, TextBox
 from matplotlib.dates import num2date, date2num
+
+from gui.dialogs.base import DialogoBase
 
 STYLE_RANGO_DIALOG = """
 QDialog { background-color: #141e30; }
@@ -30,7 +32,7 @@ QFrame#sep { background-color: #253a60; max-height: 1px; }
 """
 
 
-class RangoAnalisisDialog(QDialog):
+class RangoAnalisisDialog(DialogoBase):
     """Dialogo para elegir el rango de fechas a analizar (o todo el historico).
 
     Modo normal: grafico de precio + RangeSlider de matplotlib embebido
@@ -39,10 +41,6 @@ class RangoAnalisisDialog(QDialog):
     """
 
     def __init__(self, csv_path, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Rango de análisis")
-        self.setStyleSheet(STYLE_RANGO_DIALOG)
-
         self.slider = None
         self._idx_min = None
         self._idx_max = None
@@ -52,11 +50,13 @@ class RangoAnalisisDialog(QDialog):
 
         df = self._cargar_serie_close(csv_path)
         if df is not None:
-            self.setFixedSize(800, 620)
+            super().__init__("Rango de análisis", parent,
+                             subtitulo="Periodo a analizar", ancho=800, alto=620)
             self._construir_modo_grafico(df)
         else:
-            self.setFixedSize(380, 320)
             self._min_date, self._max_date = self._read_range(csv_path)
+            super().__init__("Rango de análisis", parent,
+                             subtitulo="Periodo a analizar", ancho=380, alto=320)
             self._construir_modo_fallback()
 
     # ── Carga de datos ──────────────────────────────────────────────
@@ -86,17 +86,8 @@ class RangoAnalisisDialog(QDialog):
 
     # ── Modo gráfico + slider (caso normal) ─────────────────────────
     def _construir_modo_grafico(self, df):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(8)
-
-        title = QLabel("Periodo a analizar")
-        title.setStyleSheet("color: #4fc3f7; font-size: 15px; font-weight: bold;")
-        layout.addWidget(title)
-
-        sep = QFrame()
-        sep.setObjectName("sep")
-        layout.addWidget(sep)
+        self.contenido.setContentsMargins(10, 8, 10, 8)
+        self.contenido.setSpacing(8)
 
         max_puntos = 50000
         step = max(1, len(df) // max_puntos)
@@ -259,7 +250,7 @@ class RangoAnalisisDialog(QDialog):
             box.on_submit(lambda _: on_apply(None))
         self.canvas.mpl_connect('key_press_event', on_key)
 
-        layout.addWidget(self.canvas, 1)
+        self.contenido.addWidget(self.canvas, 1)
 
         # Referencias fuertes: los widgets de matplotlib se desconectan si
         # sus objetos Python se recolectan (garbage collection).
@@ -280,21 +271,12 @@ class RangoAnalisisDialog(QDialog):
 
     # ── Modo fallback (sin gráfico) ──────────────────────────────────
     def _construir_modo_fallback(self):
-        layout = QVBoxLayout(self)
-        layout.setSpacing(14)
-
-        title = QLabel("Periodo a analizar")
-        title.setStyleSheet("color: #4fc3f7; font-size: 15px; font-weight: bold;")
-        layout.addWidget(title)
-
-        sep = QFrame()
-        sep.setObjectName("sep")
-        layout.addWidget(sep)
+        self.contenido.setSpacing(14)
 
         self.chk_full = QCheckBox("Usar todo el historico")
         self.chk_full.setChecked(True)
         self.chk_full.stateChanged.connect(self._toggle_dates)
-        layout.addWidget(self.chk_full)
+        self.contenido.addWidget(self.chk_full)
 
         form = QFormLayout()
         form.setSpacing(12)
@@ -322,7 +304,7 @@ class RangoAnalisisDialog(QDialog):
 
         form.addRow("Desde:", self.date_inicio)
         form.addRow("Hasta:", self.date_fin)
-        layout.addLayout(form)
+        self.contenido.addLayout(form)
 
         self.lbl_warn = QLabel("")
         self.lbl_warn.setObjectName("warn")
@@ -334,9 +316,9 @@ class RangoAnalisisDialog(QDialog):
                 "No se pudo leer el rango de fechas del archivo. "
                 "Solo esta disponible el analisis de todo el historico."
             )
-        layout.addWidget(self.lbl_warn)
+        self.contenido.addWidget(self.lbl_warn)
 
-        layout.addStretch()
+        self.contenido.addStretch()
 
         buttons = QHBoxLayout()
         buttons.addStretch()
@@ -347,7 +329,7 @@ class RangoAnalisisDialog(QDialog):
         ok_btn.clicked.connect(self.accept)
         buttons.addWidget(cancel_btn)
         buttons.addWidget(ok_btn)
-        layout.addLayout(buttons)
+        self.contenido.addLayout(buttons)
 
         self._toggle_dates()
 

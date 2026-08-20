@@ -1,6 +1,6 @@
 import os, json, re, shutil
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
-                             QLabel, QSplitter, QFileDialog, QMessageBox,
+                             QLabel, QSplitter,
                              QLineEdit, QComboBox, QFrame)
 from PyQt6.QtCore import Qt, pyqtSignal
 from gui.widgets.file_explorer import FileExplorer
@@ -8,6 +8,7 @@ from gui.widgets.console_widget import ConsoleWidget
 from gui.widgets.bombear import bombear_eventos
 from gui.widgets import STYLE_ETIQUETA_SIN_CAJA
 from gui.questdb_bootstrap import mostrar_bootstrap_questdb
+from gui.dialogs.mensajes import abrir_archivo, aviso, error, confirmar
 from core.config import (get_base_data, LIMPIADOS_DIR, TF_LABELS, TIPO_LABELS,
                           TIPO_MAP, SCRIPTS_DIR, CATEGORIAS_DESCARGA_CONOCIDAS)
 from core.rf_registry import guardar_rf as _guardar_rf_registro
@@ -140,7 +141,9 @@ class TabImportar(QWidget):
         self.tipo_input = QComboBox()
         self.tipo_input.addItems(TIPO_LABELS)
         self.tipo_input.setToolTip("Tipo de activo")
-        toolbar.addWidget(QLabel("Tipo:"))
+        lbl_tipo = QLabel("Tipo:")
+        lbl_tipo.setStyleSheet(STYLE_ETIQUETA_SIN_CAJA)
+        toolbar.addWidget(lbl_tipo)
         toolbar.addWidget(self.tipo_input)
 
         self.rf_input = QLineEdit()
@@ -148,7 +151,7 @@ class TabImportar(QWidget):
         self.rf_input.setText("0")
         self.rf_input.setToolTip("Tasa libre de riesgo anual (%)")
         self.rf_input.setMaximumWidth(55)
-        lbl_rf = QLabel("Rf(%):")
+        lbl_rf = QLabel("Risk Free %:")
         lbl_rf.setStyleSheet(STYLE_ETIQUETA_SIN_CAJA)
         toolbar.addWidget(lbl_rf)
         toolbar.addWidget(self.rf_input)
@@ -229,7 +232,7 @@ class TabImportar(QWidget):
         self.explorer.set_search_text(text)
 
     def _select_file(self):
-        path, _ = QFileDialog.getOpenFileName(
+        path, _ = abrir_archivo(
             self, "Seleccionar archivo CSV/TXT",
             self._base_data, "CSV (*.csv);;TXT (*.txt);;Todos (*)"
         )
@@ -288,7 +291,7 @@ class TabImportar(QWidget):
         # espacios y '_' se eliminan (msci-acwi -> msciacwi).
         nombre = re.sub(r'[^a-z0-9]', '', self.nombre_input.text().strip().lower())
         if not nombre:
-            QMessageBox.warning(self, "Error", "El nombre del activo no puede estar vacio.")
+            aviso(self, "Error", "El nombre del activo no puede estar vacio.")
             self.nombre_input.setFocus()
             return
 
@@ -337,7 +340,7 @@ class TabImportar(QWidget):
                 try:
                     shutil.copyfile(src, dst)
                 except Exception as e2:
-                    QMessageBox.critical(self, "Error", f"No se pudo copiar el archivo:\n{e}\n\n{e2}")
+                    error(self, "Error", f"No se pudo copiar el archivo:\n{e}\n\n{e2}")
                     self._reset_ui()
                     return
 
@@ -374,12 +377,8 @@ class TabImportar(QWidget):
     def _delete_file(self):
         if not self._selected_file or not os.path.exists(self._selected_file):
             return
-        reply = QMessageBox.question(
-            self, "Confirmar eliminacion",
-            f"Eliminar {os.path.basename(self._selected_file)}?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
-        if reply == QMessageBox.StandardButton.Yes:
+        if confirmar(self, "Confirmar eliminacion",
+                f"Eliminar {os.path.basename(self._selected_file)}?"):
             try:
                 os.remove(self._selected_file)
                 # Si la carpeta del activo queda vacia, se elimina tambien
@@ -392,7 +391,7 @@ class TabImportar(QWidget):
                 self.btn_delete.setEnabled(False)
                 self.explorer.refresh()
             except Exception as e:
-                QMessageBox.critical(self, "Error", f"No se pudo eliminar:\n{e}")
+                error(self, "Error", f"No se pudo eliminar:\n{e}")
 
     def _stop_import(self):
         self.console.stop()

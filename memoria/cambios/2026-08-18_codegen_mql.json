@@ -1,0 +1,15 @@
+{
+  "resumen_ejecutivo": "Cambio en 1 archivo(s) (588+ / 36- líneas).",
+  "modificaciones_clave": [
+    {
+      "archivo": "core/codegen/runtime/zcs_runtime_mt5.mqh",
+      "motivo": "modificación detectada en el diff (revisar hunks)"
+    }
+  ],
+  "impacto_tecnico": [
+    "exportador de código Pine/MQL5 (core/codegen/)"
+  ],
+  "tags": [
+    "zcs_runtime_mt5"
+  ]
+}

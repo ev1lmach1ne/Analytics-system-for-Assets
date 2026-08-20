@@ -1,7 +1,6 @@
 import os
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
-                              QLineEdit, QPushButton, QFileDialog, QFrame,
-                              QMessageBox)
+                              QLineEdit, QPushButton, QFrame)
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QIcon
 
@@ -10,6 +9,7 @@ from core.config import (
 )
 from core.questdb_manager import is_reachable, detener_bundled
 from gui.questdb_bootstrap import mostrar_bootstrap_questdb
+from gui.dialogs.mensajes import elegir_directorio, aviso, informacion
 
 STYLE = """
 QDialog { background-color: #141e30; }
@@ -168,9 +168,7 @@ class SettingsDialog(QDialog):
         cur = self.path_input.text() or get_base_data()
         if not os.path.isdir(cur):
             cur = ""
-        path = QFileDialog.getExistingDirectory(
-            self, "Seleccionar carpeta de datos", cur
-        )
+        path = elegir_directorio(self, "Seleccionar carpeta de datos", cur)
         if path:
             self.path_input.setText(path)
 
@@ -182,7 +180,7 @@ class SettingsDialog(QDialog):
             try:
                 os.makedirs(path, exist_ok=True)
             except Exception as e:
-                QMessageBox.warning(self, "Error", f"No se pudo crear la carpeta:\n{e}")
+                aviso(self, "Error", f"No se pudo crear la carpeta:\n{e}")
                 return
         try:
             for sub in ("Limpiados", os.path.join("Limpiados", "Informes")):
@@ -191,7 +189,7 @@ class SettingsDialog(QDialog):
             pass
         if path != self.orig_path:
             set_base_data(path)
-            QMessageBox.information(
+            informacion(
                 self, "Ruta actualizada",
                 "La nueva ruta de datos se ha guardado.\n\n"
                 "Se aplicará al REINICIAR la aplicación: hasta entonces las "

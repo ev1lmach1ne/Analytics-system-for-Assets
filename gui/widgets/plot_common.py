@@ -15,11 +15,13 @@ import traceback
 import numpy as np
 import pandas as pd
 
-from PyQt6.QtCore import Qt, QSize, QPointF, QPoint, QPropertyAnimation, QEasingCurve
-from PyQt6.QtGui import QIcon, QPixmap, QPainter, QPen, QColor, QPolygonF
+from PyQt6.QtCore import (Qt, QSize, QPointF, QPoint, QRect, QRectF, QEvent,
+                          QPropertyAnimation, QEasingCurve)
+from PyQt6.QtGui import (QIcon, QPixmap, QPainter, QPen, QColor, QPolygonF,
+                         QLinearGradient)
 from PyQt6.QtWidgets import (QSizePolicy, QLabel, QDialog, QTabWidget, QVBoxLayout,
                              QHBoxLayout, QApplication, QWidget, QFrame, QPushButton,
-                             QGraphicsDropShadowEffect)
+                             QGraphicsDropShadowEffect, QGraphicsOpacityEffect)
 
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
@@ -286,7 +288,8 @@ def fmt(v, dec=2, sufijo=''):
 
 
 def agregar_crosshair(fig, ejes, x, series, texto_fn, nombre='default',
-                      colores=None):
+                      colores=None, linestyle='solid', horizontal=False,
+                      x_texto_fn=None):
     """Crosshair vertical sincronizado + un punto marcado sobre cada serie +
     un tooltip independiente por panel, sobre varios ejes apilados que
     comparten X.
@@ -301,6 +304,13 @@ def agregar_crosshair(fig, ejes, x, series, texto_fn, nombre='default',
     punto marcado — por defecto AX_FG si no se especifica; se recomienda
     pasar el mismo color que ya usa cada línea para que se lea a qué serie
     pertenece cada punto.
+
+    `linestyle`: estilo de la línea vertical ('solid' por defecto; p.ej.
+    '--' para discontinua). `horizontal=True` añade además, en cada eje,
+    una línea horizontal discontinua al nivel del punto marcado (el valor
+    de la serie en esa x). `x_texto_fn(idx)`: etiqueta alternativa para el
+    borde inferior de cada panel (por defecto: fecha formateada, o
+    "Barra nº N" cuando el eje X no son fechas).
 
     Usa blitting (como el arrastre del gráfico principal en tab_backtest.py)
     en vez de draw_idle() en cada movimiento: con series largas (p.ej. TF de
@@ -346,7 +356,13 @@ def agregar_crosshair(fig, ejes, x, series, texto_fn, nombre='default',
         patron_fecha = '%Y-%m-%d %H:%M' if paso < np.timedelta64(1, 'D') else '%Y-%m-%d'
 
     lineas_v = [axx.axvline(x_num[0], color=GRIS, linewidth=0.7, alpha=0.7,
-                             zorder=98, visible=False) for axx in ejes]
+                             linestyle=linestyle, zorder=98, visible=False)
+                for axx in ejes]
+    lineas_h = []
+    if horizontal:
+        lineas_h = [axx.axhline(0.0, color=c, linewidth=0.7, alpha=0.7,
+                                linestyle='--', zorder=98, visible=False)
+                    for axx, c in zip(ejes, colores)]
     puntos = [axx.plot([], [], marker='o', markersize=5, color=c,
                        markeredgecolor=FIG_BG, markeredgewidth=0.8,
                        zorder=99, linestyle='none', visible=False)[0]
@@ -384,6 +400,8 @@ def agregar_crosshair(fig, ejes, x, series, texto_fn, nombre='default',
         canvas.restore_region(estado['bg'])
         for l in lineas_v:
             l.axes.draw_artist(l)
+        for l in lineas_h:
+            l.axes.draw_artist(l)
         for p in puntos:
             p.axes.draw_artist(p)
         for a in annots:
@@ -397,9 +415,12 @@ def agregar_crosshair(fig, ejes, x, series, texto_fn, nombre='default',
     def _ocultar():
         cambio = (any(a.get_visible() for a in annots)
                   or any(l.get_visible() for l in lineas_v)
+                  or any(l.get_visible() for l in lineas_h)
                   or any(p.get_visible() for p in puntos)
                   or any(et.get_visible() for et in etiquetas_x))
         for l in lineas_v:
+            l.set_visible(False)
+        for l in lineas_h:
             l.set_visible(False)
         for p in puntos:
             p.set_visible(False)
@@ -420,6 +441,9 @@ def agregar_crosshair(fig, ejes, x, series, texto_fn, nombre='default',
         xv = x_num[i]
         for l in lineas_v:
             l.set_xdata([xv, xv])
+            l.set_visible(True)
+        for l, s in zip(lineas_h, series):
+            l.set_ydata([s[i], s[i]])
             l.set_visible(True)
         for p, s in zip(puntos, series):
             p.set_data([xv], [s[i]])
@@ -445,8 +469,12 @@ def agregar_crosshair(fig, ejes, x, series, texto_fn, nombre='default',
             a.set_text(texto)
             a.set_visible(True)
 
-        texto_x = (pd.Timestamp(x_arr[i]).strftime(patron_fecha) if es_fecha
-                  else f"Barra nº {int(x_arr[i])}")
+        if x_texto_fn is not None:
+            texto_x = x_texto_fn(i)
+        elif es_fecha:
+            texto_x = pd.Timestamp(x_arr[i]).strftime(patron_fecha)
+        else:
+            texto_x = f"Barra nº {int(x_arr[i])}"
         for et in etiquetas_x:
             et.xy = (xv, 0)
             et.set_text(texto_x)
@@ -459,73 +487,132 @@ def agregar_crosshair(fig, ejes, x, series, texto_fn, nombre='default',
     setattr(fig, cid_attr, (cid1, cid2, cid3))
 
 
-class _PopupAyuda(QDialog):
-    """Panel flotante con las secciones de ayuda (Lógica/Significado/Uso/
-    Resultados) en pestañas; se cierra solo al perder el foco, igual que los
-    editores de condiciones del Backtester (gui/widgets/tab_backtest.py,
-    Qt.WindowType.Popup).
+def agregar_hover_celdas(fig, ax, m, filas=None, cols=None, fmt='{:.2f}',
+                         nombre='default', titulo=None):
+    """Tooltip al pasar el ratón sobre cada celda de una matriz pintada con
+    imshow/heatmap (las celdas quedan centradas en coordenadas enteras).
 
-    Con UNA sola sección no se monta la barra de pestañas: una pestaña
-    solitaria se lee como una interfaz a medio hacer.
+    Marca la celda con un borde fino y muestra `fila × columna → valor` en un
+    bocadillo anclado a ella. `filas`/`cols`: etiquetas (por defecto, índices);
+    `fmt`: formato del valor (p. ej. '{:.3f}'); `titulo`: cabecera opcional.
 
-    El panel es translúcido con esquinas redondeadas, gradiente y halo azul
-    (misma identidad que los diálogos flotantes de la app). El texto SIEMPRE
-    cabe: el popup se dimensiona a la altura completa del contenido y no usa
-    barras de desplazamiento.
+    Misma arquitectura de blitting que `agregar_crosshair` (fondo cacheado en
+    cada draw_event, disconnect de cids previos vía `nombre` en `fig`), para
+    que convivir ambos mecanismos en una misma sección sea seguro."""
+    from matplotlib.patches import Rectangle
+    m = np.asarray(m, dtype=float)
+    if m.size == 0:
+        return
+    canvas = fig.canvas
+    cid_attr = f'_hover_celdas_cids_{nombre}'
+    for cid in getattr(fig, cid_attr, ()):
+        try:
+            canvas.mpl_disconnect(cid)
+        except Exception:
+            pass
+
+    filas = list(filas) if filas is not None else [str(i) for i in range(m.shape[0])]
+    cols = list(cols) if cols is not None else [str(j) for j in range(m.shape[1])]
+
+    rect = ax.add_patch(Rectangle((0, 0), 1, 1, facecolor='none', edgecolor=AX_FG,
+                                  linewidth=1.0, zorder=99, visible=False))
+    annot = ax.annotate("", xy=(0, 0), xytext=(12, -12), textcoords="offset points",
+                        bbox=dict(boxstyle="round,pad=0.4", fc=FIG_BG, ec=GRID_C, alpha=0.95),
+                        color=AX_FG, fontsize=7, zorder=100, annotation_clip=False)
+    annot.set_visible(False)
+
+    estado = {'bg': None}
+
+    def _capturar_fondo(_event=None):
+        estado['bg'] = canvas.copy_from_bbox(fig.bbox)
+
+    def _pintar():
+        if estado['bg'] is None:
+            canvas.draw_idle()
+            return
+        canvas.restore_region(estado['bg'])
+        if rect.get_visible():
+            rect.axes.draw_artist(rect)
+        if annot.get_visible():
+            annot.axes.draw_artist(annot)
+        canvas.blit(fig.bbox)
+
+    def _ocultar():
+        cambio = rect.get_visible() or annot.get_visible()
+        rect.set_visible(False)
+        annot.set_visible(False)
+        if cambio:
+            _pintar()
+
+    def _on_move(event):
+        if event.inaxes is not ax or event.xdata is None:
+            _ocultar()
+            return
+        j = int(np.floor(event.xdata + 0.5))
+        i = int(np.floor(event.ydata + 0.5))
+        if not (0 <= i < m.shape[0] and 0 <= j < m.shape[1]):
+            _ocultar()
+            return
+        val = m[i, j]
+        if not np.isfinite(val):
+            _ocultar()
+            return
+        rect.set_bounds(j - 0.5, i - 0.5, 1, 1)
+        rect.set_visible(True)
+        cabecera = f"{titulo}\n" if titulo else ""
+        annot.xy = (j, i)
+        annot.set_text(f"{cabecera}{filas[i]} × {cols[j]} → {fmt.format(val)}")
+        annot.set_visible(True)
+        _pintar()
+
+    cid1 = canvas.mpl_connect('motion_notify_event', _on_move)
+    cid2 = canvas.mpl_connect('figure_leave_event', lambda e: _ocultar())
+    cid3 = canvas.mpl_connect('draw_event', _capturar_fondo)
+    setattr(fig, cid_attr, (cid1, cid2, cid3))
+
+
+class _OverlayAyuda(QWidget):
+    """Panel de ayuda «?» rediseñado: se dibuja DENTRO de la ventana principal
+    como un widget hijo pintado a mano (QPainter), sin ventana propia, sin
+    translucencia a nivel de OS ni efectos de sombra. Como Windows no gestiona
+    ninguna ventana aquí, es imposible que aparezcan bordes, sombras o cuadros
+    negros alrededor: el widget solo pinta el panel redondeado y el resto queda
+    transparente mostrando la app.
+
+    Se cierra al pulsar fuera del panel (o sobre su icono, como toggle) y con
+    Escape, vía un eventFilter global.
     """
 
-    def __init__(self, secciones, parent=None):
-        super().__init__(parent, Qt.WindowType.Popup)
-        self._animado_entrada = False
+    _ANCHO = 420
+    _PADDING = 14
+    _RADIO = 10
+
+    def __init__(self, secciones, parent, icono=None):
+        super().__init__(parent)
+        self._icono = icono
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setFixedWidth(420)
+        self.setFixedWidth(self._ANCHO)
         self.setStyleSheet(
-            "QDialog { background: transparent; }"
+            "QWidget { background: transparent; }"
+            "QLabel { color: #dbe8f5; font-size: 11px; }"
+            "QLabel#tituloAyuda { color: #4fc3f7; font-size: 12px; font-weight: bold; }"
+            "QFrame#sepAyuda { background-color: #253a60; max-height: 1px; border: none; }"
             "QTabWidget::pane { background-color: transparent; border: none; }"
             "QTabBar::tab { background-color: transparent; color: #5a7a9a;"
-            " padding: 8px 14px; border: none; font-size: 10px; }"
+            " padding: 6px 12px; border: none; font-size: 10px; }"
             "QTabBar::tab:selected { color: #4fc3f7; font-weight: bold;"
-            " border-bottom: 2px solid #4fc3f7; }"
-            "QLabel { color: #dbe8f5; font-size: 11px; }")
+            " border-bottom: 2px solid #4fc3f7; }")
+
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(20, 20, 20, 20)
-        # halo azul exterior (anillo tenue) + panel interior con gradiente
-        halo = QFrame(self)
-        halo.setObjectName("haloPopup")
-        halo.setStyleSheet(
-            "QFrame#haloPopup { background-color: rgba(79, 195, 247, 40);"
-            " border-radius: 14px; }")
-        glow = QGraphicsDropShadowEffect(halo)
-        glow.setBlurRadius(18)
-        glow.setColor(QColor(79, 195, 247, 90))
-        glow.setOffset(0, 0)
-        halo.setGraphicsEffect(glow)
-        lay.addWidget(halo)
-        panel = QFrame(halo)
-        panel.setObjectName("panelPopup")
-        panel.setStyleSheet(
-            "QFrame#panelPopup { background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
-            " stop:0 #1b2c4a, stop:1 #0d1424); border: 1px solid #2a4a6a;"
-            " border-radius: 12px; }")
-        sombra = QGraphicsDropShadowEffect(panel)
-        sombra.setBlurRadius(18)
-        sombra.setColor(QColor(0, 0, 0, 150))
-        sombra.setOffset(0, 4)
-        panel.setGraphicsEffect(sombra)
-        lay_panel = QVBoxLayout(panel)
-        lay_panel.setContentsMargins(12, 8, 12, 12)
-        lay_panel.setSpacing(0)
-        lay_halo = QVBoxLayout(halo)
-        lay_halo.setContentsMargins(2, 2, 2, 2)
-        lay_halo.addWidget(panel)
-        # ancho de texto real dentro del panel (420 - halos - márgenes)
-        ancho_texto = 420 - 40 - 4 - 24
+        lay.setContentsMargins(self._PADDING, 12, self._PADDING, self._PADDING)
+        lay.setSpacing(8)
+        ancho_texto = self._ANCHO - 2 * self._PADDING
         pantalla = QApplication.primaryScreen()
         altura_max = max(240, (pantalla.availableGeometry().height() - 160)
                          if pantalla is not None else 240)
 
         def _label(texto):
-            lbl = QLabel(texto)
+            lbl = QLabel(texto, self)
             lbl.setWordWrap(True)
             lbl.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
             # aplicar la fuente del QSS antes de medir: si se mide con la
@@ -534,30 +621,89 @@ class _PopupAyuda(QDialog):
             return lbl
 
         if len(secciones) == 1:
-            lbl = _label(secciones[0][1])
-            lay_panel.addWidget(lbl)
-            natural = lbl.heightForWidth(ancho_texto) + 24
-            panel.setFixedHeight(min(natural, altura_max))
-            return
-        tabs = QTabWidget()
-        tabs.setDocumentMode(True)
-        alturas = []
-        for titulo, texto in secciones:
-            lbl = _label(texto)
-            alturas.append(lbl.heightForWidth(ancho_texto))
-            tabs.addTab(lbl, titulo)
-        # altura del contenido completo: sin barras de scroll, todo visible.
-        # La altura se fija una vez (máximo de las pestañas + barra) para que
-        # cambiar de pestaña no redimensione el popup en caliente.
-        altura_natural = max(alturas) + 34 + 8
-        tabs.setFixedHeight(min(altura_natural, altura_max))
-        lay_panel.addWidget(tabs)
+            titulo, texto = secciones[0]
+            lbl_titulo = QLabel(titulo, self)
+            lbl_titulo.setObjectName("tituloAyuda")
+            lbl_titulo.ensurePolished()
+            lay.addWidget(lbl_titulo)
+            sep = QFrame(self)
+            sep.setObjectName("sepAyuda")
+            sep.setFixedHeight(1)
+            lay.addWidget(sep)
+            lbl_texto = _label(texto)
+            lay.addWidget(lbl_texto)
+            # altura completa: título + separador + texto, sin barras de scroll
+            natural = (12 + lbl_titulo.height() + 8 + 1 + 8
+                       + lbl_texto.heightForWidth(ancho_texto) + self._PADDING)
+        else:
+            tabs = QTabWidget()
+            tabs.setDocumentMode(True)
+            alturas = []
+            for titulo, texto in secciones:
+                lbl = _label(texto)
+                alturas.append(lbl.heightForWidth(ancho_texto))
+                tabs.addTab(lbl, titulo)
+            lay.addWidget(tabs)
+            tabs.ensurePolished()
+            barra = tabs.tabBar().sizeHint().height() or 28
+            # altura completa: barra + separación + el texto más alto
+            natural = 12 + barra + 8 + max(alturas) + self._PADDING
 
-    def showEvent(self, event):
-        super().showEvent(event)
-        if not self._animado_entrada:
-            self._animado_entrada = True
-            animar_entrada(self)
+        # el texto SIEMPRE cabe: se dimensiona a la altura completa del
+        # contenido y se recorta solo contra la altura máxima disponible
+        self.setFixedHeight(min(natural, altura_max))
+
+        self._anim_fade = None
+        QApplication.instance().installEventFilter(self)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = QRectF(self.rect()).adjusted(1, 1, -1, -1)
+        grad = QLinearGradient(rect.topLeft(), rect.bottomLeft())
+        grad.setColorAt(0, QColor("#1b2c4a"))
+        grad.setColorAt(1, QColor("#0d1424"))
+        p.setBrush(grad)
+        p.setPen(QPen(QColor("#2a4a6a"), 1))
+        p.drawRoundedRect(rect, self._RADIO, self._RADIO)
+        p.end()
+
+    # ── cierre por clic fuera / Escape ──
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.MouseButtonPress:
+            pos = event.globalPosition().toPoint()
+            if not self._rect_global().contains(pos) \
+                    and not self._rect_icono_global().contains(pos):
+                self.close()
+        elif event.type() == QEvent.Type.KeyPress \
+                and event.key() == Qt.Key.Key_Escape:
+            self.close()
+        return super().eventFilter(obj, event)
+
+    def _rect_global(self):
+        return QRect(self.mapToGlobal(self.rect().topLeft()), self.size())
+
+    def _rect_icono_global(self):
+        if self._icono is None:
+            return QRect()
+        i = self._icono
+        return QRect(i.mapToGlobal(i.rect().topLeft()), i.size())
+
+    def closeEvent(self, event):
+        QApplication.instance().removeEventFilter(self)
+        super().closeEvent(event)
+
+    def _fade_in(self):
+        efe = QGraphicsOpacityEffect(self)
+        self.setGraphicsEffect(efe)
+        efe.setOpacity(0.0)
+        anim = QPropertyAnimation(efe, b"opacity", self)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.setDuration(160)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._anim_fade = anim
+        anim.start()
 
 
 # ══════════════ paneles flotantes sin marco de Windows ══════════════
@@ -738,55 +884,65 @@ def _badge_ayuda(secciones, tooltip=None):
         icono.setToolTip(tooltip)
 
     def _abrir(event):
+        # Toggle: si el overlay de este icono sigue abierto, se cierra.
+        prev = getattr(icono, '_overlay_ayuda', None)
+        if prev is not None and prev.isVisible():
+            prev.close()
+            icono._overlay_ayuda = None
+            return
+        ventana = icono.window()
+        if ventana is None:
+            return
         # Referencia guardada en el propio icono: sin ella, el wrapper de
-        # Python del popup puede recolectarse antes de que Qt lo muestre,
-        # pese a llevar `icono` como parent en C++.
-        icono._popup = popup = _PopupAyuda(secciones, icono)
-        popup.move(_posicion_popup(icono, popup))
-        # fade-in: opacidad 0 antes de mostrar para no destellar, y la
-        # animación (fade + deslizamiento) la lanza _PopupAyuda.showEvent
-        popup.setWindowOpacity(0.0)
-        popup.show()
+        # Python del overlay puede recolectarse antes de que Qt lo muestre.
+        overlay = _OverlayAyuda(secciones, ventana, icono)
+        icono._overlay_ayuda = overlay
+        overlay.move(_posicion_overlay(icono, overlay))
+        overlay._fade_in()
+        overlay.show()
+        overlay.raise_()
     icono.mousePressEvent = _abrir
     return icono
 
 
-def _posicion_popup(icono, popup):
-    """Esquina superior izquierda donde soltar el popup, recortada a la
-    pantalla del icono.
+def _posicion_overlay(icono, overlay):
+    """Esquina superior izquierda donde colocar el overlay, recortada al
+    rectángulo de la ventana principal (el overlay es hijo de esa ventana y no
+    puede salirse de ella).
 
-    Sin este recorte el popup se ancla a la esquina inferior izquierda del
-    icono y se extiende hacia la derecha según su ancho, y eso lo hacía
-    INVISIBLE en los iconos del Backtester: allí van alineados a la derecha de
-    su grupo (`_fila_ayuda`), o sea pegados al borde de la ventana, así que con
-    la ventana maximizada el panel entero caía fuera del monitor. Se abría, pero
-    no había dónde verlo — se leía como un icono muerto.
-
-    Lo mismo por abajo: un icono en la parte baja de una página larga abriría
-    su panel por debajo del borde inferior. Ahí se prueba primero a abrirlo
-    hacia ARRIBA del icono, que es lo que hace cualquier menú.
+    El panel se ancla a la esquina inferior izquierda del icono y crece hacia
+    la derecha y abajo. Sin recorte, en el Backtester los iconos van pegados al
+    borde derecho de su grupo (`_fila_ayuda`), así que el panel caería fuera de
+    la ventana: se recorta al rectángulo del padre. Lo mismo por abajo: un
+    icono en la parte baja de una página larga abriría su panel por debajo del
+    borde inferior; ahí se prueba primero a abrirlo hacia ARRIBA del icono,
+    como hace cualquier menú.
     """
+    padre = overlay.parentWidget()
+    if padre is None:
+        return QPoint(0, 0)
     # el tamaño definitivo no está calculado hasta que se muestra: sin esto,
     # width()/height() devuelven el tamaño por defecto y el recorte se haría
     # contra medidas que no son las del panel
-    popup.adjustSize()
-    destino = icono.mapToGlobal(icono.rect().bottomLeft())
-    pantalla = icono.screen() or QApplication.primaryScreen()
-    if pantalla is None:
-        return destino
-    libre = pantalla.availableGeometry()
+    overlay.adjustSize()
+    destino = padre.mapFromGlobal(icono.mapToGlobal(icono.rect().bottomLeft()))
+    w, h = overlay.width(), overlay.height()
+    libre = padre.rect()
 
-    x = min(destino.x(), libre.right() - popup.width() + 1)
+    x = destino.x()
+    if x + w > libre.right():
+        x = libre.right() - w
     x = max(x, libre.left())
 
     y = destino.y()
-    if y + popup.height() > libre.bottom():
-        arriba = icono.mapToGlobal(icono.rect().topLeft()).y() - popup.height()
+    if y + h > libre.bottom():
+        arriba = padre.mapFromGlobal(
+            icono.mapToGlobal(icono.rect().topLeft())).y() - h
         if arriba >= libre.top():
             y = arriba
-    # recorte final por si tampoco cabe arriba (panel más alto que la pantalla,
+    # recorte final por si tampoco cabe arriba (panel más alto que el padre,
     # o icono fuera del área visible): siempre dentro, aunque tape al icono
-    y = max(libre.top(), min(y, libre.bottom() - popup.height() + 1))
+    y = max(libre.top(), min(y, libre.bottom() - h))
     return QPoint(x, y)
 
 

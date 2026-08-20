@@ -14,7 +14,8 @@ import pytest
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
 pytest.importorskip('PyQt6.QtWidgets')
-from PyQt6.QtWidgets import QApplication, QLabel, QTabWidget   # noqa: E402
+from PyQt6.QtWidgets import (QApplication, QLabel, QTabWidget,
+                             QWidget, QVBoxLayout)                  # noqa: E402
 
 from gui.widgets.plot_common import icono_ayuda, icono_ayuda_texto  # noqa: E402
 from gui.widgets.tab_backtest import _icono_ayuda                   # noqa: E402
@@ -25,18 +26,31 @@ def app():
     return QApplication.instance() or QApplication([])
 
 
-_VIVOS = []   # el popup es hijo del icono: si el icono se recolecta, Qt
-              # destruye el objeto C++ del popup y consultarlo revienta
+_VIVOS = []   # el overlay es hijo de la ventana del icono: si el icono se
+              # recolecta, Qt destruye el objeto C++ y consultarlo revienta
 
 
 def _clicar(icono):
     _VIVOS.append(icono)
     icono.mousePressEvent(None)
-    return icono._popup
+    return icono._overlay_ayuda
+
+
+def _icono_visible(icono):
+    """El overlay hereda la visibilidad de sus ancestros (ya no es una ventana
+    propia), así que para comprobarlo hay que meter el icono en una ventana
+    mostrada."""
+    cont = QWidget()
+    _VIVOS.append(cont)
+    lay = QVBoxLayout(cont)
+    lay.addWidget(icono)
+    cont.show()
+    return cont
 
 
 def test_el_icono_del_backtester_abre_panel_al_clicarlo(app):
     icono = _icono_ayuda('Qué hace esta sección')
+    cont = _icono_visible(icono)
     popup = _clicar(icono)
     assert popup.isVisible()
     textos = [w.text() for w in popup.findChildren(QLabel)]

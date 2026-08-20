@@ -132,6 +132,10 @@ aparte en 'entradas', para no contaminar win rate/expectancy/Montecarlo.
 """
 import numpy as np
 from numba import njit
+from core.metrics import (
+    conditional_value_at_risk, autocorr_penalty, serenity_index,
+    kelly_criterion, sortino_ratio, omega_ratio, calmar_ratio,
+)
 
 MOTIVOS_SALIDA = {0: 'Señal', 1: 'Stop Loss', 2: 'Take Profit', 3: 'Tiempo',
                   4: 'Fin datos', 5: 'Parcial'}
@@ -1689,10 +1693,12 @@ def resultado_filtrado(resultado, direccion=0, capital_inicial=None):
             'n_trades': int(m.sum())}
 
 
-def calcular_metricas(resultado, idx_ini=0, idx_fin=None, velas_por_anio=None):
+def calcular_metricas(resultado, idx_ini=0, idx_fin=None, velas_por_anio=None,
+                      velas_por_dia=None):
     """Métricas de un tramo [idx_ini, idx_fin) del resultado de simular().
     Un trade pertenece al tramo si su vela de ENTRADA cae dentro.
     velas_por_anio: para anualizar retorno y Sharpe (None = no anualiza).
+    velas_por_dia: para 'avg_trades_por_dia' (None = no se calcula).
 
     Incluye, además de rentabilidad, un bloque de ROBUSTEZ:
     - r2_equity: R² de la curva de capital contra el tiempo (cuanto más
@@ -1750,10 +1756,22 @@ def calcular_metricas(resultado, idx_ini=0, idx_fin=None, velas_por_anio=None):
            'tiempo_recuperacion_medio': None, 'tiempo_recuperacion_max': None,
            'sqn': None, 'payoff_ratio': None, 'pct_mejor_trade': None,
            'slippage_minimo_pct': None, 'impacto_comisiones_pct': None,
+           'kelly_pct': None,
            'ulcer_index': None, 'etd_r_medio': None,
            'eficiencia_entrada_media': None, 'eficiencia_salida_media': None,
            'exposicion_pct': 0.0, 'exposicion_capital_pct': None,
-           'retorno_ajustado_exposicion_pct': None}
+           'retorno_ajustado_exposicion_pct': None,
+           # ── riesgo de cola (CVaR) y derivados ──
+           'cvar_ret_pct': None, 'cvar_dd_pct': None,
+           'sharpe_smart': None, 'serenity_index': None,
+           'sortino': None, 'calmar': None, 'omega': None,
+           # ── estructura de trades ──
+           'win_rate_long': None, 'win_rate_short': None,
+           'longs_count': 0, 'shorts_count': 0, 'longs_pct': None,
+           'racha_ganadora': 0,
+           'mayor_ganancia': None, 'mayor_perdida': None,
+           'ganancia_bruta': None, 'perdida_bruta': None,
+           'avg_trades_por_dia': None}
 
     if idx_fin <= idx_ini:
         return out
@@ -1784,6 +1802,7 @@ def calcular_metricas(resultado, idx_ini=0, idx_fin=None, velas_por_anio=None):
         dd = np.where(eq_max > 0, eq / eq_max - 1.0, 0.0)
     out['max_dd_pct'] = float(dd.min()) * 100.0
     out['ulcer_index'] = float(np.sqrt(np.mean(dd ** 2))) * 100.0
+    out['cvar_dd_pct'] = float(conditional_value_at_risk(dd, 0.95)) * 100.0
     out['r2_equity'] = _r2_equity(eq)
 
     episodios = _analizar_drawdowns(eq)
@@ -1796,15 +1815,25 @@ def calcular_metricas(resultado, idx_ini=0, idx_fin=None, velas_por_anio=None):
 
     with np.errstate(divide='ignore', invalid='ignore'):
         ret_barras = np.diff(np.log(np.maximum(eq, 1e-12)))
+    out['cvar_ret_pct'] = float(conditional_value_at_risk(ret_barras, 0.95)) * 100.0
+    out['serenity_index'] = serenity_index(ret_barras)
     if len(ret_barras) > 1 and np.std(ret_barras) > 0:
         sharpe = float(np.mean(ret_barras) / np.std(ret_barras))
         if velas_por_anio:
             sharpe *= np.sqrt(velas_por_anio)
         out['sharpe'] = sharpe
+        pen = autocorr_penalty(ret_barras)
+        if pen and pen > 0:
+            out['sharpe_smart'] = float(sharpe / pen)
     if velas_por_anio and len(eq) > 1:
         anios = len(eq) / velas_por_anio
         if anios > 0 and eq[-1] > 0:
             out['retorno_anual_pct'] = float((eq[-1] / eq0) ** (1.0 / anios) - 1.0) * 100.0
+
+    # rendimiento ajustado por riesgo (jesse): Sortino/Calmar/Omega
+    out['sortino'] = sortino_ratio(ret_barras, velas_por_anio)
+    out['omega'] = omega_ratio(ret_barras, velas_por_anio=velas_por_anio)
+    out['calmar'] = calmar_ratio(out['retorno_anual_pct'], out['max_dd_pct'])
 
     # retorno por unidad de tiempo expuesto: lo que permite comparar un sistema
     # que renta poco pero casi nunca está dentro con otro que renta lo mismo
@@ -1850,8 +1879,44 @@ def calcular_metricas(resultado, idx_ini=0, idx_fin=None, velas_por_anio=None):
             perdida_media = float(-pnl[~ganadores].mean())
             if perdida_media > 0:
                 out['payoff_ratio'] = float(pnl[ganadores].mean()) / perdida_media
+        if out['payoff_ratio'] is not None and out['win_rate'] is not None:
+            kelly = kelly_criterion(out['win_rate'], out['payoff_ratio'])
+            if kelly is not None and kelly > 0:
+                out['kelly_pct'] = float(kelly) * 100.0
         if out['pnl_total'] > 0:
             out['pct_mejor_trade'] = float(pnl.max()) / out['pnl_total'] * 100.0
+
+        # ── estructura de trades ──
+        # win rate por dirección: necesita la columna 'dir' (1 long / -1 short);
+        # si el dict de trades no la trae (construido a mano), se queda None.
+        dir_m = _col('dir')
+        if np.any(dir_m > 0):
+            out['longs_count'] = int((dir_m > 0).sum())
+            out['win_rate_long'] = float((pnl[dir_m > 0] > 0).mean())
+        if np.any(dir_m < 0):
+            out['shorts_count'] = int((dir_m < 0).sum())
+            out['win_rate_short'] = float((pnl[dir_m < 0] > 0).mean())
+        total_dir = out['longs_count'] + out['shorts_count']
+        if total_dir > 0:
+            out['longs_pct'] = float(out['longs_count']) / total_dir * 100.0
+
+        # racha ganadora máxima (trades ganadores consecutivos)
+        racha_g = peor_g = 0
+        for g in ganadores:
+            racha_g = racha_g + 1 if g else 0
+            peor_g = max(peor_g, racha_g)
+        out['racha_ganadora'] = int(peor_g)
+
+        out['mayor_ganancia'] = float(pnl.max())
+        out['mayor_perdida'] = float(pnl.min())
+        out['ganancia_bruta'] = float(pnl[ganadores].sum())
+        out['perdida_bruta'] = float(-pnl[~ganadores].sum())
+
+        if velas_por_dia and velas_por_dia > 0:
+            n_velas_tramo = max(int(idx_fin) - int(idx_ini), 1)
+            dias = n_velas_tramo / float(velas_por_dia)
+            if dias > 0:
+                out['avg_trades_por_dia'] = float(int(m.sum())) / dias
 
         notional = tr['notional_redondo'][m]
         if notional.mean() > 0:
@@ -1869,7 +1934,7 @@ def calcular_metricas(resultado, idx_ini=0, idx_fin=None, velas_por_anio=None):
 
 
 def walk_forward(o, h, l, c, senales, config, n_ventanas=5,
-                 velas_por_anio=None):
+                 velas_por_anio=None, velas_por_dia=None):
     """Walk-forward v1 (parámetros fijos): divide la serie en n_ventanas
     tramos consecutivos y calcula las métricas de cada tramo por separado
     sobre UNA sola simulación completa — mide la estabilidad temporal del
@@ -1881,7 +1946,8 @@ def walk_forward(o, h, l, c, senales, config, n_ventanas=5,
     bordes = np.linspace(0, n, n_ventanas + 1).astype(int)
     ventanas = []
     for k in range(n_ventanas):
-        met = calcular_metricas(resultado, bordes[k], bordes[k + 1], velas_por_anio)
+        met = calcular_metricas(resultado, bordes[k], bordes[k + 1],
+                                velas_por_anio, velas_por_dia)
         met['idx_ini'] = int(bordes[k])
         met['idx_fin'] = int(bordes[k + 1])
         ventanas.append(met)

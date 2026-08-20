@@ -1,4 +1,4 @@
-"""
+﻿"""
 Pestaña "Backtest": tres sub-pestañas, cada una con una única responsabilidad.
 
 - Constructor: selección de activo (file explorer sobre LIMPIADOS_DIR) y
@@ -47,10 +47,12 @@ from PyQt6.QtWidgets import (
     QCheckBox, QScrollArea, QFrame, QTableWidget, QTableWidgetItem,
     QHeaderView, QPushButton, QSplitter, QLineEdit, QSpinBox, QDoubleSpinBox,
     QSlider, QListWidget, QListWidgetItem, QTabWidget, QFormLayout, QGroupBox,
-    QInputDialog, QDateEdit, QSizePolicy, QApplication, QDialog,
+    QDateEdit, QSizePolicy, QApplication, QDialog,
     QButtonGroup, QStyledItemDelegate, QStyle, QStackedWidget, QMenu,
-    QMessageBox, QRadioButton, QToolButton, QGraphicsOpacityEffect,
+    QRadioButton, QToolButton, QGraphicsOpacityEffect,
 )
+from gui.dialogs.base import DialogoBase, crear_dialogo
+from gui.dialogs.mensajes import pedir_texto, confirmar, informacion
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
@@ -64,6 +66,7 @@ from core.config import (
     LIMPIADOS_DIR, SISTEMAS_DIR, FAVORITOS_DIR, TF_PATTERN, tf_to_minutes,
     tipo_activo_de_csv, PRESETS_FRICCION, TIPO_MAP,
     velas_por_anio as velas_por_anio_config,
+    velas_por_dia as velas_por_dia_config,
     get_selector_recientes, set_selector_recientes,
     velas_a_tiempo_legible, get_te_api_key,
 )
@@ -85,6 +88,9 @@ from core.strategies import (
     validar_tramos, validar_setup, AVISO_EXCESO_PARCIALES, tramo_entrada_por_defecto, trigger_tramo,
     sma, ema, rsi, atr, bollinger, stochastic, williams_r, cci, _kama_serie,
     _sar_serie, donchian, _zigzag_pivotes, _ZIGZAG_DESVIACION_REGLA,
+    _supertrend_serie, _macd_series, _adx_series, _aroon_series, _cmo_serie,
+    _trix_serie, _stochrsi_series, _ichimoku_series, _keltner_series,
+    _ttm_squeeze_series, _vwap_series,
     _entrada_por_defecto, NIVELES_FIB, tramos_zigzag_vigentes,
     preparar_eventos_noticias,
     _er_serie, _hurst_serie, ventana_regimen_defecto,
@@ -169,6 +175,14 @@ COLOR_BOLLINGER = '#9b59b6'
 COLOR_KAMA = '#ab47bc'
 COLOR_DONCHIAN = '#26a69a'
 COLOR_SAR = '#8d6e63'
+COLOR_SUPERTREND = '#d4a5f5'
+COLOR_ICHIMOKU_TENKAN = '#00bcd4'
+COLOR_ICHIMOKU_KIJUN = '#ff7043'
+COLOR_ICHIMOKU_SENKOU = '#78909c'
+COLOR_KELTNER = '#26a69a'
+# grises del VWAP: tonos distintos por configuración (anclaje/k/modo) para
+# que canales solapados no se apilen en una sola mancha oscura
+_PALETA_VWAP = ['#9aa7b8', '#7a8ba3', '#b8c4d4', '#5d6f8a']
 COLOR_PATRONES = '#2ecc71'
 
 # ── paneles apilados del gráfico de operaciones (precio + osciladores) ──
@@ -189,17 +203,27 @@ TOP_PANEL, BOTTOM_STACK = 0.94, 0.075
 GAP_PANEL = 0.018
 ETIQUETA_PANEL = {'precio': 'Precio', 'rsi': 'RSI', 'atr': 'ATR',
                   'stoch': 'Estocástico', 'williams': 'Williams %R', 'cci': 'CCI',
-                  'er': 'Régimen ER', 'hurst': 'Régimen Hurst'}
+                  'er': 'Régimen ER', 'hurst': 'Régimen Hurst',
+                  'macd': 'MACD', 'adx': 'ADX (+DI/−DI)', 'aroon': 'Aroon',
+                  'cmo': 'CMO', 'trix': 'TRIX', 'stochrsi': 'StochRSI',
+                  'ttm': 'TTM Squeeze', 'vwap': 'Distancia VWAP (σ)'}
 # primer color de la paleta de cada panel: es el que representa al oscilador en
 # el cuadradito del panel de capas
 COLOR_PANEL_OSC = {'rsi': '#ffffff', 'atr': '#2ecc71', 'stoch': '#26c6da',
                    'williams': '#ec407a', 'cci': '#5c6bc0',
-                   'er': '#ff9800', 'hurst': '#ab47bc'}
+                   'er': '#ff9800', 'hurst': '#ab47bc',
+                   'macd': '#4fc3f7', 'adx': '#7986cb', 'aroon': '#1abc9c',
+                   'cmo': '#ffa726', 'trix': '#ff7043', 'stochrsi': '#fd79a8',
+                   'ttm': '#ffb300', 'vwap': '#9aa7b8'}
 # (kind, clave en _recolectar_indicadores) de cada panel apilado bajo el precio,
 # en el orden en que se apilan. Un solo sitio: lo recorren el dibujo y el
 # catálogo de capas.
 PANELES_OSCILADOR = (('rsi', 'rsis'), ('atr', 'atrs'), ('stoch', 'stochs'),
                      ('williams', 'williams'), ('cci', 'ccis'),
+                     ('macd', 'macds'), ('adx', 'adxs'), ('aroon', 'aroones'),
+                     ('cmo', 'cmos'), ('trix', 'trixes'),
+                     ('stochrsi', 'stochrsis'), ('ttm', 'ttms'),
+                     ('vwap', 'vwaps'),
                      ('er', 'ers'), ('hurst', 'hursts'))
 # banda que el filtro ADMITE en cada método, para sombrearla en su panel
 BANDA_REGIMEN = {
@@ -566,12 +590,41 @@ def _decimar_ohlc(x, o, h, l, c, x0, x1, max_velas=2500):
     return xs[idx], os_[idx], hs[idx], ls[idx], cs[idx]
 
 
+def _decimar_linea(x_all, y_all, x0, x1, max_puntos=2500):
+    """Recorta una serie (x, y) de overlay/oscilador a la ventana visible
+    [x0, x1] y, si quedan más de max_puntos, la submuestrea con el MISMO
+    criterio que las velas (_decimar_ohlc): se dibujan puntos REALES de la
+    serie, ninguno sintético, y al acercar solo aparecen los intermedios.
+
+    El indexado con numpy conserva los NaN (huecos de las series con tramos
+    sin valor), así que no deforma líneas discontinuas. `x_all` es el índice
+    de vela (monótono), igual que `_x_full`."""
+    i0 = max(int(np.searchsorted(x_all, x0)) - 1, 0)
+    i1 = min(int(np.searchsorted(x_all, x1)) + 1, len(x_all))
+    if i1 <= i0:
+        i1 = min(i0 + 1, len(x_all))
+    xs, ys = x_all[i0:i1], y_all[i0:i1]
+    m = len(xs)
+    if m <= max_puntos:
+        return xs, ys
+    paso = int(np.ceil(m / max_puntos))
+    idx = np.arange(0, m, paso)
+    return xs[idx], ys[idx]
+
+
+# pasos máximos de la animación de zoom con la rueda (ver _avanzar_zoom):
+# antes convergía tras ~20 pasos (~600 ms de animación con los frames de
+# blit de ~30 ms, que era el lag/parpadeo al hacer scroll); con 6 pasos el
+# easing se resuelve en ~180 ms, ágil pero sigue siendo animado.
+MAX_PASOS_ZOOM = 6
+
+
 def _cargar_ohlc(csv_path, regla_resample=None):
     """Lee timestamp/open/high/low/close de un CSV limpiado y, si se pide,
     lo reagrega a una temporalidad más gruesa (misma agregación que
     tab_patrones._ResampleThread). Compartido por _BacktestThread y
     _OptimizerThread."""
-    cols = ['timestamp', 'open', 'high', 'low', 'close',
+    cols = ['timestamp', 'open', 'high', 'low', 'close', 'volume',
             'interpolado', 'anomalia']
     try:
         df = pd.read_csv(csv_path, usecols=cols, engine='pyarrow')
@@ -586,11 +639,17 @@ def _cargar_ohlc(csv_path, regla_resample=None):
         else:
             df[nombre] = (pd.to_numeric(df[nombre], errors='coerce')
                           .fillna(0).astype(np.int8))
+    if 'volume' not in df.columns:
+        df['volume'] = 0
+    else:
+        df['volume'] = pd.to_numeric(df['volume'], errors='coerce').fillna(0)
     if regla_resample:
         agg = {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last',
+               'volume': 'sum',
                'interpolado': 'max', 'anomalia': 'max'}
         df = (df.set_index('timestamp')[
-                ['open', 'high', 'low', 'close', 'interpolado', 'anomalia']]
+                ['open', 'high', 'low', 'close', 'volume',
+                 'interpolado', 'anomalia']]
                 .resample(regla_resample).agg(agg)
                 .dropna(subset=['close'])
                 .reset_index())
@@ -644,6 +703,16 @@ def _velas_por_anio(df, csv_path=None):
     minutos_vela = float(difs.median()) if len(difs) else 60.0
     tipo = tipo_activo_de_csv(csv_path) if csv_path else None
     return velas_por_anio_config(tipo, minutos_vela)
+
+
+def _velas_por_dia(df, csv_path=None):
+    """Nº de velas por día de trading de la clase de activo del CSV, para
+    métricas por tiempo (p. ej. 'avg_trades_por_dia'). Misma sesión real
+    (STOCK 390 min/día, CRYPTO/FUTURO/FOREX 1440) que _velas_por_anio."""
+    difs = df['timestamp'].diff().dropna().dt.total_seconds() / 60.0
+    minutos_vela = float(difs.median()) if len(difs) else 60.0
+    tipo = tipo_activo_de_csv(csv_path) if csv_path else None
+    return velas_por_dia_config(tipo, minutos_vela)
 
 
 # ══════════════ hilo de backtest ══════════════
@@ -817,12 +886,13 @@ class _BacktestThread(QThread):
             self.progreso.emit(60, 100)
 
             velas_anio = _velas_por_anio(df, self._csv)
+            velas_dia = _velas_por_dia(df, self._csv)
 
             corte = dividir_is_oos(n, self._pct_oos)
             metricas = {
-                'IS': calcular_metricas(resultado, 0, corte, velas_anio),
-                'OOS': calcular_metricas(resultado, corte, n, velas_anio),
-                'Total': calcular_metricas(resultado, 0, n, velas_anio),
+                'IS': calcular_metricas(resultado, 0, corte, velas_anio, velas_dia),
+                'OOS': calcular_metricas(resultado, corte, n, velas_anio, velas_dia),
+                'Total': calcular_metricas(resultado, 0, n, velas_anio, velas_dia),
             }
 
             # métricas por setup (valida si cada forma de entrada aporta)
@@ -847,7 +917,7 @@ class _BacktestThread(QThread):
                 ventanas = []
                 for k in range(self._wfa_n):
                     met = calcular_metricas(resultado, bordes[k], bordes[k + 1],
-                                            velas_anio)
+                                            velas_anio, velas_dia)
                     met['idx_ini'] = int(bordes[k])
                     met['idx_fin'] = int(bordes[k + 1])
                     ventanas.append(met)
@@ -866,6 +936,8 @@ class _BacktestThread(QThread):
                 'high': df['high'].values,
                 'low': df['low'].values,
                 'close': c,
+                'volume': df['volume'].values if 'volume' in df.columns
+                          else np.zeros(n),
                 'codigo': self._codigo,
                 'log_ret_acum': np.log(c / c[0]),
                 'resultado': resultado,
@@ -876,6 +948,7 @@ class _BacktestThread(QThread):
                 'corte': corte,
                 'n_velas': n,
                 'velas_anio': velas_anio,
+                'velas_dia': velas_dia,
                 'wfa': wfa,
                 'montecarlo': mc,
                 'estrategia': ' + '.join(s.get('nombre') or s['plantilla']
@@ -1207,6 +1280,34 @@ def _spin_regla(valor, minimo=1, maximo=100000, dec=None):
 # parecía que el número importaba cuando no.
 _PRECIOS_SIN_PERIODO = {'close', 'open', 'high', 'low'}
 
+# series VWAP con anclaje/desviación/modo seleccionables en las condiciones
+_TIPOS_VWAP_REGLA = ('VWAP_MEDIA', 'VWAP_SD', 'VWAP_SUP', 'VWAP_INF')
+_MAPA_ANCLAJE = {'Sesión': 'D', 'Semana': 'W', 'Mes': 'M', 'Trimestre': 'T',
+                 'Año': 'A', 'Década': '10Y', 'Siglo': '100Y'}
+_MAPA_ANCLAJE_INV = {v: k for k, v in _MAPA_ANCLAJE.items()}
+_MAPA_MODO_VWAP = {'SD': 'sd', '%': 'pct'}
+_MAPA_MODO_VWAP_INV = {v: k for k, v in _MAPA_MODO_VWAP.items()}
+_K_VWAP = ['0.5', '1', '2', '3']
+
+
+def _es_vwap_regla(tipo):
+    return tipo in _TIPOS_VWAP_REGLA
+
+
+def _sincronizar_vwap(cmb_izq, cmb_der, ancla, k, modo):
+    """Habilita/deshabilita las columnas Anclaje/Desviación/Modo según si el
+    indicador de la fila (izq o der) es una serie VWAP configurable."""
+    def _sync(_texto=None):
+        activo = _es_vwap_regla(cmb_izq.currentText()) or \
+            _es_vwap_regla(cmb_der.currentText())
+        for w in (ancla, k, modo):
+            w.setEnabled(activo)
+            w.setToolTip('' if activo else
+                         "Solo aplica a las series VWAP (anclaje y banda).")
+    cmb_izq.currentTextChanged.connect(_sync)
+    cmb_der.currentTextChanged.connect(_sync)
+    _sync()
+
 
 def _sincronizar_periodo(cmb, spin):
     """Liga un combo de indicador con su spin de periodo: al elegir un precio
@@ -1225,12 +1326,19 @@ def _sincronizar_periodo(cmb, spin):
     _sync(cmb.currentText())
 
 
-def _spec_regla(tipo, num):
+def _spec_regla(tipo, num, anclaje=None, k=None, modo=None):
     if tipo == 'Valor':
         return {'tipo': 'valor', 'valor': num}
     if tipo in ('close', 'open', 'high', 'low'):
         return {'tipo': tipo}
-    return {'tipo': tipo, 'periodo': int(num)}
+    spec = {'tipo': tipo, 'periodo': int(num)}
+    # las series VWAP llevan anclaje + desviación + modo (seleccionables en
+    # las columnas de la tabla de condiciones)
+    if tipo in _TIPOS_VWAP_REGLA:
+        spec['anclaje'] = anclaje or 'W'
+        spec['k'] = float(k or 1.0)
+        spec['modo'] = modo or 'sd'
+    return spec
 
 
 def _texto_spec_regla(spec):
@@ -1296,86 +1404,67 @@ def _abrir_guia_calendario(parent):
     key configurada (el llamador puede entonces activar el checkbox)."""
     from gui.dialogs.settings_dialog import SettingsDialog
 
-    dlg = QDialog(parent)
-    dlg.setWindowTitle("Noticias económicas (TradingEconomics)")
-    dlg.setMinimumWidth(480)
-    dlg.setStyleSheet("""
-        QDialog { background-color: #0d1424; }
-        QLabel { color: #c8d6e5; font-size: 11px; }
-        QLabel#titulo { color: #4fc3f7; font-size: 14px; font-weight: bold; }
-        QLabel#paso { color: #7aaccc; font-size: 12px; font-weight: bold; }
-        QPushButton {
-            background-color: #1a2a45; color: #4fc3f7; border: 1px solid #253a60;
-            border-radius: 4px; padding: 6px 12px; font-size: 11px;
-        }
-        QPushButton:hover { background-color: #1e3050; border-color: #3a5a8a; }
-        QPushButton#cerrar {
-            background-color: #2a4a6a; color: #4fc3f7; font-weight: bold;
-            padding: 8px 18px;
-        }
-    """)
-    lay = QVBoxLayout(dlg)
-    lay.setContentsMargins(18, 16, 18, 16)
-    lay.setSpacing(10)
-
-    titulo = QLabel("Noticias económicas (TradingEconomics)")
-    titulo.setObjectName("titulo")
-    lay.addWidget(titulo)
+    dlg, contenido, _ = crear_dialogo(
+        "Noticias económicas (TradingEconomics)", parent,
+        subtitulo='API key gratuita (~100 peticiones al mes)', ancho=480)
 
     cuerpo = QLabel(
         "El filtro «Evitar noticias» y las líneas de eventos en Resultados "
         "necesitan datos del calendario económico de TradingEconomics, que "
         "requiere una API key gratuita (~100 peticiones al mes).")
     cuerpo.setWordWrap(True)
-    lay.addWidget(cuerpo)
+    contenido.addWidget(cuerpo)
 
     # Paso 1
     paso1 = QLabel("Paso 1 — Consigue la API key")
-    paso1.setObjectName("paso")
-    lay.addWidget(paso1)
+    paso1.setStyleSheet("color: #7aaccc; font-size: 12px; font-weight: bold;")
+    contenido.addWidget(paso1)
     t1 = QLabel("Regístrate gratis en tradingeconomics.com; en «My Account » "
                 "→ API tendrás tu key (el plan gratuito incluye el "
                 "calendario). Sin tarjeta de crédito.")
     t1.setWordWrap(True)
-    lay.addWidget(t1)
+    contenido.addWidget(t1)
     btn_web = QPushButton("Abrir tradingeconomics.com")
     btn_web.clicked.connect(
         lambda: QDesktopServices.openUrl(QUrl("https://tradingeconomics.com/api")))
-    lay.addWidget(btn_web)
+    contenido.addWidget(btn_web)
 
     # Paso 2
     paso2 = QLabel("Paso 2 — Conéctala en la plataforma")
-    paso2.setObjectName("paso")
-    lay.addWidget(paso2)
+    paso2.setStyleSheet("color: #7aaccc; font-size: 12px; font-weight: bold;")
+    contenido.addWidget(paso2)
     t2 = QLabel("En Ajustes → Calendario económico, pega tu key y pulsa "
                 "«Probar conexión». Al cerrar Ajustes, esta opción quedará "
                 "activa.")
     t2.setWordWrap(True)
-    lay.addWidget(t2)
+    contenido.addWidget(t2)
     btn_ajustes = QPushButton("Abrir Ajustes")
     btn_ajustes.clicked.connect(lambda: SettingsDialog(parent).exec())
-    lay.addWidget(btn_ajustes)
+    contenido.addWidget(btn_ajustes)
 
     # Paso 3
     paso3 = QLabel("Paso 3 — Listo")
-    paso3.setObjectName("paso")
-    lay.addWidget(paso3)
+    paso3.setStyleSheet("color: #7aaccc; font-size: 12px; font-weight: bold;")
+    contenido.addWidget(paso3)
     t3 = QLabel("Vuelve a marcar «Evitar noticias» (o «Mostrar noticias» en "
                 "Resultados). Se descargarán los eventos del rango del backtest.")
     t3.setWordWrap(True)
-    lay.addWidget(t3)
+    contenido.addWidget(t3)
 
     btn_cerrar = QPushButton("Cerrar")
-    btn_cerrar.setObjectName("cerrar")
+    btn_cerrar.setObjectName("accionOk")
     btn_cerrar.clicked.connect(dlg.accept)
-    lay.addWidget(btn_cerrar, alignment=Qt.AlignmentFlag.AlignRight)
+    contenido.addWidget(btn_cerrar, alignment=Qt.AlignmentFlag.AlignRight)
 
     dlg.exec()
     return bool(get_te_api_key())
 
 
 def _acumular_indicador_spec(spec, mas, rsis, atrs, bbs, donchianes=None,
-                             zigzags=None):
+                             zigzags=None, macds=None, adxs=None,
+                             supertrends=None, aroones=None, cmos=None,
+                             trixes=None, stochrsis=None, ichimokus=None,
+                             keltners=None, ttms=None, vwaps=None):
     """Clasifica un spec de indicador ({'tipo':'EMA','periodo':200}, etc.) en
     los sets que consumen ResultadosWidget._dibujar_principal/_dibujar_indicadores.
     Ignora specs sin indicador real (close/open/high/low/valor)."""
@@ -1394,6 +1483,34 @@ def _acumular_indicador_spec(spec, mas, rsis, atrs, bbs, donchianes=None,
     elif t == 'ZIGZAG' and zigzags is not None:
         # desde una regla la desviación es fija y el «Periodo» son las piernas
         zigzags.add((_ZIGZAG_DESVIACION_REGLA, per))
+    elif t == 'SUPERTREND' and supertrends is not None:
+        # en el editor el multiplicador es fijo (×3); la plantilla lo varía
+        supertrends.add((per, 3.0))
+    elif t in ('MACD_LINEA', 'MACD_SENAL', 'MACD_HIST') and macds is not None:
+        # parámetros fijos 12/26/9 en el editor; la plantilla los varía
+        macds.add((12, 26, 9))
+    elif t in ('ADX', 'DI_PLUS', 'DI_MINUS') and adxs is not None:
+        # el umbral de fuerza no viaja en la regla: se dibuja con el de 20
+        adxs.add((per, 20.0))
+    elif t in ('AROON_UP', 'AROON_DN') and aroones is not None:
+        aroones.add(per)
+    elif t == 'CMO' and cmos is not None:
+        cmos.add(per)
+    elif t == 'TRIX' and trixes is not None:
+        trixes.add(per)
+    elif t == 'STOCHRSI' and stochrsis is not None:
+        stochrsis.add(per)
+    elif t in ('ICHIMOKU_TENKAN', 'ICHIMOKU_KIJUN', 'ICHIMOKU_SENKOU_A',
+               'ICHIMOKU_SENKOU_B', 'ICHIMOKU_CHIKOU') and ichimokus is not None:
+        # parámetros fijos 9/26/52 en el editor; la plantilla los varía
+        ichimokus.add((9, 26, 52))
+    elif t in ('KELTNER_SUP', 'KELTNER_INF', 'KELTNER_MEDIA') and keltners is not None:
+        keltners.add((per, 2.0))
+    elif t in ('TTM_SQUEEZE', 'TTM_MOMENTUM') and ttms is not None:
+        ttms.add((per, 2.0, 1.5))
+    elif t in _TIPOS_VWAP_REGLA and vwaps is not None:
+        vwaps.add((spec.get('anclaje', 'W'), float(spec.get('k', 1.0)),
+                   spec.get('modo', 'sd')))
 
 
 class EditorReglas(QGroupBox):
@@ -1411,10 +1528,10 @@ class EditorReglas(QGroupBox):
             "condiciones de entrada/salida a mano combinando indicadores. "
             "Las condiciones del mismo bloque se exigen todas a la vez "
             "(AND); bloques distintos son alternativas entre sí (OR)."))
-        self.tabla = QTableWidget(0, 7)
+        self.tabla = QTableWidget(0, 10)
         self.tabla.setHorizontalHeaderLabels(
             ['Regla', 'Setup', 'Indicador', 'Periodo', 'Operador',
-             'Comparar con', 'Valor/Periodo'])
+             'Comparar con', 'Valor/Periodo', 'Anclaje', 'Desviación', 'Modo'])
         self.tabla.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.tabla.verticalHeader().setVisible(False)
         self.tabla.setMinimumHeight(120)
@@ -1447,6 +1564,23 @@ class EditorReglas(QGroupBox):
         self.tabla.setCellWidget(r, 6, sp_der)
         _sincronizar_periodo(cmb_izq, sp_izq)
         _sincronizar_periodo(cmb_der, sp_der)
+        # columnas VWAP (anclaje / desviación / modo) — solo activas si la
+        # fila usa una serie VWAP configurable
+        cmb_ancla = _combo_regla(
+            list(_MAPA_ANCLAJE), _MAPA_ANCLAJE_INV.get(d.get('anclaje', 'W'), 'Semana'))
+        cmb_ancla.setToolTip("Periodo de referencia del VWAP: cuándo se "
+                             "reinicia el acumulado (sesión/semana/mes/…).")
+        cmb_k = _combo_regla(_K_VWAP, '{:g}'.format(float(d.get('k', 1.0))))
+        cmb_k.setToolTip("Multiplicador de la banda: VWAP ± k·σ (o k% en modo "
+                         "porcentaje).")
+        cmb_modo = _combo_regla(list(_MAPA_MODO_VWAP),
+                                _MAPA_MODO_VWAP_INV.get(d.get('modo', 'sd'), 'SD'))
+        cmb_modo.setToolTip("Modo de la banda: desviación estándar del anclaje "
+                            "o porcentaje del propio VWAP.")
+        _sincronizar_vwap(cmb_izq, cmb_der, cmb_ancla, cmb_k, cmb_modo)
+        self.tabla.setCellWidget(r, 7, cmb_ancla)
+        self.tabla.setCellWidget(r, 8, cmb_k)
+        self.tabla.setCellWidget(r, 9, cmb_modo)
 
     def _del_fila(self):
         r = self.tabla.currentRow()
@@ -1466,8 +1600,12 @@ class EditorReglas(QGroupBox):
             op = self.tabla.cellWidget(r, 4).currentText()
             der = self.tabla.cellWidget(r, 5).currentText()
             der_val = self.tabla.cellWidget(r, 6).value()
-            cond = {'izq': _spec_regla(izq, izq_per), 'op': op,
-                    'der': _spec_regla(der, der_val)}
+            anclaje = _MAPA_ANCLAJE[self.tabla.cellWidget(r, 7).currentText()]
+            k = float(self.tabla.cellWidget(r, 8).currentText())
+            modo = _MAPA_MODO_VWAP[self.tabla.cellWidget(r, 9).currentText()]
+            cond = {'izq': _spec_regla(izq, izq_per, anclaje, k, modo),
+                    'op': op,
+                    'der': _spec_regla(der, der_val, anclaje, k, modo)}
             grupos.setdefault((self._CLAVES[regla], setup), []).append(cond)
         out = {'entradas_long': [], 'salidas_long': [],
                'entradas_short': [], 'salidas_short': []}
@@ -1493,6 +1631,9 @@ class EditorReglas(QGroupBox):
                         'op': cond['op'],
                         'der': 'Valor' if der['tipo'] == 'valor' else der['tipo'],
                         'der_valor': der.get('valor', der.get('periodo', 0.0)),
+                        'anclaje': izq.get('anclaje') or der.get('anclaje') or 'W',
+                        'k': izq.get('k') or der.get('k') or 1.0,
+                        'modo': izq.get('modo') or der.get('modo') or 'sd',
                     })
 
 
@@ -1509,6 +1650,7 @@ class EditorCondiciones(QGroupBox):
     mapeada escribe en el parámetro correspondiente de la plantilla."""
 
     COL_INDICADOR, COL_PERIODO, COL_OP, COL_DER, COL_VALOR, COL_DIR = range(6)
+    COL_ANCLAJE, COL_K, COL_MODO = range(6, 9)
     # qué parámetro de la plantilla edita cada celda, según el 'mapeo' del
     # descriptor (ver core/strategies._fila)
     _CELDA_MAPEO = {COL_INDICADOR: 'izq.tipo', COL_PERIODO: 'izq.periodo',
@@ -1518,10 +1660,10 @@ class EditorCondiciones(QGroupBox):
     def __init__(self, titulo, parent=None):
         super().__init__(titulo, parent)
         lay = QVBoxLayout(self)
-        self.tabla = QTableWidget(0, 6)
+        self.tabla = QTableWidget(0, 9)
         self.tabla.setHorizontalHeaderLabels(
             ['Indicador', 'Periodo', 'Operador', 'Comparar con', 'Valor/Periodo',
-             'Dirección'])
+             'Dirección', 'Anclaje', 'Desviación', 'Modo'])
         self.tabla.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.tabla.verticalHeader().setVisible(False)
         self.tabla.verticalHeader().setDefaultSectionSize(30)
@@ -1625,7 +1767,7 @@ class EditorCondiciones(QGroupBox):
             item.setToolTip(tooltip + "\n(no representable como fila de "
                             "indicador: edítala desde «Parámetros»)")
             self.tabla.setItem(r, 0, item)
-            self.tabla.setSpan(r, 0, 1, 6)
+            self.tabla.setSpan(r, 0, 1, 9)
             return
 
         izq, der = desc['izq'], desc['der']
@@ -1742,7 +1884,22 @@ class EditorCondiciones(QGroupBox):
             "'Long'/'Short' la restringe solo a ese lado, sin afectar al otro "
             "— p.ej. close > SMA(200) en Long y close < SMA(200) en Short "
             "dentro del mismo setup.")
-        for col, w in enumerate((w0, w1, w2, w3, w4, cmb_dir)):
+        # columnas VWAP (anclaje / desviación / modo) — solo activas si la
+        # fila usa una serie VWAP configurable
+        ancla_ini = _MAPA_ANCLAJE_INV.get(d.get('anclaje', 'W'), 'Semana')
+        cmb_ancla = _combo_regla(list(_MAPA_ANCLAJE), ancla_ini)
+        cmb_ancla.setToolTip("Periodo de referencia del VWAP: cuándo se "
+                             "reinicia el acumulado (sesión/semana/mes/…).")
+        cmb_k = _combo_regla(_K_VWAP, '{:g}'.format(float(d.get('k', 1.0))))
+        cmb_k.setToolTip("Multiplicador de la banda: VWAP ± k·σ (o k% en modo "
+                         "porcentaje).")
+        cmb_modo = _combo_regla(list(_MAPA_MODO_VWAP),
+                                _MAPA_MODO_VWAP_INV.get(d.get('modo', 'sd'), 'SD'))
+        cmb_modo.setToolTip("Modo de la banda: desviación estándar del anclaje "
+                            "o porcentaje del propio VWAP.")
+        _sincronizar_vwap(w0, w3, cmb_ancla, cmb_k, cmb_modo)
+        for col, w in enumerate((w0, w1, w2, w3, w4, cmb_dir,
+                                 cmb_ancla, cmb_k, cmb_modo)):
             _seleccionar_fila_al_clic(w, self.tabla, r)
             self.tabla.setCellWidget(r, col, w)
         _repintar_seleccion_fila(self.tabla)
@@ -1798,8 +1955,13 @@ class EditorCondiciones(QGroupBox):
             der = self.tabla.cellWidget(r, 3).currentText()
             der_val = self.tabla.cellWidget(r, 4).value()
             direccion = _MAPA_DIRECCION[self.tabla.cellWidget(r, 5).currentText()]
-            out.append({'izq': _spec_regla(izq, izq_per), 'op': op,
-                        'der': _spec_regla(der, der_val), 'direccion': direccion})
+            anclaje = _MAPA_ANCLAJE[self.tabla.cellWidget(r, 6).currentText()]
+            k = float(self.tabla.cellWidget(r, 7).currentText())
+            modo = _MAPA_MODO_VWAP[self.tabla.cellWidget(r, 8).currentText()]
+            out.append({'izq': _spec_regla(izq, izq_per, anclaje, k, modo),
+                        'op': op,
+                        'der': _spec_regla(der, der_val, anclaje, k, modo),
+                        'direccion': direccion})
         return out
 
     def cargar_condiciones(self, condiciones):
@@ -1817,6 +1979,9 @@ class EditorCondiciones(QGroupBox):
                 'der': 'Valor' if der['tipo'] == 'valor' else der['tipo'],
                 'der_valor': der.get('valor', der.get('periodo', 0.0)),
                 'direccion': _MAPA_DIRECCION_INV.get(cond.get('direccion', 'ambas'), 'Ambas'),
+                'anclaje': izq.get('anclaje') or der.get('anclaje') or 'W',
+                'k': izq.get('k') or der.get('k') or 1.0,
+                'modo': izq.get('modo') or der.get('modo') or 'sd',
             })
 
 
@@ -1883,6 +2048,12 @@ _MAPA_VOLATILIDAD_INV = {v: k for k, v in _MAPA_VOLATILIDAD.items()}
 _MAPA_SESION_INV = {v: k for k, v in _MAPA_SESION.items()}
 _MAPA_IMPACTO_NOTICIAS = {'Bajo': 'bajo', 'Medio': 'medio', 'Alto': 'alto'}
 _MAPA_IMPACTO_NOTICIAS_INV = {v: k for k, v in _MAPA_IMPACTO_NOTICIAS.items()}
+_MAPA_TF_SUPERIOR = {
+    'Ninguno': 'ninguno', 'SMA': 'SMA', 'EMA': 'EMA', 'Supertrend': 'SUPERTREND',
+}
+_MAPA_TF_SUPERIOR_INV = {v: k for k, v in _MAPA_TF_SUPERIOR.items()}
+_MAPA_RELACION_TF = {'Ambos': 'ambos', 'Solo largos': 'long', 'Solo cortos': 'short'}
+_MAPA_RELACION_TF_INV = {v: k for k, v in _MAPA_RELACION_TF.items()}
 
 # dirección de una condición de filtro (EditorCondiciones): a qué lado(s) se
 # aplica. 'Ambas' es el valor por defecto y restringe long y short por igual
@@ -2090,20 +2261,16 @@ class TemplateCard(QFrame):
         return self._nombre
 
 
-class DialogoSeleccionTarjeta(QDialog):
+class DialogoSeleccionTarjeta(DialogoBase):
     """Ventana modal con todas las opciones como tarjetas en rejilla (3
     columnas) dentro de un scroll VERTICAL (barra ya tematizada). Un click en
     una tarjeta la elige y cierra el diálogo."""
 
     def __init__(self, opciones, actual, titulo, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle(titulo)
-        self.setModal(True)
+        super().__init__(titulo, parent,
+                         subtitulo='Elige una opción con un clic',
+                         ancho=480, alto=400)
         self.elegido = None
-
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(10, 10, 10, 10)
-        lay.setSpacing(8)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -2121,16 +2288,15 @@ class DialogoSeleccionTarjeta(QDialog):
             card.clicked.connect(self._elegir)
             grid.addWidget(card, i // 3, i % 3)
         scroll.setWidget(cont)
-        lay.addWidget(scroll, 1)
+        self.contenido.addWidget(scroll, 1)
 
         btn_cancelar = QPushButton("Cancelar")
+        btn_cancelar.setObjectName("accionNeutra")
         btn_cancelar.clicked.connect(self.reject)
         fila_btn = QHBoxLayout()
         fila_btn.addStretch()
         fila_btn.addWidget(btn_cancelar)
-        lay.addLayout(fila_btn)
-
-        self.resize(480, 360)
+        self.contenido.addLayout(fila_btn)
 
     def _elegir(self, nombre):
         self.elegido = nombre
@@ -3027,6 +3193,54 @@ class OptimizadorWidget(QWidget):
         if self._lbl_horas is not None:
             self._lbl_horas.setVisible(False)
 
+        # ── filtro de tendencia de TF superior (multi-timeframe) ──
+        self.cmb_tf_sup_indicador = QComboBox()
+        self.cmb_tf_sup_indicador.addItems(list(_MAPA_TF_SUPERIOR))
+        self.cmb_tf_sup_indicador.setToolTip(
+            "Solo se abren posiciones NUEVAS cuando el precio está alineado "
+            "con la tendencia de un timeframe superior: la serie se "
+            "resamplea al TF elegido y se compara el cierre de cada vela "
+            "con su media (SMA/EMA) o Supertrend de ese TF. Sin lookahead: "
+            "solo se usa la vela del TF superior ya cerrada.")
+        self.cmb_tf_sup_indicador.currentTextChanged.connect(
+            self._on_tf_sup_changed)
+        f_filtros.addRow("Tendencia TF sup.:", self.cmb_tf_sup_indicador)
+        fila_tfs = QHBoxLayout()
+        self.cmb_tf_sup_tf = QComboBox()
+        self.cmb_tf_sup_tf.addItems(TF_LABELS)
+        self.cmb_tf_sup_tf.setCurrentText('1h')
+        self.cmb_tf_sup_tf.setToolTip(
+            "Timeframe superior al de las velas del activo; si no es mayor, "
+            "el filtro se ignora con aviso.")
+        self.sp_tf_sup_periodo = QSpinBox()
+        self.sp_tf_sup_periodo.setRange(2, 5000)
+        self.sp_tf_sup_periodo.setValue(200)
+        self.sp_tf_sup_periodo.setToolTip(
+            "Periodo del indicador calculado sobre el TF superior (p. ej. "
+            "SMA 200 de 1h filtrando velas de 5m).")
+        self.cmb_tf_sup_relacion = QComboBox()
+        self.cmb_tf_sup_relacion.addItems(list(_MAPA_RELACION_TF))
+        self.cmb_tf_sup_relacion.setToolTip(
+            "'Ambos': largos solo con precio ≥ tendencia y cortos solo con "
+            "precio ≤ tendencia. 'Solo largos'/'Solo cortos' aplican la "
+            "alineación a un único lado.")
+        self.cmb_tf_sup_tf.currentTextChanged.connect(self._guardar_setup_actual)
+        self.sp_tf_sup_periodo.valueChanged.connect(self._guardar_setup_actual)
+        self.cmb_tf_sup_relacion.currentTextChanged.connect(self._guardar_setup_actual)
+        fila_tfs.addWidget(QLabel("TF"))
+        fila_tfs.addWidget(self.cmb_tf_sup_tf)
+        fila_tfs.addWidget(QLabel("periodo"))
+        fila_tfs.addWidget(self.sp_tf_sup_periodo)
+        fila_tfs.addWidget(QLabel("relación"))
+        fila_tfs.addWidget(self.cmb_tf_sup_relacion)
+        fila_tfs.addStretch()
+        self._fila_tf_sup_widget = QWidget()
+        self._fila_tf_sup_widget.setLayout(fila_tfs)
+        f_filtros.addRow("Parámetros:", self._fila_tf_sup_widget)
+        self._lbl_tf_sup = f_filtros.labelForField(self._fila_tf_sup_widget)
+        if self._lbl_tf_sup is not None:
+            self._lbl_tf_sup.setVisible(False)
+
         self.chk_noticias = QCheckBox("Evitar noticias")
         self.chk_noticias.setToolTip(
             "Próximamente: el calendario económico está en revisión (sin "
@@ -3389,7 +3603,7 @@ class OptimizadorWidget(QWidget):
         else:
             self.lbl_tf_info.setText(
                 f"Nativa: {self._tf_nativo} · backtest en {self._tf_actual} "
-                f"(velas agregadas al ejecutar)")
+f"(velas agregadas al ejecutar)")
 
     @_no_crash
     def _on_tf_clicked(self, btn_id):
@@ -3410,10 +3624,10 @@ class OptimizadorWidget(QWidget):
     @_no_crash
     def _on_tf_custom_clicked(self):
         previo = self._tf_actual
-        texto, ok = QInputDialog.getText(
+        texto, ok = pedir_texto(
             self, "Temporalidad personalizada",
             "Temporalidad (p.ej. 20m, 90m, 2h, 3d, 5d, 2w):",
-            text=self._tf_custom or "")
+            inicial=self._tf_custom or "")
         if not ok:
             self._restaurar_boton_tf(previo)
             return
@@ -3674,6 +3888,13 @@ class OptimizadorWidget(QWidget):
             self.sp_hora_ini.setValue(filtros.get('sesion', {}).get('hora_inicio', 0))
             self.sp_hora_fin.setValue(filtros.get('sesion', {}).get('hora_fin', 0))
             self._recargar_filas_plantilla(s, filtros.get('condiciones_entrada'))
+            tfs = filtros.get('tf_superior') or {}
+            self.cmb_tf_sup_indicador.setCurrentText(
+                _MAPA_TF_SUPERIOR_INV.get(tfs.get('indicador', 'ninguno'), 'Ninguno'))
+            self.cmb_tf_sup_tf.setCurrentText(str(tfs.get('tf', '1h')))
+            self.sp_tf_sup_periodo.setValue(int(tfs.get('periodo') or 200))
+            self.cmb_tf_sup_relacion.setCurrentText(
+                _MAPA_RELACION_TF_INV.get(tfs.get('relacion', 'ambos'), 'Ambos'))
             # Noticias: en revisión («próximamente») — nunca se activan, ni
             # siquiera para setups guardados con el filtro puesto.
             noticias = filtros.get('noticias') or {}
@@ -3962,6 +4183,13 @@ class OptimizadorWidget(QWidget):
         activo = self.chk_noticias.isChecked()
         self._fila_noticias_widget.setEnabled(activo)
         self.chk_noticias_cerrar.setEnabled(activo)
+        tf_sup_activo = self.cmb_tf_sup_indicador.currentText() != 'Ninguno'
+        self._fila_tf_sup_widget.setEnabled(tf_sup_activo)
+
+    @_no_crash
+    def _on_tf_sup_changed(self, _texto):
+        self._actualizar_visibilidad_filtros()
+        self._guardar_setup_actual()
 
     @_no_crash
     def _on_regimen_changed(self, texto):
@@ -4955,6 +5183,12 @@ class OptimizadorWidget(QWidget):
             },
             'condiciones_entrada': self.editor_cond_entrada.condiciones(),
             'condiciones_salida': [],  # ahora en parciales[etapa]
+            'tf_superior': {
+                'indicador': _MAPA_TF_SUPERIOR[self.cmb_tf_sup_indicador.currentText()],
+                'tf': self.cmb_tf_sup_tf.currentText(),
+                'periodo': self.sp_tf_sup_periodo.value(),
+                'relacion': _MAPA_RELACION_TF[self.cmb_tf_sup_relacion.currentText()],
+            },
             'noticias': {
                 # Noticias en revisión («próximamente»): nunca activas.
                 'activo': False,
@@ -5323,8 +5557,8 @@ class OptimizadorWidget(QWidget):
 
     @_no_crash
     def _guardar_sistema(self):
-        nombre, ok = QInputDialog.getText(self, "Guardar sistema",
-                                          "Nombre del sistema:")
+        nombre, ok = pedir_texto(self, "Guardar sistema",
+                                       "Nombre del sistema:")
         if not ok or not nombre.strip():
             return
         nombre = nombre.strip()
@@ -5365,11 +5599,8 @@ class OptimizadorWidget(QWidget):
         if extras:
             aviso = ("\n\nSe borrará también el código exportado que hay en esa "
                      "carpeta:\n  " + "\n  ".join(extras))
-        resp = QMessageBox.question(
-            self, "Eliminar sistema",
-            f"¿Eliminar definitivamente el sistema «{nombre}»?{aviso}",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if resp != QMessageBox.StandardButton.Yes:
+        if not confirmar(self, "Eliminar sistema",
+                         f"¿Eliminar definitivamente el sistema «{nombre}»?{aviso}"):
             return
         shutil.rmtree(carpeta)
         if self._guardado_cargado == nombre:
@@ -5397,11 +5628,8 @@ class OptimizadorWidget(QWidget):
         carpeta = os.path.join(FAVORITOS_DIR, _slug_sistema(nombre))
         if not os.path.isdir(carpeta):
             return
-        resp = QMessageBox.question(
-            self, "Eliminar favorito",
-            f"¿Eliminar definitivamente el favorito «{nombre}»?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if resp != QMessageBox.StandardButton.Yes:
+        if not confirmar(self, "Eliminar favorito",
+                         f"¿Eliminar definitivamente el favorito «{nombre}»?"):
             return
         shutil.rmtree(carpeta)
         if self._favorito_cargado == nombre:
@@ -5420,6 +5648,11 @@ class DialogoOptimizacion(QDialog):
 
     METRICAS = [
         ('sharpe', 'Sharpe acumulado (IS)'),
+        ('sharpe_smart', 'Sharpe smart (IS)'),
+        ('sortino', 'Sortino (IS)'),
+        ('calmar', 'Calmar (IS)'),
+        ('omega', 'Omega (IS)'),
+        ('serenity_index', 'Serenity Index (IS)'),
         ('retorno_pct', 'Retorno % (IS)'),
         ('profit_factor', 'Profit factor (IS)'),
         ('sqn', 'SQN (IS)'),
@@ -5629,18 +5862,28 @@ _FILAS_METRICAS = [
     ('retorno_anual_pct', 'Retorno anualizado', 2, ' %'),
     ('max_dd_pct', 'Max drawdown', 2, ' %'),
     ('sharpe', 'Sharpe', 2, ''),
+    ('sharpe_smart', 'Sharpe smart (corr. autocorrelación)', 2, ''),
+    ('sortino', 'Sortino', 2, ''),
+    ('calmar', 'Calmar (CAGR/MaxDD)', 2, ''),
+    ('omega', 'Omega', 2, ''),
     ('expectancy_pct', 'Expectancy por trade', 3, ' R'),
     ('racha_perdedora', 'Racha perdedora máx.', 0, ''),
+    ('racha_ganadora', 'Racha ganadora máx.', 0, ''),
     ('duracion_media', 'Duración media (velas)', 1, ''),
     (None, '— Curva de capital —', None, None),
     ('r2_equity', 'R² de la equity curve', 3, ''),
     ('dd_promedio_pct', 'Drawdown promedio', 2, ' %'),
     ('ulcer_index', 'Ulcer Index', 2, ' %'),
+    ('cvar_dd_pct', 'CVaR drawdown (peor 5%)', 2, ' %'),
     ('tiempo_recuperacion_medio', 'Tiempo recuperación medio', 1, ''),
     ('tiempo_recuperacion_max', 'Tiempo recuperación máx.', 0, ''),
+    (None, '— Riesgo de cola —', None, None),
+    ('cvar_ret_pct', 'CVaR retorno (peor 5% de velas)', 2, ' %'),
+    ('serenity_index', 'Serenity Index', 2, ''),
     (None, '— Robustez y costes —', None, None),
     ('sqn', 'SQN (>2 bueno, >3 excelente)', 2, ''),
     ('payoff_ratio', 'Payoff ratio (ganancia/pérdida media)', 2, ''),
+    ('kelly_pct', 'Kelly fraccional (sizing óptimo)', 1, ' %'),
     ('pct_mejor_trade', 'Beneficio Total Atribuible al mejor trade', 1, ' %'),
     ('slippage_minimo_pct', 'Slippage mínimo viable', 3, ' %'),
     ('impacto_comisiones_pct', 'Impacto de comisiones', 2, ' %'),
@@ -5648,6 +5891,14 @@ _FILAS_METRICAS = [
     ('etd_r_medio', 'ETD medio (beneficio dejado en la mesa)', 2, ' R'),
     ('eficiencia_entrada_media', 'Eficiencia de entrada', 1, ' %'),
     ('eficiencia_salida_media', 'Eficiencia de salida', 1, ' %'),
+    (None, '— Estructura de trades —', None, None),
+    ('win_rate_long', 'Win rate largos', 1, ' %'),
+    ('win_rate_short', 'Win rate cortos', 1, ' %'),
+    ('mayor_ganancia', 'Mayor ganancia', 2, ' €'),
+    ('mayor_perdida', 'Mayor pérdida', 2, ' €'),
+    ('ganancia_bruta', 'Ganancia bruta', 2, ' €'),
+    ('perdida_bruta', 'Pérdida bruta', 2, ' €'),
+    ('avg_trades_por_dia', 'Trades por día', 2, ''),
     (None, '— Exposición —', None, None),
     ('exposicion_pct', 'Exposición al mercado (% del tiempo)', 1, ' %'),
     ('exposicion_capital_pct', 'Capital medio comprometido', 1, ' %'),
@@ -5666,6 +5917,11 @@ _TOOLTIPS_METRICAS = {
           "con R = PnL en múltiplos del riesgo arriesgado. >2.0 bueno, >3.0 excelente",
     'payoff_ratio': "Ganancia media de los trades ganadores / pérdida media "
                     "de los perdedores — bajo con win rate alto puede seguir siendo rentable",
+    'kelly_pct': "Fracción óptima de Kelly f = p − (1−p)/b con p = win rate y "
+                 "b = payoff ratio. Apunta el % del capital que maximiza el "
+                 "crecimiento logarítmico; la práctica habitual es apostar "
+                 "una fracción (medio Kelly = la mitad). Vacío si el sistema "
+                 "no tiene edge (f ≤ 0).",
     'pct_mejor_trade': "% del PnL total que aporta un único trade — alto "
                        "(>20-30%) sugiere depender de un outlier, no de un edge consistente",
     'slippage_minimo_pct': "Slippage adicional (aplicado igual que la "
@@ -5706,6 +5962,48 @@ _TOOLTIPS_METRICAS = {
                                        "10% del tiempo puntúa 110%; ese mismo "
                                        "11% estando el 90% del tiempo puntúa "
                                        "12.2%",
+    'sharpe_smart': "Sharpe ratio corregido por autocorrelación de los "
+                    "retornos: si los retornos están correlacionados en serie, "
+                    "la volatilidad real es mayor que la muestral y el Sharpe "
+                    "clásico lo sobreestima. Este lo penaliza.",
+    'sortino': "Retorno medio entre la desviación SOLO de las pérdidas "
+               "(downside deviation): premia sistemas que caen poco y "
+               "controlado, sin castigar las subidas.",
+    'calmar': "Retorno anualizado entre |Max drawdown|: cuánto retorno da el "
+              "sistema por cada punto de drawdown que hay que soportar.",
+    'omega': "Ganancia total sobre el umbral (0) entre pérdida total bajo él: "
+             ">1 significa que las ganancias superan a las pérdidas en "
+             "términos agregados.",
+    'cvar_ret_pct': "CVaR (Expected Shortfall) del retorno por vela: la "
+                    "pérdida media del peor 5% de las velas del tramo. Es "
+                    "siempre mayor (en magnitud) que el VaR 95%, porque promedia "
+                    "la cola en vez de quedarse en su umbral.",
+    'cvar_dd_pct': "CVaR (Expected Shortfall) de la serie de drawdown: la "
+                   "profundidad media del peor 5% de los drawdowns del tramo. "
+                   "Complementa al Ulcer Index castigando la cola profunda.",
+    'serenity_index': "Serenity Index: retorno total del tramo entre la "
+                      "profundidad de la cola de drawdowns (Ulcer Index × "
+                      "CVaR del drawdown). Premia sistemas con retornos altos "
+                      "y drawdowns poco profundos y cortos. Más es mejor.",
+    'win_rate_long': "Win rate solo de los trades largos (dir=1). Al filtrar "
+                     "«Solo Largos» coincide con el Win rate global; con "
+                     "«Solo Cortos» queda vacío.",
+    'win_rate_short': "Win rate solo de los trades cortos (dir=-1). Al filtrar "
+                      "«Solo Cortos» coincide con el Win rate global; con "
+                      "«Solo Largos» queda vacío.",
+    'racha_ganadora': "Máxima racha de trades ganadores consecutivos del tramo.",
+    'mayor_ganancia': "El trade ganador más grande del tramo, en unidades "
+                      "monetarias.",
+    'mayor_perdida': "El trade perdedor más grande del tramo, en unidades "
+                     "monetarias (valor negativo).",
+    'ganancia_bruta': "Suma de todos los trades ganadores, en unidades "
+                      "monetarias.",
+    'perdida_bruta': "Suma de todos los trades perdedores, en unidades "
+                     "monetarias (valor negativo).",
+    'avg_trades_por_dia': "Promedio de trades completados por día de trading "
+                          "de la clase de activo (STOCK 390 min/día, "
+                          "CRYPTO/FUTURO/FOREX 1440). Requiere conocer la "
+                          "sesión del activo; si no, queda vacío.",
 }
 
 
@@ -5718,13 +6016,16 @@ _TOOLTIPS_METRICAS = {
 # de dirección activo se miden sobre una curva reconstruida, no sobre la equity
 # marcada a mercado del motor, y conviene avisarlo en su tooltip
 _METRICAS_DE_CURVA = frozenset((
-    'retorno_pct', 'retorno_anual_pct', 'max_dd_pct', 'sharpe', 'r2_equity',
-    'dd_promedio_pct', 'ulcer_index', 'tiempo_recuperacion_medio',
-    'tiempo_recuperacion_max', 'retorno_ajustado_exposicion_pct',
+    'retorno_pct', 'retorno_anual_pct', 'max_dd_pct', 'sharpe',
+    'sharpe_smart', 'sortino', 'calmar', 'omega',
+    'cvar_ret_pct', 'cvar_dd_pct', 'serenity_index',
+    'r2_equity', 'dd_promedio_pct', 'ulcer_index',
+    'tiempo_recuperacion_medio', 'tiempo_recuperacion_max',
+    'retorno_ajustado_exposicion_pct',
 ))
 
 
-def _wfa_filtrado(wfa, resultado, velas_por_anio=None):
+def _wfa_filtrado(wfa, resultado, velas_por_anio=None, velas_por_dia=None):
     """Rehace el Walk-Forward sobre un resultado filtrado por dirección.
 
     No hace falta re-simular: las ventanas del WFA son tramos [idx_ini, idx_fin)
@@ -5735,7 +6036,7 @@ def _wfa_filtrado(wfa, resultado, velas_por_anio=None):
     ventanas = []
     for v in wfa:
         m = calcular_metricas(resultado, v['idx_ini'], v['idx_fin'],
-                              velas_por_anio)
+                              velas_por_anio, velas_por_dia)
         m['idx_ini'], m['idx_fin'] = v['idx_ini'], v['idx_fin']
         ventanas.append(m)
     return ventanas
@@ -5786,7 +6087,7 @@ def render_tabla_metricas(tabla, metricas, claves, tf=None, nota_curva=None):
                 tiempo_str = velas_a_tiempo_legible(v, tf)
                 velas_txt = str(int(v)) if dec == 0 and v is not None else _fmt(v, dec, '')
                 texto = f"{tiempo_str}  —  {velas_txt} velas" if v is not None else '—'
-            elif clave == 'win_rate':
+            elif clave in ('win_rate', 'win_rate_long', 'win_rate_short'):
                 texto = _fmt(v * 100 if v is not None else None, 1, ' %')
             elif dec == 0:
                 texto = str(int(v)) if v is not None else '—'
@@ -5795,9 +6096,16 @@ def render_tabla_metricas(tabla, metricas, claves, tf=None, nota_curva=None):
             it = QTableWidgetItem(texto)
             it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             if clave in ('retorno_pct', 'retorno_anual_pct', 'expectancy_pct',
-                        'sqn', 'r2_equity', 'payoff_ratio',
-                        'retorno_ajustado_exposicion_pct') and v is not None:
+                         'sqn', 'r2_equity', 'payoff_ratio',
+                         'retorno_ajustado_exposicion_pct',
+                         'sharpe_smart', 'serenity_index',
+                         'sortino', 'calmar', 'omega',
+                         'mayor_ganancia', 'ganancia_bruta') and v is not None:
                 it.setForeground(QColor(VERDE if v > 0 else ROJO))
+            elif clave in ('mayor_perdida', 'perdida_bruta') and v is not None:
+                it.setForeground(QColor(ROJO))
+            elif clave in ('cvar_ret_pct', 'cvar_dd_pct') and v is not None:
+                it.setForeground(QColor(ROJO))
             tabla.setItem(fila, col, it)
 
 
@@ -6498,6 +6806,10 @@ class ResultadosWidget(QWidget):
         self._art_fijos_dinamicos = []
         self._art_overlays_extra = []
         self._art_osciladores = []
+        # Line2D densos de overlays/osciladores etiquetados con su serie
+        # completa (_x_all/_y_all) para decimarlos a la ventana visible en
+        # cada frame (ver _etiquetar_decimables / _redibujar_datos)
+        self._art_decimables = []
 
         # paneles apilados (precio + osciladores activos) y sus proporciones
         # de altura — persisten entre redibujados (pan/zoom/centrar trade)
@@ -6548,6 +6860,7 @@ class ResultadosWidget(QWidget):
         # _zoom_target es el xlim destino de la ráfaga y _timer_zoom lo
         # interpola tick a tick (ver _on_scroll / _avanzar_zoom)
         self._zoom_target = None
+        self._zoom_pasos = 0
         self._timer_zoom = QTimer(self)
         self._timer_zoom.setInterval(16)
         self._timer_zoom.timeout.connect(self._avanzar_zoom)
@@ -7088,14 +7401,15 @@ class ResultadosWidget(QWidget):
         cap0 = float(p['config'].get('capital_inicial', 10000.0))
         res = resultado_filtrado(p['resultado'], direccion, cap0)
         n, corte, va = p['n_velas'], p['corte'], p.get('velas_anio')
+        vd = p.get('velas_dia')
         pf = {**p, 'resultado': res,
-              'metricas': {'IS': calcular_metricas(res, 0, corte, va),
-                           'OOS': calcular_metricas(res, corte, n, va),
-                           'Total': calcular_metricas(res, 0, n, va)},
+              'metricas': {'IS': calcular_metricas(res, 0, corte, va, vd),
+                           'OOS': calcular_metricas(res, corte, n, va, vd),
+                           'Total': calcular_metricas(res, 0, n, va, vd)},
               'montecarlo': (montecarlo(res['trades'], cap0, n_sims=1000,
                                         semilla=1234)
                              if res['n_trades'] else None),
-              'wfa': _wfa_filtrado(p.get('wfa'), res, va)}
+              'wfa': _wfa_filtrado(p.get('wfa'), res, va, vd)}
         self._cache_dir[direccion] = pf
         return pf
 
@@ -7252,8 +7566,8 @@ class ResultadosWidget(QWidget):
         la estrategia sin recordar con qué activo/temporalidad se corrió)."""
         if self._payload is None:
             return
-        nombre, ok = QInputDialog.getText(self, "Guardar como favorito",
-                                          "Nombre del favorito:")
+        nombre, ok = pedir_texto(self, "Guardar como favorito",
+                                       "Nombre del favorito:")
         if not ok or not nombre.strip():
             return
         nombre = nombre.strip()
@@ -7293,7 +7607,7 @@ class ResultadosWidget(QWidget):
             return
         carpeta = dlg.resultado['carpeta']
         self.btn_exportar.setText("✓ Código exportado")
-        QMessageBox.information(
+        informacion(
             self, "Código exportado",
             f"{len(dlg.resultado['archivos'])} archivos escritos en:\n"
             f"{carpeta}\n\n"
@@ -7394,6 +7708,35 @@ class ResultadosWidget(QWidget):
                           'etiqueta': f'SAR({af_i:g},{af_p:g},{af_m:g})',
                           'color': COLOR_SAR, 'grupo': 'ind',
                           'ayuda': 'Parabolic SAR: puntos de stop and reverse.'})
+        for per, mult in sorted(ind['supertrends']):
+            capas.append({'clave': f'st:{per}:{mult:g}',
+                          'etiqueta': f'Supertrend({per},×{mult:g})',
+                          'color': COLOR_SUPERTREND, 'grupo': 'ind',
+                          'ayuda': f'Envolvente ATR de {per} periodos con '
+                                   f'multiplicador {mult:g}: cambia de lado en '
+                                   'los giros de tendencia.'})
+        for tenkan, kijun, senkou in sorted(ind['ichimokus']):
+            capas.append({'clave': f'ichi:{tenkan}:{kijun}:{senkou}',
+                          'etiqueta': f'Ichimoku({tenkan},{kijun},{senkou})',
+                          'color': COLOR_ICHIMOKU_TENKAN, 'grupo': 'ind',
+                          'ayuda': 'Tenkan, Kijun y Senkou A/B alineadas (sin '
+                                   'el desplazamiento +26 del gráfico, que '
+                                   'sería lookahead).'})
+        for per, mult in sorted(ind['keltners']):
+            capas.append({'clave': f'kc:{per}:{mult:g}',
+                          'etiqueta': f'Keltner({per},×{mult:g})',
+                          'color': COLOR_KELTNER, 'grupo': 'ind',
+                          'ayuda': f'Bandas de Keltner: EMA ± {mult:g}×ATR de '
+                                   f'{per} periodos.'})
+        for idx, (anclaje, k, modo) in enumerate(sorted(ind['vwaps'])):
+            color_v = _PALETA_VWAP[idx % len(_PALETA_VWAP)]
+            unidad = 'σ' if modo == 'sd' else '%'
+            capas.append({'clave': f'vwap:{anclaje}:{k:g}:{modo}',
+                          'etiqueta': f'VWAP({_MAPA_ANCLAJE_INV.get(anclaje, anclaje)}, {k:g}{unidad})',
+                          'color': color_v, 'grupo': 'ind',
+                          'ayuda': f'VWAP del anclaje «{anclaje}» con banda '
+                                   f'{k:g}{unidad} (gris, relleno del canal). '
+                                   'Se reinicia en cada borde del anclaje.'})
         if ind['patrones']:
             capas.append({'clave': 'patrones', 'etiqueta': 'Patrones de velas',
                           'color': COLOR_PATRONES, 'grupo': 'ind',
@@ -7640,6 +7983,39 @@ class ResultadosWidget(QWidget):
             pad = (y_hi - y_lo) * 0.05 or 1.0
             ax.set_ylim(y_lo - pad, y_hi + pad)
         self._actualizar_ultimo_precio(ax)
+        # overlays/osciladores densos: cortarlos a la ventana visible como a
+        # las velas. Antes se redibujaban a resolución completa en CADA frame
+        # de blit (una media con 100k puntos costaba ~16 ms por frame), que
+        # con la animación de la rueda era el lag/parpadeo del scroll.
+        for art in self._art_decimables:
+            xs, ys = _decimar_linea(art._x_all, art._y_all, x0, x1,
+                                    max_puntos=self._max_velas_visibles())
+            art.set_data(xs, ys)
+
+    def _etiquetar_decimables(self):
+        """Tras crear todos los overlays/osciladores (final de
+        _dibujar_principal), etiqueta los Line2D densos (medias, Bollinger,
+        KAMA, Supertrend, Ichimoku, Keltner, Donchian y las líneas de los
+        paneles de oscilador) con su serie completa y los apunta en
+        _art_decimables para que _redibujar_datos los recorte en cada frame.
+
+        Se excluyen los pasos (steps-post: squeeze TTM y tracks de
+        stop/entrada, cuyo submuestreo deformaría el patrón) y los artistas
+        ralos (zigzag, tramos de Fibonacci, órdenes, axhline, leyendas), que
+        no son el cuello de botella del blit."""
+        from matplotlib.lines import Line2D
+        self._art_decimables = []
+        for art in self._art_overlays_extra + self._art_osciladores:
+            if not isinstance(art, Line2D):
+                continue
+            if art.get_drawstyle().startswith('steps'):
+                continue
+            xd = art.get_xdata()
+            if len(xd) < 3000:
+                continue
+            art._x_all = np.asarray(xd, dtype=float)
+            art._y_all = np.asarray(art.get_ydata(), dtype=float)
+            self._art_decimables.append(art)
 
     def _actualizar_ultimo_precio(self, ax):
         """Reubica el badge del último precio dentro del rango visible del eje
@@ -8068,6 +8444,7 @@ class ResultadosWidget(QWidget):
         factor = 0.85 if subir else 1.0 / 0.85
         self._zoom_target = (ancla + (lo - ancla) * factor,
                              ancla + (hi - ancla) * factor)
+        self._zoom_pasos = 0
         if not self._timer_zoom.isActive():
             self._timer_zoom.start()
         self._solicitar_frame_blit(ax)
@@ -8075,20 +8452,28 @@ class ResultadosWidget(QWidget):
 
     def _avanzar_zoom(self):
         """Un paso de la animación de zoom: acerca el xlim actual al objetivo
-        con easing exponencial; al quedar suficientemente cerca, ajusta el
-        objetivo exacto y se detiene."""
+        con easing exponencial; al quedar suficientemente cerca, o tras
+        MAX_PASOS_ZOOM pasos, ajusta el objetivo exacto y se detiene.
+
+        El tope de pasos es lo que hace ágil la rueda: sin él, cada notch
+        animaba ~20 frames (~600 ms con los frames de blit) y la ráfaga
+        saturaba el hilo de la GUI — el lag y el parpadeo al hacer scroll.
+        Con el tope el easing se resuelve en ~6 frames y la rueda responde."""
         ax = getattr(self, '_ax_principal', None)
         if ax is None or self._zoom_target is None:
             self._timer_zoom.stop()
             return
+        self._zoom_pasos += 1
         lo, hi = ax.get_xlim()
         t_lo, t_hi = self._zoom_target
         d_lo, d_hi = t_lo - lo, t_hi - hi
         if (t_hi - t_lo) <= 0:
             self._timer_zoom.stop()
             return
-        if max(abs(d_lo), abs(d_hi)) < (t_hi - t_lo) * 1e-4:
-            # prácticamente en el objetivo: ajustar exacto y terminar
+        if (self._zoom_pasos >= MAX_PASOS_ZOOM
+                or max(abs(d_lo), abs(d_hi)) < (t_hi - t_lo) * 1e-4):
+            # prácticamente en el objetivo (o pasos agotados): ajustar exacto
+            # y terminar
             ax.set_xlim(t_lo, t_hi)
             self._timer_zoom.stop()
         else:
@@ -8304,17 +8689,26 @@ class ResultadosWidget(QWidget):
         """Al empezar un arrastre/scroll: cachea un bitmap de fondo SIN la
         capa dinámica (para poder repintarla encima en cada frame sin dejar
         "fantasmas" de su posición anterior). copy_from_bbox necesita un
-        buffer ya renderizado, por eso el draw() de aquí es síncrono, no
+        buffer ya renderizado, por eso el render de aquí es síncrono, no
         draw_idle().
 
-        Ese draw() deja el lienzo con la capa dinámica oculta (velas, trades,
-        overlays...) y Qt puede llegar a pintar ese frame "despojado" en
-        pantalla antes de que llegue el primer evento de movimiento — se veía
-        como un parpadeo al simplemente CLICAR sobre el gráfico, sin llegar
-        a arrastrar. Por eso, justo después de capturar el fondo, se
-        recompone y pinta ya el frame completo (como haría el primer
-        _pintar_frame_blit) para que la pantalla nunca llegue a mostrar el
-        estado intermedio."""
+        El render se hace directo al buffer del renderer (fig.draw + clear)
+        en vez de canvas.draw(): este último además de rasterizar llama a
+        update(), encolando un repintado de Qt del frame "despojado" (sin
+        velas, trades ni overlays) que puede llegar a pantalla antes de que
+        el blit de _pintar_frame_blit recomponga el frame completo — es el
+        parpadeo que se veía al hacer scroll/clic sobre el gráfico. Al no
+        pedirle a Qt que repinte, la pantalla pasa directamente del frame
+        anterior al frame completo de blit, sin estados intermedios.
+
+        El frame "despojado" se rasteriza en un RendererAgg APARTE (offscreen),
+        nunca en el buffer compartido del canvas: así, cualquier repintado de
+        Qt que caiga a mitad de captura (p. ej. un update() asíncrono de un
+        frame anterior, o un repintado del sistema en ventana real) lee del
+        buffer del canvas el ÚLTIMO frame completo, nunca el despojado. Ese
+        destello —el gráfico "mal colocado o extendido" un microsegundo al
+        hacer scroll rápido— era exactamente el frame sin velas llegando a
+        pantalla."""
         ax = getattr(self, '_ax_principal', None)
         if ax is None:
             return
@@ -8329,14 +8723,18 @@ class ResultadosWidget(QWidget):
             dinamicos.append(eje_panel)
         for art in dinamicos:
             art.set_visible(False)
-        # este draw() es el "despojado": que _capturar_fondo_hover no se lo
-        # quede como fondo de la cruceta
+        # render "despojado" en un renderer aparte: que _capturar_fondo_hover
+        # no se lo quede como fondo de la cruceta y, sobre todo, que el buffer
+        # compartido del canvas nunca llegue a contener el frame sin velas
         self._capturando_fondo_drag = True
         try:
-            self.canvas.draw()
+            from matplotlib.backends.backend_agg import RendererAgg
+            pw, ph = self.canvas.get_width_height(physical=True)
+            r_off = RendererAgg(pw, ph, self.fig.dpi)
+            self.fig.draw(r_off)
         finally:
             self._capturando_fondo_drag = False
-        self._blit_bg = self.canvas.copy_from_bbox(self.fig.bbox)
+        self._blit_bg = r_off.copy_from_bbox(self.fig.bbox)
         for art in dinamicos:
             art.set_visible(True)
         self._pintar_frame_blit(ax)
@@ -8379,18 +8777,24 @@ class ResultadosWidget(QWidget):
             self._pintar_frame_blit(ax)
 
     def _finalizar_blit(self):
-        """Al soltar el ratón / tras el debounce de scroll: descarta el
-        fondo cacheado y deja todo consistente con un draw_idle() completo
-        (una sola vez, no por frame)."""
+        """Al soltar el ratón / tras el debounce de scroll: descarta la sesión
+        de blit dejando en pantalla el frame final SIN re-rasterizar toda la
+        figura.
+
+        El cierre solía terminar con un draw_idle() completo: cada debounce de
+        scroll (y cada soltar el ratón) re-renderizaba TODO el gráfico (~70 ms
+        de bloqueo por rasterizado) — era el parpadeo al hacer scroll. Como el
+        último frame de blit ya es correcto, se cierra pintándolo por blitting
+        (aplicando antes el redibujado pendiente, si lo hay) y solo se
+        refresca el fondo de la cruceta para que el hover siga consistente."""
         # un frame pendiente pintaría por blitting con el fondo ya descartado
         self._timer_frame.stop()
         self._timer_zoom.stop()
         ax = self._ax_frame_pendiente
         self._ax_frame_pendiente = None
-        self._blit_bg = None
         self._sesion_activa = False
         # si el zoom animado quedó a medias, ajustar el objetivo exacto antes
-        # del draw final (set_xlim dispara _on_xlim_changed, que ya redibuja)
+        # del frame final (set_xlim dispara _on_xlim_changed, que ya redibuja)
         if self._zoom_target is not None:
             if ax is None:
                 ax = getattr(self, '_ax_principal', None)
@@ -8398,16 +8802,27 @@ class ResultadosWidget(QWidget):
                 ax.set_xlim(*self._zoom_target)
             self._zoom_target = None
         # si el último redibujado quedó pendiente (p. ej. soltar el ratón
-        # antes de que dispare el timer de frames), ejecutarlo ANTES del draw
-        # final: sin esto, el draw_idle pintaría las velas del xlim ANTERIOR
-        # (la misma serie repetida en cualquier ventana de zoom)
+        # antes de que dispare el timer de frames), ejecutarlo ANTES de pintar:
+        # sin esto el frame final llevaría las velas del xlim ANTERIOR (la
+        # misma serie repetida en cualquier ventana de zoom)
         if self._datos_sucios:
+            self._datos_sucios = False
             if ax is None:
                 ax = getattr(self, '_ax_principal', None)
             if ax is not None:
                 self._redibujar_datos(ax)
-        self._datos_sucios = False
-        self.canvas.draw_idle()
+        # pintar el estado final: por blitting si queda fondo válido (la capa
+        # dinámica ya está al día, el fondo estático no ha cambiado), si no con
+        # un draw_idle — el único repintado completo de cierre
+        if ax is not None:
+            self._pintar_frame_blit(ax)
+        else:
+            self.canvas.draw_idle()
+        self._blit_bg = None
+        # refrescar el fondo de la cruceta desde el buffer recién pintado: sin
+        # el draw_idle de cierre ya no hay draw_event que lo recapture
+        self._bg_hover = self.canvas.copy_from_bbox(self.fig.bbox)
+        self._hover_pintado = False
 
     def _on_resize_canvas(self, event):
         """El bitmap cacheado tiene el tamaño de figura de cuando se
@@ -8536,7 +8951,16 @@ class ResultadosWidget(QWidget):
             # renderer (compartido a nivel Figure), así que basta con
             # invocarlo desde el Axes dueño del artista
             (art.axes or ax).draw_artist(art)
-        self.canvas.blit(self.fig.bbox)
+        # Presentar el frame de forma ASÍNCRONA (update() en vez de blit():
+        # blit() llama a repaint(), un repintado síncrono que en ráfagas de
+        # scroll/arrastre se encadenaba decenas de veces por segundo con su
+        # eraseRect + drawImage fuera del ciclo de composición — el parpadeo
+        # al hacer scroll rápido. update() lo pinta en el ciclo normal de Qt,
+        # coalesciendo los frames que lleguen antes de repintar (siempre el
+        # último, que es el que se quiere ver). El buffer ya tiene el frame
+        # completo (restore_region + draw_artist), así que el repintado
+        # asíncrono lo muestra tal cual.
+        self.canvas.update()
 
     def _dibujar_principal(self, xlim=None, ylim=None):
         p = self._payload
@@ -8972,6 +9396,55 @@ class ResultadosWidget(QWidget):
                                         af_i, af_p, af_m)
             sc = ax.scatter(x_idx, sar_val, s=3, color=COLOR_SAR, alpha=0.75)
             self._art_overlays_extra.append(sc)
+        for per, mult in sorted(ind['supertrends']):
+            if not self._capa_activa(f'st:{per}:{mult:g}'):
+                continue
+            st_val, _tend_st = _supertrend_serie(
+                p.get('high', y), p.get('low', y), y, per, mult)
+            line, = ax.plot(x_idx, st_val, color=COLOR_SUPERTREND,
+                            linewidth=1.1, alpha=0.85)
+            self._art_overlays_extra.append(line)
+        for tenkan, kijun, senkou in sorted(ind['ichimokus']):
+            if not self._capa_activa(f'ichi:{tenkan}:{kijun}:{senkou}'):
+                continue
+            t_v, k_v, sa, sb, _ch = _ichimoku_series(
+                p.get('high', y), p.get('low', y), y, tenkan, kijun, senkou)
+            for serie_v, color in ((t_v, COLOR_ICHIMOKU_TENKAN),
+                                   (k_v, COLOR_ICHIMOKU_KIJUN),
+                                   (sa, COLOR_ICHIMOKU_SENKOU),
+                                   (sb, COLOR_ICHIMOKU_SENKOU)):
+                line, = ax.plot(x_idx, serie_v, color=color, linewidth=0.8,
+                                alpha=0.8)
+                self._art_overlays_extra.append(line)
+        for per, mult in sorted(ind['keltners']):
+            if not self._capa_activa(f'kc:{per}:{mult:g}'):
+                continue
+            media_kc, sup_kc, inf_kc = _keltner_series(
+                y, p.get('high', y), p.get('low', y), per, mult)
+            for serie_v in (media_kc, sup_kc, inf_kc):
+                line, = ax.plot(x_idx, serie_v, color=COLOR_KELTNER,
+                                linewidth=0.8, alpha=0.75)
+                self._art_overlays_extra.append(line)
+        vol_v = p.get('volume')
+        if vol_v is not None:
+            df_v = pd.DataFrame({'timestamp': ts, 'high': p.get('high', y),
+                                 'low': p.get('low', y), 'close': y,
+                                 'volume': vol_v})
+            for anclaje, k, modo in sorted(ind['vwaps']):
+                clave = f'vwap:{anclaje}:{k:g}:{modo}'
+                if not self._capa_activa(clave):
+                    continue
+                color_v = self._color_capa(clave)
+                r = _vwap_series(df_v, anclaje, k, modo)
+                l_media, = ax.plot(x_idx, r['media'], color=color_v,
+                                   linewidth=1.2, alpha=0.9)
+                l_sup, = ax.plot(x_idx, r['sup'], color=color_v,
+                                 linewidth=0.5, alpha=0.45)
+                l_inf, = ax.plot(x_idx, r['inf'], color=color_v,
+                                 linewidth=0.5, alpha=0.45)
+                fill = ax.fill_between(x_idx, r['inf'], r['sup'],
+                                       color=color_v, alpha=0.12)
+                self._art_overlays_extra += [l_media, l_sup, l_inf, fill]
         if patrones_set and self._capa_activa('patrones'):
             o_all, h_all, l_all = (p.get('open', y), p.get('high', y),
                                    p.get('low', y))
@@ -9067,6 +9540,7 @@ class ResultadosWidget(QWidget):
         ax.legend(loc='lower right', fontsize=7, facecolor=FIG_BG,
                   edgecolor=GRID_C, labelcolor=AX_FG, framealpha=0.6)
 
+        self._etiquetar_decimables()
         ax.callbacks.connect('xlim_changed', self._on_xlim_changed)
         self._ax_principal = ax
         self.canvas.draw_idle()
@@ -9246,6 +9720,17 @@ class ResultadosWidget(QWidget):
         sars = set()
         donchianes = set()
         zigzags = set()
+        macds = set()
+        adxs = set()
+        supertrends = set()
+        aroones = set()
+        cmos = set()
+        trixes = set()
+        stochrsis = set()
+        ichimokus = set()
+        keltners = set()
+        ttms = set()
+        vwaps = set()
         # (periodo, metodo) del filtro de régimen de cada setup
         ers = set()
         hursts = set()
@@ -9289,14 +9774,48 @@ class ResultadosWidget(QWidget):
                     donchianes.add(per_salida)
             elif plantilla == 'Patrones de velas':
                 patrones_set.update(p.get('patrones', []))
+            elif plantilla == 'Supertrend':
+                supertrends.add((int(p.get('periodo', 10)),
+                                 float(p.get('multiplicador', 3.0))))
+            elif plantilla == 'MACD':
+                macds.add((int(p.get('rapido', 12)), int(p.get('lento', 26)),
+                           int(p.get('senal', 9))))
+            elif plantilla == 'ADX (fuerza de tendencia)':
+                adxs.add((int(p.get('periodo', 14)),
+                          float(p.get('umbral_fuerza', 20.0))))
+            elif plantilla == 'Aroon':
+                aroones.add(int(p.get('periodo', 25)))
+            elif plantilla == 'CMO':
+                cmos.add(int(p.get('periodo', 14)))
+            elif plantilla == 'TRIX':
+                trixes.add(int(p.get('periodo', 15)))
+            elif plantilla == 'StochRSI':
+                stochrsis.add(int(p.get('periodo', 14)))
+            elif plantilla == 'Ichimoku':
+                ichimokus.add((int(p.get('tenkan', 9)), int(p.get('kijun', 26)),
+                               int(p.get('senkou', 52))))
+            elif plantilla == 'Keltner':
+                keltners.add((int(p.get('periodo', 20)),
+                              float(p.get('mult', 2.0))))
+            elif plantilla == 'TTM Squeeze':
+                ttms.add((int(p.get('periodo', 20)),
+                          float(p.get('mult_bb', 2.0)),
+                          float(p.get('mult_kc', 1.5))))
+            elif plantilla == 'VWAP':
+                vwaps.add((p.get('anclaje', 'W'), float(p.get('k', 2.0)),
+                           p.get('modo', 'sd')))
             elif plantilla == 'Custom (reglas)':
                 for clave in ('entradas_long', 'entradas_short',
                               'salidas_long', 'salidas_short'):
                     for grupo in p.get('reglas', {}).get(clave, []):
                         for cond in grupo.get('condiciones', []):
                             for lado in (cond.get('izq', {}), cond.get('der', {})):
-                                _acumular_indicador_spec(lado, mas, rsis, atrs, bbs,
-                                                         donchianes, zigzags)
+                                _acumular_indicador_spec(
+                                    lado, mas, rsis, atrs, bbs,
+                                    donchianes, zigzags, macds, adxs,
+                                    supertrends, aroones, cmos, trixes,
+                                    stochrsis, ichimokus, keltners, ttms,
+                                    vwaps)
 
             # filtros extra del setup (condiciones_entrada/condiciones_salida) —
             # aplicables a CUALQUIER plantilla, no solo Custom (reglas); por
@@ -9315,8 +9834,11 @@ class ResultadosWidget(QWidget):
             for clave in ('condiciones_entrada', 'condiciones_salida'):
                 for cond in filtros.get(clave, []):
                     for lado in (cond.get('izq', {}), cond.get('der', {})):
-                        _acumular_indicador_spec(lado, mas, rsis, atrs, bbs,
-                                                 donchianes, zigzags)
+                        _acumular_indicador_spec(
+                            lado, mas, rsis, atrs, bbs,
+                            donchianes, zigzags, macds, adxs,
+                            supertrends, aroones, cmos, trixes, stochrsis,
+                            ichimokus, keltners, ttms, vwaps)
 
             # el régimen NO viene de la plantilla sino del filtro del setup: se
             # dibuja para poder comprobar que las entradas caen donde el filtro
@@ -9334,6 +9856,10 @@ class ResultadosWidget(QWidget):
             'ccis': ccis, 'kamas': kamas, 'sars': sars,
             'donchianes': donchianes, 'zigzags': zigzags, 'fibs': fibs,
             'ers': ers, 'hursts': hursts,
+            'macds': macds, 'adxs': adxs, 'supertrends': supertrends,
+            'aroones': aroones, 'cmos': cmos, 'trixes': trixes,
+            'stochrsis': stochrsis, 'ichimokus': ichimokus,
+            'keltners': keltners, 'ttms': ttms, 'vwaps': vwaps,
         }
 
     def _dibujar_panel_oscilador(self, ax, kind, datos, x, c, h, l):
@@ -9412,6 +9938,121 @@ class ResultadosWidget(QWidget):
                 h_sv = ax.axhline(sobreventa, color=VERDE, linewidth=0.5, linestyle='--', alpha=0.4)
                 artes += [line, h_sc, h_0, h_sv]
                 niveles += [(sobrecompra, ROJO), (0, GRIS), (sobreventa, VERDE)]
+        elif kind == 'macd':
+            for i, (rapido, lento, senal) in enumerate(sorted(datos)):
+                linea, senal_l, hist = _macd_series(c, rapido, lento, senal)
+                l_linea, = ax.plot(x, linea, color='#4fc3f7', linewidth=1.0,
+                                   alpha=0.9, label=f'MACD({rapido},{lento},{senal})')
+                l_senal, = ax.plot(x, senal_l, color='#f1c40f', linewidth=0.9,
+                                   alpha=0.85, label='Señal')
+                colores = np.where(np.isfinite(hist) & (hist >= 0), VERDE, ROJO)
+                barras = ax.bar(x, hist, width=0.8, color=colores, alpha=0.4)
+                h_0 = ax.axhline(0, color=GRIS, linewidth=0.5, linestyle='--', alpha=0.3)
+                artes += [l_linea, l_senal, barras, h_0]
+                niveles += [(0, GRIS)]
+        elif kind == 'adx':
+            for i, (per, umbral) in enumerate(sorted(datos)):
+                adx, pdi, mdi = _adx_series(h, l, c, per)
+                l_adx, = ax.plot(x, adx, color='#7986cb', linewidth=1.0, alpha=0.9,
+                                 label=f'ADX({per})')
+                l_pdi, = ax.plot(x, pdi, color='#2ecc71', linewidth=0.8, alpha=0.8,
+                                 label='+DI')
+                l_mdi, = ax.plot(x, mdi, color='#e74c3c', linewidth=0.8, alpha=0.8,
+                                 label='−DI')
+                h_umb = ax.axhline(umbral, color=AMBAR, linewidth=0.5,
+                                   linestyle='--', alpha=0.5)
+                artes += [l_adx, l_pdi, l_mdi, h_umb]
+                niveles += [(umbral, AMBAR)]
+            ax.set_ylim(0, 100)
+        elif kind == 'aroon':
+            pal = ['#1abc9c', '#16a085']
+            for i, per in enumerate(sorted(datos)):
+                up, dn = _aroon_series(h, l, per)
+                l_up, = ax.plot(x, up, color=pal[0], linewidth=1.0, alpha=0.9,
+                                label=f'Aroon Up({per})')
+                l_dn, = ax.plot(x, dn, color=pal[1], linewidth=0.9, alpha=0.8,
+                                label=f'Aroon Down({per})')
+                h_70 = ax.axhline(70, color=ROJO, linewidth=0.5, linestyle='--', alpha=0.4)
+                h_30 = ax.axhline(30, color=VERDE, linewidth=0.5, linestyle='--', alpha=0.4)
+                artes += [l_up, l_dn, h_70, h_30]
+                niveles += [(70, ROJO), (30, VERDE)]
+            ax.set_ylim(0, 100)
+        elif kind == 'cmo':
+            pal = ['#ffa726', '#ffb74d']
+            for i, per in enumerate(sorted(datos)):
+                val = _cmo_serie(c, per)
+                line, = ax.plot(x, val, color=pal[i % len(pal)], linewidth=1.0,
+                                alpha=0.85, label=f'CMO({per})')
+                h_0 = ax.axhline(0, color=GRIS, linewidth=0.5, linestyle='--', alpha=0.3)
+                artes += [line, h_0]
+                niveles += [(0, GRIS)]
+            ax.set_ylim(-100, 100)
+        elif kind == 'trix':
+            pal = ['#ff7043', '#ff8a65']
+            for i, per in enumerate(sorted(datos)):
+                val = _trix_serie(c, per)
+                line, = ax.plot(x, val, color=pal[i % len(pal)], linewidth=1.0,
+                                alpha=0.85, label=f'TRIX({per})')
+                h_0 = ax.axhline(0, color=GRIS, linewidth=0.5, linestyle='--', alpha=0.3)
+                artes += [line, h_0]
+                niveles += [(0, GRIS)]
+        elif kind == 'stochrsi':
+            pal = ['#fd79a8', '#f8bbd0']
+            for i, per in enumerate(sorted(datos)):
+                k, d = _stochrsi_series(c, per)
+                l_k, = ax.plot(x, k, color=pal[0], linewidth=1.0, alpha=0.9,
+                               label=f'StochRSI %K({per})')
+                l_d, = ax.plot(x, d, color=pal[1], linewidth=0.9, alpha=0.8,
+                               label='%D')
+                h_80 = ax.axhline(0.8, color=ROJO, linewidth=0.5, linestyle='--', alpha=0.4)
+                h_20 = ax.axhline(0.2, color=VERDE, linewidth=0.5, linestyle='--', alpha=0.4)
+                artes += [l_k, l_d, h_80, h_20]
+                niveles += [(0.8, ROJO), (0.2, VERDE)]
+            ax.set_ylim(0, 1)
+        elif kind == 'ttm':
+            for i, (per, mult_bb, mult_kc) in enumerate(sorted(datos)):
+                sq, mom = _ttm_squeeze_series(c, h, l, per, mult_bb, mult_kc)
+                sq_f = np.where(np.isfinite(mom), np.asarray(sq, dtype=float), np.nan)
+                # squeeze como pasos de fondo (1 = comprimido)
+                step = ax.step(x, sq_f, where='post', color=GRIS, linewidth=1.0,
+                               alpha=0.5, label=f'Squeeze({per})')
+                colores = np.where(np.isfinite(mom) & (mom >= 0), VERDE, ROJO)
+                barras = ax.bar(x, mom, width=0.8, color=colores, alpha=0.5)
+                h_0 = ax.axhline(0, color=GRIS, linewidth=0.5, linestyle='--', alpha=0.3)
+                artes += [step, barras, h_0]
+                niveles += [(0, GRIS)]
+        elif kind == 'vwap':
+            # distancia del cierre al VWAP en desviaciones: (close−media)/σ
+            payload = getattr(self, '_payload', None)
+            vol_v = (payload or {}).get('volume')
+            ts_v = (pd.DatetimeIndex(payload['timestamps'])
+                    if payload and payload.get('timestamps') is not None
+                    else None)
+            if ts_v is None or vol_v is None:
+                return artes
+            df_v = pd.DataFrame({'timestamp': ts_v, 'high': h, 'low': l,
+                                 'close': c, 'volume': vol_v})
+            for i, (anclaje, k, modo) in enumerate(sorted(datos)):
+                r = _vwap_series(df_v, anclaje, k, modo)
+                sd_pos = np.where(r['sd'] > 0, r['sd'], np.nan)
+                dist = (c - r['media']) / sd_pos
+                etiqueta = (f"VWAP({_MAPA_ANCLAJE_INV.get(anclaje, anclaje)}, "
+                            f"{k:g}{'σ' if modo == 'sd' else '%'})")
+                color_v = _PALETA_VWAP[i % len(_PALETA_VWAP)]
+                line, = ax.plot(x, dist, color=color_v, linewidth=1.0,
+                                alpha=0.9, label=etiqueta)
+                artes.append(line)
+            for ref in (1, 2, 3):
+                h_pos = ax.axhline(ref, color=ROJO, linewidth=0.5,
+                                   linestyle='--', alpha=0.3)
+                h_neg = ax.axhline(-ref, color=VERDE, linewidth=0.5,
+                                   linestyle='--', alpha=0.3)
+                artes += [h_pos, h_neg]
+                niveles += [(ref, ROJO), (-ref, VERDE)]
+            h_0 = ax.axhline(0, color=GRIS, linewidth=0.5, linestyle='--', alpha=0.4)
+            artes.append(h_0)
+            niveles += [(0, GRIS)]
+            ax.set_ylim(-4, 4)
         elif kind in ('er', 'hurst'):
             artes_reg, niveles_reg = self._dibujar_panel_regimen(ax, kind, datos, x, c)
             artes += artes_reg
@@ -9784,6 +10425,10 @@ _COLS_METRICAS_COMBO = [
     ('n_trades', 'Trades', 0, ''),
     ('retorno_pct', 'Retorno', 2, ' %'),
     ('sharpe', 'Sharpe', 2, ''),
+    ('sharpe_smart', 'Sharpe smart', 2, ''),
+    ('sortino', 'Sortino', 2, ''),
+    ('calmar', 'Calmar', 2, ''),
+    ('serenity_index', 'Serenity', 2, ''),
     ('profit_factor', 'Profit factor', 2, ''),
     ('max_dd_pct', 'Max DD', 2, ' %'),
     ('win_rate', 'Win rate', 1, ' %'),
@@ -10065,7 +10710,9 @@ class ComparativaWidget(QWidget):
                 it.setData(_ROL_VALOR, v if v is not None else float('-inf'))
                 it.setData(_ROL_INDICE, fila)
                 it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                if clave in ('retorno_pct', 'sharpe', 'sqn') and v is not None:
+                if clave in ('retorno_pct', 'sharpe', 'sqn',
+                             'sharpe_smart', 'serenity_index',
+                             'sortino', 'calmar', 'omega') and v is not None:
                     it.setForeground(QColor(VERDE if v > 0 else ROJO))
                 self.tabla.setItem(fila, col, it)
                 col += 1
@@ -10727,3 +11374,5 @@ class TabBacktest(QWidget):
     def _agregar_setups(self, setups):
         self.constructor.agregar_setups(setups)
         self.tabs.setCurrentWidget(self.constructor)
+
+

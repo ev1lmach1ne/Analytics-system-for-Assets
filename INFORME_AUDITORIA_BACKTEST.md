@@ -41,17 +41,17 @@ y ampliación de `tests/test_backtest.py` con 4 tests nuevos (short PnL exacto,
 comisión en corto, direcciones de slippage largo/corto, riesgo realizado vs
 nominal). Suite completa: **180+ tests, todos en verde**.
 
-## 2. Indicadores — verificados, con 3 desviaciones documentadas (sin corregir)
+## 2. Indicadores — verificados, con 3 desviaciones corregidas el 2026-08-17
 
 Se agregó `tests/test_indicadores.py` con 9 tests numéricos directos (antes
 NO existía ningún test que verificara los valores de `sma`/`ema`/`rsi`/`atr`/
 `bollinger` contra un cálculo independiente — solo se probaban indirectamente
-a través de señales generadas). Los indicadores calculan correctamente sus
-fórmulas, **excepto** por 3 desviaciones respecto a la definición "de libro"
-que ya estaban presentes en el código y que, por decisión explícita, **no se
-modifican** en esta tarea (cambiarlas alteraría las señales de estrategias
-existentes). Quedan fijadas por test para que cualquier cambio futuro sea
-intencional:
+a través de señales generadas). La auditoría encontró 3 desviaciones respecto
+a la definición "de libro" que en su momento se dejaron fijadas por test sin
+corregir (cambiarlas altera las señales de estrategias existentes). Esas tres
+desviaciones se **corrigieron el 2026-08-17** (ver la actualización al final
+del documento). La tabla y el impacto siguientes documentan el estado que
+tenían antes de la corrección:
 
 | Indicador | Desviación encontrada | Estándar de referencia | Archivo |
 |---|---|---|---|
@@ -59,15 +59,17 @@ intencional:
 | ATR | Promedio **simple (SMA)** del True Range | Suavizado de **Wilder** (usado por TradingView/MT5/la mayoría de plataformas) | `core/strategies.py:58-62` |
 | Bollinger | Desviación estándar **muestral** (`ddof=1`, default de pandas) | Desviación **poblacional** (`ddof=0`) | `core/strategies.py:65-69` |
 
-Impacto práctico: los valores de ATR y Bollinger difieren (ligeramente, en el
+Impacto práctico: los valores de ATR y Bollinger diferían (ligeramente, en el
 caso de Bollinger; más notablemente en ATR según la volatilidad reciente) de
 lo que mostraría un gráfico de TradingView/MT5 con los mismos parámetros. El
-RSI=50 en vez de 100 solo importa en rachas de subida pura sin ninguna vela
+RSI=50 en vez de 100 solo importaba en rachas de subida pura sin ninguna vela
 roja dentro de la ventana — un caso de borde poco frecuente pero real.
 
-Si en algún momento quieres alinear estos indicadores con el estándar de
-mercado, es un cambio localizado (3 funciones en `core/strategies.py`), pero
-hay que asumir que las estrategias ya guardadas cambiarán de señales.
+> **Corregido el 2026-08-17**: las 3 desviaciones se alinearon con el estándar
+> (RSI→100 sin pérdidas, ATR→suavizado de Wilder, Bollinger→ddof=0), tanto en
+> el motor como en los runtimes Pine/MT5 del código generado para mantener la
+> fidelidad motor↔código generado. Detalle y archivos en la actualización al
+> final del documento.
 
 ## 3. Anualización — CORREGIDA por clase de activo
 
@@ -139,7 +141,7 @@ corta (STOCK 1d habría dado ~68/año en vez de 252).
 | Slippage (dirección largo/corto) | ✅ Correcto, verificado con tests de precio exacto |
 | Tamaño de posición / riesgo | ✅ Correcto (con el matiz de fricciones documentado) |
 | Ejecución sin lookahead | ✅ Correcto (open de la vela siguiente) |
-| Indicadores (SMA/EMA/RSI/ATR/Bollinger/cruces) | ✅ Verificados con tests numéricos; 3 desviaciones documentadas y fijadas, sin corregir por decisión explícita |
+| Indicadores (SMA/EMA/RSI/ATR/Bollinger/cruces) | ✅ Verificados con tests numéricos; 3 desviaciones corregidas el 2026-08-17 (RSI→100, ATR Wilder, Bollinger ddof=0) |
 | Anualización Sharpe/CAGR | ✅ Corregida — ahora por clase de activo, con fallback seguro |
 
 Archivos nuevos/modificados: `tests/test_indicadores.py` (nuevo),
@@ -196,3 +198,53 @@ Tests nuevos en `tests/test_stop_atr_modo.py` (causalidad, ambos modos,
 largos/cortos, recorte de presupuesto, gap al open sin ejecutar el tramo,
 stop dinámico que respeta BE) y ajuste del escenario de pirámide en
 `tests/test_backtest.py`. Suite completa: 853 tests en verde.
+
+---
+
+## Actualización posterior — indicadores alineados con el estándar (RSI / ATR / Bollinger)
+
+Fecha: 2026-08-17. Se corrigen las 3 desviaciones documentadas en la §2,
+tanto en el motor como en los runtimes del código generado (Pine/MT5), para
+mantener la garantía de fidelidad motor↔código generado
+(`tests/test_runtime_diferencial.py` exige paridad exacta).
+
+### 1. RSI — sin pérdidas → 100 (antes 50)
+
+- `core/strategies.py:rsi()`: cuando la ventana no tiene pérdidas, devuelve
+  **100** (fuerza alcista pura) en vez de 50. El 50 neutro queda solo para la
+  serie plana (ganancias y pérdidas a 0 a la vez) y para el warm-up.
+- Los runtimes ya usaban el nativo (Pine `ta.rsi`, MT5 `iRSI`), así que esta
+  corrección **alinea** el motor con su propio código generado.
+
+### 2. ATR — suavizado de Wilder (antes media simple)
+
+- `core/strategies.py:atr()`: ahora usa el suavizado de **Wilder (RMA)** con
+  la misma semilla que `ta.rma` de Pine (SMA de las primeras `periodo` velas y
+  recursión `atr[i] = (atr[i-1]*(periodo-1) + tr[i])/periodo`), vía el helper
+  `@njit _atr_rma_numba`. Conserva el `bfill()` del warm-up.
+- `core/codegen/runtime/pine_runtime.pine:zcsAtr()` → `ta.atr(periodo)`.
+- `core/codegen/runtime/zcs_runtime_mt5.mqh:zcsAtr()` → recursión de Wilder
+  sobre la ventana de calentamiento (`ZCS_CALENTAMIENTO`), mismo patrón que
+  KAMA/SAR.
+
+### 3. Bollinger — desviación poblacional ddof=0 (antes muestral ddof=1)
+
+- `core/strategies.py:bollinger()`: `std(ddof=0)` (divide por n), la definición
+  estándar.
+- `pine_runtime.pine:zcsBbDesv()` → `ta.stdev(src, periodo, true)`.
+- `zcs_runtime_mt5.mqh:zcsBbDesv()` → `MathSqrt(s / periodo)`.
+
+### 4. Consecuencia de comportamiento
+
+Las estrategias guardadas (`Sistemas/`, `Favoritos/`) cambian de señales y de
+dimensionado de stop (el ATR fija la distancia al stop y, con ella, el tamaño
+de la posición). Es el tradeoff ya advertido en la §2, asumido en esta tarea.
+
+### 5. Cobertura
+
+Tests actualizados: `tests/test_indicadores.py` (los 3 pines pasan a verificar
+el comportamiento corregido), `tests/test_runtime_diferencial.py` (`_port_atr`
+y `_port_bb_desv` reflejan el nuevo runtime), `tests/test_codegen_pine.py` (las
+2 aserciones del runtime) y `tests/test_strategias_volatilidad.py` (con Wilder
+el ATR decae más lento tras un pico, así que la "calma" se lee como percentil
+bajo algo más tarde). Suite completa: 890 tests en verde.

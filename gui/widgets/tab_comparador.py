@@ -9,16 +9,20 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
                              QLabel, QPushButton, QComboBox, QCompleter,
                              QFrame, QTableWidget, QTableWidgetItem,
                              QHeaderView, QLineEdit, QSizePolicy, QButtonGroup,
-                             QSplitter, QMessageBox, QInputDialog, QCheckBox)
+                             QSplitter, QCheckBox,
+                             QTabWidget)
 from PyQt6.QtCore import Qt, pyqtSignal, QThread
 from PyQt6.QtGui import QColor
+from gui.dialogs.mensajes import aviso, confirmar, pedir_texto
 
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 
+from core.metrics import cointegracion_pares, calculate_alpha_beta
 from gui.widgets.asset_selector import scan_limpiados, RE_LIMPIADO, RE_LIMPIO
 from gui.widgets.file_explorer import FileExplorer
 from gui.widgets.bombear import bombear_eventos
+from gui.widgets.plot_common import icono_ayuda
 from gui.widgets.loading_overlay import (mostrar_overlay_tab, ocultar_overlay_tab,
                                          apagar_overlay_tab)
 from gui.widgets import STYLE_ETIQUETA_SIN_CAJA
@@ -157,6 +161,108 @@ MAX_PUNTOS_PLOT = 4000
 # vez de CSVs 1m de décadas sobrecargan CPU/RAM. Un paralelismo acotado
 # recupera la velocidad sin ese riesgo.
 MAX_CARGAS_PARALELAS = 4
+
+# ── Ayudas «?» de los 5 paneles (misma estructura de 4 pestañas que el
+#    Analizador: Lógica / Significado / Uso / Resultados) ──
+AYUDA_TABLA = (
+    "Se lee el informe de análisis guardado de cada activo "
+    "(.analysis.metrics.json) y se extraen cinco métricas: CAGR, volatilidad "
+    "anualizada, máximo drawdown, Sharpe y Calmar. Cada fila de la tabla es un "
+    "activo; cada columna, una métrica.",
+    "CAGR: retorno anualizado compuesto. Volatilidad anualizada: desviación "
+    "típica de los retornos, anualizada con los periodos reales de mercado del "
+    "activo. Max DD: la peor caída pico-a-valle del histórico. Sharpe: exceso "
+    "de retorno por unidad de riesgo. Calmar: CAGR dividido entre el Max DD.",
+    "Sirve para comparar de un vistazo el perfil riesgo-retorno de todos los "
+    "activos de la cartera sin tener que abrir el informe completo de cada uno. "
+    "El color acompaña al signo: verde para retornos positivos, rojo para "
+    "negativos, y umbrales de Sharpe/Calmar (1 y 0.5) para graduar la calidad.",
+    "Una fila con CAGR y Sharpe altos y Max DD contenido indica un perfil "
+    "sólido; Sharpe o Calmar por debajo de 1 advierte de que el retorno se "
+    "paga con demasiada volatilidad o drawdown. Las celdas N/A aparecen "
+    "cuando el informe del activo no llegó a calcular esa métrica.")
+
+AYUDA_NORMALIZADO = (
+    "Cada serie de cierres se normaliza a base 100 en su punto de partida y "
+    "se dibuja junto a las demás. El modo «Intersección Temporal» arranca "
+    "todas las curvas en la fecha más tardía de inicio (T0 común); el modo "
+    "«Día de Vida» alinea los lanzamientos (eje X = días desde el primer "
+    "dato de cada activo); el modo «Histórico Completo» dibuja un punto "
+    "CAGR/vol por activo con todo su historial.",
+    "El valor 100 es el punto de partida de cada curva: por encima de 100 el "
+    "activo ha subido acumuladamente desde ese origen, por debajo ha caído. "
+    "Si algún activo multiplica su base por más de 20x, el eje Y pasa a escala "
+    "logarítmica para no aplastar al resto de curvas.",
+    "Sirve para comparar trayectorias a escala comparable entre activos con "
+    "historias de distinta longitud: qué activo crece más desde su origen, "
+    "cuándo se cruzaron dos curvas, o si un activo nuevo rinde igual que uno "
+    "veterano desde su propio lanzamiento (modo Día de Vida).",
+    "Curvas sostenidas por encima de 100 indican rendimiento positivo "
+    "acumulado; cruces entre curvas señalan cambios de liderazgo entre "
+    "activos. En el modo dispersión, los puntos arriba-izquierda combinan "
+    "más retorno con menos riesgo.")
+
+AYUDA_CORRELACION = (
+    "Se calcula la correlación de Pearson de los retornos logarítmicos de "
+    "cada par de activos, alineados por timestamp en el TF común elegido en "
+    "la barra superior, sobre el solape temporal compartido (se exige un "
+    "mínimo de 30 velas comunes para no correlacionar pares con solape "
+    "espurio).",
+    "+1 significa que ambos activos se mueven en el mismo sentido y "
+    "proporción; -1 que se mueven en sentidos opuestos; 0 que son "
+    "independientes. La celda «—» indica solape insuficiente para estimar "
+    "la correlación con fiabilidad.",
+    "Sirve para construir la cartera: pares muy correlacionados (celdas "
+    "rojas) aportan poca diversificación —cuando uno cae, el otro también—, "
+    "mientras que correlaciones bajas o negativas (verdes) reparten el "
+    "riesgo de verdad entre activos.",
+    "Bloques rojos entre varios activos del mismo sector o tipo confirman "
+    "que comparten un mismo factor de riesgo; un activo con correlación "
+    "cercana a 0 con el resto es el mejor candidato para diversificar.")
+
+AYUDA_DISPERSION = (
+    "Cada activo se dibuja como un punto (volatilidad anualizada en el eje X, "
+    "CAGR en el eje Y) calculados sobre el TF común. Con «Frontera eficiente» "
+    "activado se simulan 20.000 carteras aleatorias long-only (pesos "
+    "Dirichlet) sobre el solape común a todos los activos, se marca con ★ la "
+    "cartera tangente de máximo Sharpe y se dibuja la CML desde el Rf. El "
+    "benchmark elegido resalta su punto y se usa también en el panel de "
+    "pares.",
+    "Arriba-izquierda es la zona ideal: mucho retorno, poco riesgo. La "
+    "cartera tangente (★) es la combinación de pesos que maximiza "
+    "(retorno - Rf) / vol; la línea CML es la recta que une el Rf con esa "
+    "cartera y marca el máximo rendimiento por unidad de riesgo alcanzable "
+    "combinando activo libre de riesgo con la cartera tangente.",
+    "Sirve para elegir entre activos individuales (el punto más arriba y a "
+    "la izquierda domina al resto) o entre carteras (los puntos de la nube "
+    "dominada por la frontera superior). El campo Risk Free desplaza el "
+    "origen de la CML y el cálculo del Sharpe.",
+    "Puntos por encima de la nube de carteras ofrecen más retorno por su "
+    "riesgo que cualquier combinación de los activos cargados. La etiqueta "
+    "bajo el gráfico muestra la composición de la cartera tangente cuando "
+    "la frontera está activa.")
+
+AYUDA_PARES = (
+    "La pestaña «Cointegración» aplica el test de Engle-Granger a los "
+    "precios logarítmicos de cada par en el TF común alineado y muestra el "
+    "p-valor en un heatmap. La pestaña «Alpha/Beta» regresa cada activo "
+    "contra el benchmark elegido en el panel de dispersión (OLS sobre el "
+    "solape común, con la tasa Risk Free descontada y anualización con los "
+    "periodos reales de mercado).",
+    "Cointegración (p < 0.05) significa que dos precios comparten una "
+    "relación de equilibrio estable a largo plazo: aunque se separen, "
+    "tienden a volver a ella —base de las estrategias de pares. Beta es la "
+    "sensibilidad del activo al benchmark; alpha es el retorno anualizado "
+    "que el activo aporta por encima de lo que su beta predeciría; R² "
+    "mide cuánto del movimiento del activo explica el benchmark.",
+    "Sirve para detectar pares con relación estable (celdas verdes) aptos "
+    "para estrategias market-neutral, y para medir si un activo añade valor "
+    "propio frente al benchmark o solo replica su movimiento con más o "
+    "menos palanca.",
+    "Pares con p bajo y spread estable son candidatos a pares trading; "
+    "alpha positivo y significativo indica gestión que supera al benchmark "
+    "tras ajustar por beta y riesgo. Un R² alto con beta ≈ 1 delata un "
+    "activo que es casi un duplicado del benchmark.")
 
 
 def _no_crash(fn):
@@ -309,7 +415,7 @@ class AssetChip(QFrame):
 class _Panel(QFrame):
     """Marco visual comun de cada cuadrante del dashboard."""
 
-    def __init__(self, titulo, parent=None):
+    def __init__(self, titulo, ayuda=None, parent=None):
         super().__init__(parent)
         self.setObjectName("panel")
         self.vlay = QVBoxLayout(self)
@@ -319,6 +425,8 @@ class _Panel(QFrame):
         self.title = QLabel(titulo)
         self.title.setObjectName("panelTitle")
         self.header.addWidget(self.title)
+        if ayuda:
+            self.header.addWidget(icono_ayuda(*ayuda))
         self.header.addStretch()
         self.vlay.addLayout(self.header)
 
@@ -475,7 +583,8 @@ class TabComparador(QWidget):
         grid.setColumnStretch(1, 1)
 
         # 📊 Tabla comparativa
-        self.panel_tabla = _Panel("📊 TABLA COMPARATIVA DE MÉTRICAS")
+        self.panel_tabla = _Panel("📊 TABLA COMPARATIVA DE MÉTRICAS",
+                                  ayuda=AYUDA_TABLA)
         self.tabla = QTableWidget(0, 6)
         self.tabla.setHorizontalHeaderLabels(['Activo', 'CAGR', 'Vol Anual', 'Max DD', 'Sharpe', 'Calmar'])
         self.tabla.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
@@ -487,7 +596,8 @@ class TabComparador(QWidget):
         bombear_eventos()
 
         # 📈 Retorno normalizado (con desplegable de modo)
-        self.panel_norm = _Panel("📈 GRÁFICO DE RETORNO NORMALIZADO")
+        self.panel_norm = _Panel("📈 GRÁFICO DE RETORNO NORMALIZADO",
+                                 ayuda=AYUDA_NORMALIZADO)
         self.modo_combo = QComboBox()
         self.modo_combo.setMinimumWidth(220)
         for m in MODOS_NORMALIZADO:
@@ -497,15 +607,22 @@ class TabComparador(QWidget):
         self.fig_norm, self.canvas_norm = _make_canvas()
         self.panel_norm.vlay.addWidget(self.canvas_norm, 1)
         grid.addWidget(self.panel_norm, 0, 1)
+        # Cada _make_canvas() paga la inicialización de matplotlib (fuentes,
+        # backend): bombear entre figura y figura para que el overlay siga
+        # girando y Windows no marque la ventana "No responde" en la precarga.
+        bombear_eventos()
 
         # 🧬 Matriz de correlacion
-        self.panel_corr = _Panel("🧬 MATRIZ DE CORRELACIÓN (Heatmap)")
+        self.panel_corr = _Panel("🧬 MATRIZ DE CORRELACIÓN (Heatmap)",
+                                 ayuda=AYUDA_CORRELACION)
         self.fig_corr, self.canvas_corr = _make_canvas()
         self.panel_corr.vlay.addWidget(self.canvas_corr, 1)
         grid.addWidget(self.panel_corr, 1, 0)
+        bombear_eventos()
 
         # 🎯 Dispersion riesgo-retorno
-        self.panel_scatter = _Panel("🎯 DISPERSIÓN RIESGO-RETORNO")
+        self.panel_scatter = _Panel("🎯 DISPERSIÓN RIESGO-RETORNO",
+                                    ayuda=AYUDA_DISPERSION)
         lbl_bench = QLabel("Benchmark:")
         lbl_bench.setObjectName("tfLabel")
         self.panel_scatter.header.addWidget(lbl_bench)
@@ -515,6 +632,9 @@ class TabComparador(QWidget):
         # lambda sin usar el arg de la señal: evita el problema de aridad con
         # los slots decorados por @_no_crash (ver nota en _on_add_clicked)
         self.benchmark_combo.currentIndexChanged.connect(lambda _i: self._refresh_scatter())
+        # el panel de pares sigue al benchmark elegido en el scatter: cambiar
+        # el combo repinta también la tabla de alpha/beta al instante
+        self.benchmark_combo.currentIndexChanged.connect(lambda _i: self._refresh_pares())
         self.panel_scatter.header.addWidget(self.benchmark_combo)
         self.frontera_check = QCheckBox("Frontera eficiente")
         self.frontera_check.toggled.connect(lambda _v: self._refresh_scatter())
@@ -530,6 +650,43 @@ class TabComparador(QWidget):
         # El primer _make_canvas() paga el coste de inicialización de
         # matplotlib (fuentes, backend): bombear para que el overlay de carga
         # siga animándose y Windows no marque la ventana "No responde".
+        bombear_eventos()
+
+        # 🔗 Pares: cointegración + alpha/beta frente al benchmark
+        self.panel_pares = _Panel("🔗 PARES: COINTEGRACIÓN + ALPHA/BETA",
+                                  ayuda=AYUDA_PARES)
+        self.pares_tabs = QTabWidget()
+        self.pares_tabs.setStyleSheet(
+            "QTabBar::tab { color: #5a7a9a; padding: 4px 14px; border: none; }"
+            "QTabBar::tab:selected { color: #4fc3f7; font-weight: bold; }")
+        self.fig_coint, self.canvas_coint = _make_canvas()
+        self.lbl_coint = QLabel("")
+        self.lbl_coint.setWordWrap(True)
+        self.lbl_coint.setObjectName("tangenteLabel")
+        w_coint = QWidget()
+        lay_coint = QVBoxLayout(w_coint)
+        lay_coint.setContentsMargins(6, 4, 6, 6)
+        lay_coint.addWidget(self.canvas_coint, 1)
+        lay_coint.addWidget(self.lbl_coint)
+        self.pares_tabs.addTab(w_coint, "Cointegración (p < 0.05)")
+        self.tabla_ab = QTableWidget(0, 5)
+        self.tabla_ab.setHorizontalHeaderLabels(
+            ['Activo', 'Beta', 'Alpha anual', 'R²', 'Obs.'])
+        self.tabla_ab.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch)
+        self.tabla_ab.verticalHeader().setVisible(False)
+        self.tabla_ab.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.lbl_bench_ab = QLabel("Benchmark: —")
+        self.lbl_bench_ab.setObjectName("tangenteLabel")
+        self.lbl_bench_ab.setWordWrap(True)
+        w_ab = QWidget()
+        lay_ab = QVBoxLayout(w_ab)
+        lay_ab.setContentsMargins(6, 4, 6, 6)
+        lay_ab.addWidget(self.lbl_bench_ab)
+        lay_ab.addWidget(self.tabla_ab)
+        self.pares_tabs.addTab(w_ab, "Alpha / Beta vs benchmark")
+        self.panel_pares.vlay.addWidget(self.pares_tabs, 1)
+        grid.addWidget(self.panel_pares, 2, 0, 1, 2)
         bombear_eventos()
 
         # ── Splitter: Explorer (izquierda) + Dashboard (derecha) ──
@@ -685,12 +842,10 @@ class TabComparador(QWidget):
         if not os.path.exists(path):
             return
         if not os.path.exists(path + '.analysis.metrics.json'):
-            QMessageBox.warning(
-                self, "Activo sin analizar",
-                "Este archivo no tiene resultados de análisis guardados\n"
-                "(falta el .analysis.metrics.json).\n\n"
-                "Analízalo primero desde la pestaña Limpiados."
-            )
+            aviso(self, "Activo sin analizar",
+                  "Este archivo no tiene resultados de análisis guardados\n"
+                  "(falta el .analysis.metrics.json).\n\n"
+                  "Analízalo primero desde la pestaña Limpiados.")
             return
         fname = os.path.basename(path)
         m = RE_LIMPIADO.match(fname) or RE_LIMPIO.match(fname)
@@ -912,7 +1067,7 @@ class TabComparador(QWidget):
     def _guardar_lista_actual(self):
         if not self._orden:
             return
-        name, ok = QInputDialog.getText(self, "Guardar lista", "Nombre de la lista:")
+        name, ok = pedir_texto(self, "Guardar lista", "Nombre de la lista:")
         if not ok or not name.strip():
             return
         name = name.strip()
@@ -931,10 +1086,8 @@ class TabComparador(QWidget):
         if idx <= 0:
             return
         name = self.lista_combo.currentText()
-        reply = QMessageBox.question(self, "Eliminar lista",
-            f"¿Eliminar la lista '{name}'?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if reply != QMessageBox.StandardButton.Yes:
+        if not confirmar(self, "Eliminar lista",
+                 f"¿Eliminar la lista '{name}'?"):
             return
         self._listas = [l for l in self._listas if l['nombre'] != name]
         self._refresh_listas_combo()
@@ -1049,6 +1202,8 @@ class TabComparador(QWidget):
         self._refresh_corr()
         bombear_eventos()
         self._refresh_scatter()
+        bombear_eventos()
+        self._refresh_pares()
 
     @_no_crash
     def _refresh_tabla(self):
@@ -1214,6 +1369,142 @@ class TabComparador(QWidget):
         except Exception:
             pass
         self.canvas_corr.draw_idle()
+
+    @_no_crash
+    def _refresh_pares(self):
+        """Cointegración de Engle-Granger por pares (sobre precios LOG del
+        TF común alineados) y regresión alpha/beta de cada activo contra el
+        benchmark elegido en el panel de dispersión."""
+        if not hasattr(self, 'tabla_ab'):
+            return   # el combo puede disparar durante la construcción
+        self.fig_coint.clear()
+        ax = self.fig_coint.add_subplot(111)
+        ax.set_facecolor(FIG_BG)
+        self.lbl_coint.setText("")
+        self.tabla_ab.setRowCount(0)
+        self.lbl_bench_ab.setText("Benchmark: —")
+        self.pares_tabs.setTabText(1, "Alpha / Beta vs benchmark")
+        listos = self._series_listas()
+        if len(listos) < 2:
+            _ax_placeholder(
+                ax, "Añade al menos 2 activos para cointegración y alpha/beta")
+            self.canvas_coint.draw_idle()
+            return
+
+        retornos = pd.DataFrame({info['label']: datos['ret']
+                                 for _p, info, datos in listos}).dropna()
+        if len(retornos) < 30:
+            _ax_placeholder(
+                ax, f"Solape temporal insuficiente: {len(retornos)} velas "
+                    "comunes (mínimo 30)")
+            self.canvas_coint.draw_idle()
+            return
+
+        # ── cointegración por pares sobre precios LOG ──
+        precios_log = retornos.cumsum()
+        n = len(listos)
+        etiquetas = [_nombre_sin_tf(info['label']) for _p, info, _d in listos]
+        pvals = np.full((n, n), np.nan)
+        pares_sig = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                r = cointegracion_pares(precios_log.iloc[:, i].values,
+                                        precios_log.iloc[:, j].values)
+                if r['p_value'] is not None:
+                    pvals[i, j] = pvals[j, i] = r['p_value']
+                    if r['cointegrados']:
+                        pares_sig.append((etiquetas[i], etiquetas[j],
+                                          r['p_value']))
+
+        import matplotlib
+        cmap = matplotlib.colormaps['RdYlGn_r'].copy()
+        cmap.set_bad('#3a4a5a')
+        im = ax.imshow(np.ma.masked_invalid(pvals), cmap=cmap,
+                       vmin=0.0, vmax=0.25, aspect='auto')
+        ax.set_xticks(range(n))
+        ax.set_yticks(range(n))
+        ax.set_xticklabels(etiquetas, rotation=30, ha='right', fontsize=7,
+                           color=AX_FG)
+        ax.set_yticklabels(etiquetas, fontsize=7, color=AX_FG)
+        ax.tick_params(colors=AX_FG, length=0)
+        for spine in ax.spines.values():
+            spine.set_edgecolor(GRID_C)
+        for i in range(n):
+            for j in range(n):
+                v = pvals[i, j]
+                if np.isfinite(v):
+                    ax.text(j, i, f"{v:.3f}", ha='center', va='center',
+                            color='#ffffff' if v < 0.05 else '#c8d6e5',
+                            fontsize=7)
+        cbar = self.fig_coint.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cbar.ax.tick_params(colors=AX_FG, labelsize=6)
+        cbar.outline.set_edgecolor(GRID_C)
+        try:
+            self.fig_coint.tight_layout()
+        except Exception:
+            pass
+        if pares_sig:
+            texto = "Pares cointegrados (p < 0.05): " + " · ".join(
+                f"{a}~{b} (p={p:.3f})" for a, b, p in pares_sig)
+            self.lbl_coint.setText(texto)
+            self.lbl_coint.setVisible(True)
+        else:
+            self.lbl_coint.setText(
+                "Ningún par cointegrado al 5% — los pares con p bajo son los "
+                "candidatos a estrategias de pares.")
+            self.lbl_coint.setVisible(True)
+        self.canvas_coint.draw_idle()
+
+        # ── alpha/beta frente al benchmark del scatter ──
+        # el combo guarda el PATH del activo (o None = '(medianas)'): se
+        # resuelve a su label igual que hace el scatter con bench_path
+        bench = self.benchmark_combo.currentData()
+        nombre_bench = "(medianas)"
+        serie_bench = retornos.mean(axis=1)
+        if bench is not None:
+            info_bench = self._assets.get(bench)
+            if (info_bench is not None
+                    and info_bench['label'] in retornos.columns):
+                serie_bench = retornos[info_bench['label']]
+                nombre_bench = _nombre_sin_tf(info_bench['label'])
+        anios = max((retornos.index[-1] - retornos.index[0]).days, 1) / 365.25
+        ppy = len(retornos) / anios if anios > 0 else 252.0
+        rf_anual = self._rf_actual() / 100.0
+        rf_per = rf_anual / ppy
+
+        self.lbl_bench_ab.setText(
+            f"Benchmark: {nombre_bench} · Rf {self._rf_actual():g}% anual · "
+            f"{len(retornos)} velas de {self._tf}")
+        self.pares_tabs.setTabText(1, f"Alpha / Beta vs {nombre_bench}")
+
+        self.tabla_ab.setRowCount(n)
+        for fila, (path, info, _datos) in enumerate(listos):
+            res = calculate_alpha_beta(
+                retornos[info['label']].values, serie_bench.values,
+                rf=rf_per, periodos_anio=ppy)
+            item_n = QTableWidgetItem(_nombre_sin_tf(info['label']))
+            item_n.setForeground(QColor(info['color']))
+            self.tabla_ab.setItem(fila, 0, item_n)
+            beta = res['beta']
+            alpha = res['alpha']
+            r2 = res['r2']
+            celdas = [
+                (f"{beta:.2f}" if beta is not None else "N/A", '#c8d6e5'),
+                (f"{alpha * 100:.2f}%" if alpha is not None else "N/A",
+                 '#27ae60' if (alpha or 0) > 0 else '#e74c3c'),
+                (f"{r2:.2f}" if r2 is not None else "N/A", '#c8d6e5'),
+                (str(res['n']), '#5a7a9a'),
+            ]
+            for col, (texto, color) in enumerate(celdas, start=1):
+                item = QTableWidgetItem(texto)
+                item.setForeground(QColor('#5a7a9a') if texto == 'N/A'
+                                   else QColor(color))
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.tabla_ab.setItem(fila, col, item)
+        self.tabla_ab.setToolTip(
+            f"Regresión sobre el solape común de {len(retornos)} velas del "
+            f"TF {self._tf}. Beta = cov/var; Alpha anualizado con Rf "
+            f"{self._rf_actual():g}% anual; benchmark: {nombre_bench}.")
 
     def _rf_actual(self):
         try:

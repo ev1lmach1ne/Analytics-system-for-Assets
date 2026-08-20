@@ -21,10 +21,11 @@ resuelven con zcsCruzaArriba(a1, a2, b1, b2).
 
 LO QUE NO SE PUEDE REPRODUCIR
 ─────────────────────────────
-El motor dimensiona con el ATR de la vela en cuya apertura entra, que incluye
-el máximo, el mínimo y el cierre de esa misma vela. Aquí se usa el de la
-última vela cerrada, que es lo único que existe en ese momento. Va declarado
-en fidelidad.CAPACIDADES y avisado en la cabecera y en el OnInit.
+El motor dimensiona con el ATR de la última vela cerrada antes de la entrada
+(atr[i-1], ver core/backtest._atr_cerrado); aquí se usa el de la vela de la
+señal (1), que ya está cerrada, así que coinciden salvo en el borde inicial
+de la serie. Va declarado en fidelidad.CAPACIDADES y avisado en la cabecera y
+en el OnInit.
 """
 import os
 import zlib
@@ -112,6 +113,12 @@ class EmisorMQL5(Emisor):
         contrario = '-1' if nodo['sentido'] > 0 else '1'
         return f"({base}_tend_1 == {signo} && {base}_tend_2 == {contrario})"
 
+    def giro_supertrend(self, nodo):
+        base = Emisor.nombre_serie(self, nodo['sar'])
+        signo = '1' if nodo['sentido'] > 0 else '-1'
+        contrario = '-1' if nodo['sentido'] > 0 else '1'
+        return f"({base}_tend_1 == {signo} && {base}_tend_2 == {contrario})"
+
     # ══════════════ handles de indicadores nativos ══════════════
 
     def _nombre_handle(self, nodo):
@@ -194,6 +201,82 @@ class EmisorMQL5(Emisor):
                     f"   zcsSar({arg('af_inicial')}, {arg('af_paso')}, "
                     f"{arg('af_max')}, {shift}, {nombre}, "
                     f"{base}_tend_{shift});")
+        if tipo == 'SUPERTREND':
+            base = nombre[:-2]      # sin el sufijo de desplazamiento
+            return (f"   double {nombre} = 0.0;\n"
+                    f"   int {base}_tend_{shift} = 0;\n"
+                    f"   zcsSupertrend({arg('periodo')}, "
+                    f"{self.num(nodo['multiplicador'])}, {shift}, {nombre}, "
+                    f"{base}_tend_{shift});")
+        if tipo in ('MACD_LINEA', 'MACD_SENAL', 'MACD_HIST'):
+            suf = nombre[len(tipo.lower()):]   # conserva el sufijo de desplazamiento
+            return (f"   double macd_linea{suf} = 0.0;\n"
+                    f"   double macd_senal{suf} = 0.0;\n"
+                    f"   double macd_hist{suf} = 0.0;\n"
+                    f"   zcsMacd({arg('rapido')}, {arg('lento')}, "
+                    f"{arg('senal')}, {shift}, macd_linea{suf}, "
+                    f"macd_senal{suf}, macd_hist{suf});")
+        if tipo in ('ADX', 'DI_PLUS', 'DI_MINUS'):
+            suf = nombre[len(tipo.lower()):]
+            return (f"   double adx{suf} = 0.0;\n"
+                    f"   double di_plus{suf} = 0.0;\n"
+                    f"   double di_minus{suf} = 0.0;\n"
+                    f"   zcsAdx({arg('periodo')}, {shift}, adx{suf}, "
+                    f"di_plus{suf}, di_minus{suf});")
+        if tipo == 'AROON_UP':
+            return (f"   double {nombre} = 0.0;\n"
+                    f"   zcsAroonUp({arg('periodo')}, {shift}, {nombre});")
+        if tipo == 'AROON_DN':
+            return (f"   double {nombre} = 0.0;\n"
+                    f"   zcsAroonDown({arg('periodo')}, {shift}, {nombre});")
+        if tipo == 'CMO':
+            return (f"   double {nombre} = 0.0;\n"
+                    f"   zcsCmo({arg('periodo')}, {shift}, {nombre});")
+        if tipo == 'TRIX':
+            return (f"   double {nombre} = 0.0;\n"
+                    f"   zcsTrix({arg('periodo')}, {shift}, {nombre});")
+        if tipo == 'STOCHRSI':
+            return (f"   double {nombre} = 0.0;\n"
+                    f"   zcsStochRsiK({arg('periodo')}, {shift}, {nombre});")
+        if tipo == 'STOCHRSI_D':
+            return (f"   double {nombre} = 0.0;\n"
+                    f"   zcsStochRsiD({arg('periodo')}, {shift}, {nombre});")
+        if tipo in ('ICHIMOKU_TENKAN', 'ICHIMOKU_KIJUN', 'ICHIMOKU_SENKOU_A',
+                    'ICHIMOKU_SENKOU_B', 'ICHIMOKU_CHIKOU'):
+            fname = {'ICHIMOKU_TENKAN': 'zcsIchimokuTenkan',
+                     'ICHIMOKU_KIJUN': 'zcsIchimokuKijun',
+                     'ICHIMOKU_SENKOU_A': 'zcsIchimokuSenkouA',
+                     'ICHIMOKU_SENKOU_B': 'zcsIchimokuSenkouB',
+                     'ICHIMOKU_CHIKOU': 'zcsIchimokuChikou'}[tipo]
+            return (f"   double {nombre} = 0.0;\n"
+                    f"   {fname}({arg('tenkan')}, {arg('kijun')}, "
+                    f"{arg('senkou')}, {shift}, {nombre});")
+        if tipo in ('KELTNER_SUP', 'KELTNER_INF', 'KELTNER_MEDIA'):
+            fname = {'KELTNER_MEDIA': 'zcsKeltnerMedia',
+                     'KELTNER_SUP': 'zcsKeltnerSup',
+                     'KELTNER_INF': 'zcsKeltnerInf'}[tipo]
+            return (f"   double {nombre} = 0.0;\n"
+                    f"   {fname}({arg('periodo')}, "
+                    f"{self.num(nodo['multiplicador'])}, {shift}, {nombre});")
+        if tipo in ('TTM_SQUEEZE', 'TTM_MOMENTUM'):
+            fname = 'zcsTtmSqueeze' if tipo == 'TTM_SQUEEZE' else 'zcsTtmMomentum'
+            return (f"   double {nombre} = 0.0;\n"
+                    f"   {fname}({arg('periodo')}, {self.num(nodo['mult_bb'])}, "
+                    f"{self.num(nodo['mult_kc'])}, {shift}, {nombre});")
+        if tipo in ('VWAP_MEDIA', 'VWAP_SD', 'VWAP_SUP', 'VWAP_INF'):
+            fname = {'VWAP_MEDIA': 'zcsVwapMedia', 'VWAP_SD': 'zcsVwapSd',
+                     'VWAP_SUP': 'zcsVwapSup', 'VWAP_INF': 'zcsVwapInf'}[tipo]
+            ancla = f'"{nodo["anclaje"]}"'
+            modo_lit = f'"{nodo["modo"]}"'
+            return (f"   double {nombre} = 0.0;\n"
+                    f"   {fname}({ancla}, {arg('k')}, {modo_lit}, "
+                    f"{shift}, {nombre});")
+        if tipo == 'ZIGZAG':
+            base = nombre[:-2]      # sin el sufijo de desplazamiento
+            return (f"   double {nombre} = 0.0; int {base}_tipo_{shift} = 0;\n"
+                    f"   zcsZigzag({self.num(nodo['desviacion'])}, "
+                    f"{self.num(nodo['piernas'])}, {shift}, {nombre}, "
+                    f"{base}_tipo_{shift});")
         if tipo == 'PCT_ATR':
             return (f"   double {nombre} = zcsPercentilAtr("
                     f"{self.num(nodo['periodo_base'])}, "
@@ -203,10 +286,8 @@ class EmisorMQL5(Emisor):
                     f"{self.num(nodo['periodo_base'])}, "
                     f"{self.num(nodo['ventana'])}, {shift});")
         if tipo == 'HURST':
-            raise ValueError(
-                "El Hurst todavía no está portado a MQL5 (ver "
-                "fidelidad.CAPACIDADES): este setup no debería haber llegado "
-                "al emisor con el filtro de régimen puesto.")
+            return (f"   double {nombre} = zcsHurst("
+                    f"{self.num(nodo['periodo'])}, {shift});")
         raise ValueError(f"{self.nombre}: serie sin traducción: {tipo!r}")
 
     # ══════════════ archivos ══════════════
@@ -299,7 +380,8 @@ class EmisorMQL5(Emisor):
         return "\n".join(lineas)
 
     def _estado(self, ir_setup):
-        return "\n".join([
+        g = ir_setup['gestion']
+        lineas = [
             self._seccion("Estado de la posicion"),
             "",
             "double zcsDistEntrada  = 0.0;   // distancia al stop al entrar",
@@ -308,8 +390,15 @@ class EmisorMQL5(Emisor):
             "int    zcsBarraEntrada = 0;",
             "bool   zcsBeAplicado   = false;",
             "double zcsDistPendiente = 0.0;  // distancia calculada en la vela de la senal",
-        ] + [f"int {handle} = INVALID_HANDLE;"
-             for handle, _nodo in self._handles(ir_setup)])
+        ]
+        if len(g['tramos']) > 1:
+            lineas += [
+                "int    zcsTramoActual  = 1;     // tramo que falta por anadir (entrada escalonada)",
+                "bool   zcsTramoOrden   = false; // ya se pidio el tramo en esta vela",
+            ]
+        lineas += [f"int {handle} = INVALID_HANDLE;"
+                   for handle, _nodo in self._handles(ir_setup)]
+        return "\n".join(lineas)
 
     def _on_init(self, ir_setup, avisos, meta):
         minutos = _TF_MINUTOS.get(meta.get('tf') or '', 0)
@@ -489,11 +578,17 @@ class EmisorMQL5(Emisor):
                 f"      {umbral}, zcsMonedas, {len(monedas)}))",
                 "      { zcsCerrar(p_magic); return; }",
             ]
+        reset_tramos = []
+        if len(g['tramos']) > 1:
+            reset_tramos = [
+                "               zcsTramoActual  = 1;",
+                "               zcsTramoOrden   = false;",
+            ]
         return [
             "   // --- gestion de la posicion",
-            "   // El motor mide la distancia con el ATR de la vela en cuya",
-            "   // apertura entra; en vivo ese dato aun no existe, asi que se",
-            "   // usa el de la ultima vela cerrada (ver cabecera).",
+            "   // El motor dimensiona con el ATR de la ultima vela cerrada",
+            "   // antes de la entrada (atr[i-1]); aqui se usa el de la vela de",
+            "   // la senal (1), que ya esta cerrada, asi que coinciden.",
             "   double distRef = (p_stop_atr > 0.0 ? p_stop_atr * atrGestion",
             "                                      : 2.0 * atrGestion);",
             "   int dir = zcsDireccion(p_magic);",
@@ -521,6 +616,7 @@ class EmisorMQL5(Emisor):
             "               zcsMaxFav       = precio;",
             "               zcsBarraEntrada = Bars(_Symbol, _Period);",
             "               zcsBeAplicado   = false;",
+            *reset_tramos,
             "            }",
             "         }",
             "      }",
@@ -530,6 +626,8 @@ class EmisorMQL5(Emisor):
             "   double precioIn = zcsPrecioEntrada(p_magic);",
             "   zcsMaxFav = (dir > 0 ? MathMax(zcsMaxFav, h1)",
             "                        : MathMin(zcsMaxFav, l1));",
+            "",
+            *self._tramos(ir_setup),
             "",
             *cierre_noticias,
             "",
@@ -568,6 +666,95 @@ class EmisorMQL5(Emisor):
             "      Bars(_Symbol, _Period) - zcsBarraEntrada >= p_salida_velas)",
             "      zcsCerrar(p_magic);",
         ]
+
+    def _tramos(self, ir_setup):
+        """Tramos de entrada escalonada (2º en adelante). Cada tramo abre su
+        propia posición con el mismo magic (la capa de posición del runtime
+        agrega), con tamaño = riesgo_total × pct/100 / distancia_al_stop y el
+        suelo del 25% de la distancia de referencia, igual que el motor."""
+        g = ir_setup['gestion']
+        tramos = g['tramos']
+        if len(tramos) <= 1:
+            return []
+        from core.codegen.ir import condiciones_de_lado
+        lineas = [
+            "   // --- entrada escalonada: tramos adicionales",
+            "   zcsTramoOrden = false;",
+            "   double distTramo = MathMax(",
+            "      (zcsStopActual > 0.0 ? MathAbs(precioIn - zcsStopActual)"
+            "                           : distRef), 0.25 * distRef);",
+        ]
+        for k, t in enumerate(tramos[1:], 1):
+            cond = condiciones_de_lado(t['condiciones'], 'long')
+            cond_s = condiciones_de_lado(t['condiciones'], 'short')
+            pct = float(t['pct']) / 100.0
+            cond_l = (self.expr(cond) if cond is not None else "true")
+            cond_sx = (self.expr(cond_s) if cond_s is not None else "true")
+            trig_l = self._tramo_trig(t, 'long')
+            trig_s = self._tramo_trig(t, 'short')
+            lineas += [
+                "",
+                f"   if(zcsTramoActual == {k} && !zcsTramoOrden)",
+                "   {",
+                "      if(dir > 0)",
+                "      {",
+                f"         if({trig_l} && {cond_l})",
+                "         {",
+                f"            double lotesT = zcsLotesPorRiesgo("
+                f"p_riesgo_pct / 100.0 * {self.num(pct)}, distTramo);",
+                "            if(lotesT > 0.0)",
+                "            {",
+                "               if(zcsAbrir(1, lotesT, zcsStopActual, "
+                "0.0, p_magic))",
+                "               {",
+                "                  zcsTramoActual++;",
+                "                  zcsTramoOrden = true;",
+                "               }",
+                "            }",
+                "         }",
+                "      }",
+                "      else",
+                "      {",
+                f"         if({trig_s} && {cond_sx})",
+                "         {",
+                f"            double lotesT = zcsLotesPorRiesgo("
+                f"p_riesgo_pct / 100.0 * {self.num(pct)}, distTramo);",
+                "            if(lotesT > 0.0)",
+                "            {",
+                "               if(zcsAbrir(-1, lotesT, zcsStopActual, "
+                "0.0, p_magic))",
+                "               {",
+                "                  zcsTramoActual++;",
+                "                  zcsTramoOrden = true;",
+                "               }",
+                "            }",
+                "         }",
+                "      }",
+                "   }",
+            ]
+        return lineas
+
+    def _tramo_trig(self, t, lado):
+        """Expresión booleana del disparador de un tramo para un lado."""
+        val = float(t.get('val', 0.0))
+        trig = t['trigger']
+        if trig == 'senal':
+            return ("entradaLong  && filtroLong" if lado == 'long'
+                    else "entradaShort && filtroShort")
+        if trig == 'velas':
+            return (f"(Bars(_Symbol, _Period) - zcsBarraEntrada >= "
+                    f"{self.num(int(val))})")
+        if trig == 'retroceso':
+            return (f"(l1 <= precioIn - {self.num(val)} * atrGestion)"
+                    if lado == 'long'
+                    else f"(h1 >= precioIn + {self.num(val)} * atrGestion)")
+        if trig == 'avance':
+            return (f"(h1 >= precioIn + {self.num(val)} * distRef)"
+                    if lado == 'long'
+                    else f"(l1 <= precioIn - {self.num(val)} * distRef)")
+        if trig == 'cond':
+            return "(true)"
+        return "(false)"
 
 
 _VAR_SENAL = {'entradas_long': 'entradaLong', 'entradas_short': 'entradaShort',
@@ -618,6 +805,14 @@ def _instalar_md(meta, slug):
 - El tamaño se calcula por riesgo y se redondea al paso de lote del bróker.
   Si el riesgo pedido queda por debajo del lote mínimo, el EA **no abre** la
   operación en vez de arriesgar de más.
+- La **comisión** no se puede fijar desde el código: en vivo la cobra el
+  bróker según el esquema de la cuenta, y en el **probador de estrategias**
+  hay que configurarla a mano (*Ajustes → Comisión*, o la ficha de contrato
+  del símbolo) con la del backtest que aparece en la cabecera del archivo y
+  en `NOTAS_DE_FIDELIDAD.md`. Con otra comisión, la curva saldrá distinta.
+- El **slippage** del backtest tampoco se traslada solo: se configura en el
+  probador en puntos, y en vivo lo pone el mercado (spread y deslizamiento
+  reales).
 
 Lee `NOTAS_DE_FIDELIDAD.md` en la carpeta de arriba: dice exactamente en qué se
 diferencia este EA del backtest.

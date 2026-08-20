@@ -28,6 +28,16 @@ from core.strategies import (
     _kama_serie,
     _retorno_log,
     _sar_serie,
+    _supertrend_serie,
+    _macd_series,
+    _adx_series,
+    _aroon_series,
+    _cmo_serie,
+    _trix_serie,
+    _stochrsi_series,
+    _ichimoku_series,
+    _keltner_series,
+    _ttm_squeeze_series,
     atr,
     bollinger,
     donchian,
@@ -41,14 +51,23 @@ RNG = np.random.default_rng(42)
 # ============================================================
 
 def _port_atr(high, low, close, periodo):
-    """Fiel a zcsAtr(periodo) del runtime Pine: SMA del True Range."""
+    """Fiel a zcsAtr(periodo) del runtime Pine (ta.atr): suavizado de Wilder
+    del True Range. Semilla SMA de las primeras `periodo` velas y recursión
+    atr[i] = (atr[i-1]*(periodo-1) + tr[i]) / periodo."""
     hs, ls, cs = pd.Series(high), pd.Series(low), pd.Series(close)
     tr = pd.concat([
         hs - ls,
         (hs - cs.shift(1)).abs(),
         (ls - cs.shift(1)).abs(),
-    ], axis=1).max(axis=1)
-    return tr.rolling(int(periodo)).mean().bfill().values
+    ], axis=1).max(axis=1).values
+    n = len(tr)
+    out = np.full(n, np.nan)
+    p = int(periodo)
+    if n >= p:
+        out[p - 1] = tr[:p].mean()
+        for i in range(p, n):
+            out[i] = (out[i - 1] * (p - 1) + tr[i]) / p
+    return out
 
 
 def _port_bb_media(close, periodo):
@@ -57,8 +76,8 @@ def _port_bb_media(close, periodo):
 
 
 def _port_bb_desv(close, periodo):
-    """Fiel a zcsBbDesv(src, periodo): stdev muestral (ddof=1)."""
-    return pd.Series(close).rolling(int(periodo)).std().values
+    """Fiel a zcsBbDesv(src, periodo): stdev poblacional (ddof=0)."""
+    return pd.Series(close).rolling(int(periodo)).std(ddof=0).values
 
 
 def _port_bb_sup(close, periodo, desv):
@@ -567,6 +586,417 @@ class TestUnidadesPorRiesgo:
 
 
 # ============================================================
+# Ports de las funciones nuevas del runtime (Pine)
+# ============================================================
+
+def _port_supertrend(high, low, close, periodo, mult):
+    """Fiel a zcsSupertrend(periodo, mult) del runtime Pine: envolvente ATR
+    con recursion (max/min del nivel previo segun el cierre) y tendencia
+    +/-1. El ATR de la ventana de calentamiento es NaN (ta.atr), igual que
+    en el motor que no rellena aqui a proposito."""
+    n = len(close)
+    atr_v = _port_atr(high, low, close, periodo)
+    hl2 = (np.asarray(high, dtype=float) + np.asarray(low, dtype=float)) * 0.5
+    up = np.full(n, np.nan)
+    dn = np.full(n, np.nan)
+    st = np.full(n, np.nan)
+    tend = np.zeros(n, dtype=np.int32)
+    tend_v = 0
+    for i in range(n):
+        up_i = hl2[i] - mult * atr_v[i]
+        dn_i = hl2[i] + mult * atr_v[i]
+        if i > 0 and not np.isnan(up[i - 1]):
+            up[i] = max(up_i, up[i - 1]) if close[i - 1] > up[i - 1] else up_i
+            dn[i] = min(dn_i, dn[i - 1]) if close[i - 1] < dn[i - 1] else dn_i
+        else:
+            up[i] = up_i
+            dn[i] = dn_i
+        if tend_v == 0:
+            tend_v = 1
+            st[i] = hl2[i]
+        elif tend_v > 0:
+            if close[i] < up[i]:
+                tend_v = -1
+                st[i] = dn[i]
+            else:
+                st[i] = up[i]
+        else:
+            if close[i] > dn[i]:
+                tend_v = 1
+                st[i] = up[i]
+            else:
+                st[i] = dn[i]
+        tend[i] = tend_v
+    return st, tend
+
+
+def _port_macd(close, rapido, lento, senal):
+    """Fiel a zcsMacd(rapido, lento, senal) del runtime Pine: EMAs
+    ajustadas (ta.ema == ewm span adjust=False)."""
+    linea = (pd.Series(close).ewm(span=rapido, adjust=False).mean()
+             - pd.Series(close).ewm(span=lento, adjust=False).mean()).values
+    senal_linea = pd.Series(linea).ewm(span=senal, adjust=False).mean().values
+    return linea, senal_linea, linea - senal_linea
+
+
+def _port_rma_wilder(serie, periodo):
+    """Fiel a ta.rma (semilla SMA de las primeras `periodo` velas y
+    recursion de Wilder); warm-up en NaN."""
+    serie = np.asarray(serie, dtype=float)
+    n = len(serie)
+    out = np.full(n, np.nan)
+    p = int(periodo)
+    if n >= p:
+        out[p - 1] = serie[:p].mean()
+        for i in range(p, n):
+            out[i] = (out[i - 1] * (p - 1) + serie[i]) / p
+    return out
+
+
+def _port_adx(high, low, close, periodo):
+    """Fiel a zcsAdx(periodo) del runtime Pine: +DI/-DI/ADX con RMA de
+    Wilder. El tr de la vela 0 usa alto-bajo (sin cierre anterior)."""
+    hs, ls, cs = pd.Series(high), pd.Series(low), pd.Series(close)
+    up = hs.diff().values
+    dn = (-ls.diff()).values
+    plus_dm = np.where((up > dn) & (up > 0), up, 0.0)
+    minus_dm = np.where((dn > up) & (dn > 0), dn, 0.0)
+    tr = pd.concat([hs - ls, (hs - cs.shift(1)).abs(),
+                    (ls - cs.shift(1)).abs()], axis=1).max(axis=1).values
+    tr_rma = _port_rma_wilder(tr, periodo)
+    plus_rma = _port_rma_wilder(plus_dm, periodo)
+    minus_rma = _port_rma_wilder(minus_dm, periodo)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        pdi = 100.0 * plus_rma / tr_rma
+        mdi = 100.0 * minus_rma / tr_rma
+    dx = 100.0 * np.abs(pdi - mdi) / np.maximum(pdi + mdi, 1e-12)
+    # el ADX se siembra con las primeras `periodo` dx validas (dx es valido
+    # desde p-1) y luego aplica la recursion de Wilder
+    n = len(dx)
+    adx = np.full(n, np.nan)
+    p = int(periodo)
+    ini = p - 1
+    if n >= ini + p:
+        adx[ini + p - 1] = dx[ini:ini + p].mean()
+        for i in range(ini + p, n):
+            adx[i] = (adx[i - 1] * (p - 1) + dx[i]) / p
+    return adx, pdi, mdi
+
+
+class TestSupertrend:
+    def test_contra_engine_tendencia(self):
+        _, h, l, c = _ohlc_tendencia()
+        p = 10
+        port, _ = _port_supertrend(h, l, c, p, 3.0)
+        engine, _ = _supertrend_serie(h, l, c, p, 3.0)
+        np.testing.assert_allclose(port[p:], engine[p:], atol=1e-10)
+
+    def test_contra_engine_rango(self):
+        _, h, l, c = _ohlc_rango()
+        p = 10
+        port, port_t = _port_supertrend(h, l, c, p, 3.0)
+        engine, engine_t = _supertrend_serie(h, l, c, p, 3.0)
+        np.testing.assert_allclose(port[p:], engine[p:], atol=1e-10)
+        np.testing.assert_array_equal(port_t[p:], engine_t[p:])
+
+    def test_sigue_la_tendencia(self):
+        # velas alcistas (hl2 por debajo del cierre) en tendencia suave: el
+        # Supertrend debe permanecer alcista; la flip de cierre>close<hl2 de
+        # velas simetricas seria degenerada para la envolvente
+        rng = np.random.default_rng(3)
+        n = 500
+        base = np.linspace(100.0, 115.0, n)
+        c = base + rng.normal(0, 0.05, n)
+        h = c + 0.3
+        l = c - 0.1
+        _, port_t = _port_supertrend(h, l, c, 10, 3.0)
+        assert (port_t[200:] > 0).mean() > 0.9
+
+
+class TestMacd:
+    def test_contra_engine_tendencia(self):
+        _, _, _, c = _ohlc_tendencia()
+        port = _port_macd(c, 12, 26, 9)
+        engine = _macd_series(c, 12, 26, 9)
+        for a, b in zip(port, engine):
+            np.testing.assert_allclose(a[25:], b[25:], atol=1e-10)
+
+    def test_hist_es_linea_menos_senal(self):
+        _, _, _, c = _ohlc_rango()
+        linea, senal, hist = _port_macd(c, 12, 26, 9)
+        np.testing.assert_allclose(hist, linea - senal, atol=1e-12)
+
+
+class TestAdx:
+    def test_contra_engine_tendencia(self):
+        _, h, l, c = _ohlc_tendencia()
+        p = 14
+        port = _port_adx(h, l, c, p)
+        engine = _adx_series(h, l, c, p)
+        for a, b in zip(port, engine):
+            np.testing.assert_allclose(a[2 * p:], b[2 * p:], atol=1e-10)
+
+    def test_contra_engine_rango(self):
+        _, h, l, c = _ohlc_rango()
+        p = 14
+        port = _port_adx(h, l, c, p)
+        engine = _adx_series(h, l, c, p)
+        for a, b in zip(port, engine):
+            np.testing.assert_allclose(a[2 * p:], b[2 * p:], atol=1e-10)
+
+    def test_plus_di_domina_en_tendencia(self):
+        _, h, l, c = _ohlc_tendencia()
+        p = 14
+        _, pdi, mdi = _port_adx(h, l, c, p)
+        assert (pdi[2 * p:] > mdi[2 * p:]).mean() > 0.6
+
+
+# ============================================================
+# Ports de la segunda tanda de indicadores (Bloque 6 y 7)
+# ============================================================
+
+def _port_aroon(high, low, periodo):
+    """Fiel a zcsAroonUp/Down del runtime Pine: % del recorrido desde el
+    último extremo de la ventana; 100 cuando el extremo es la vela actual.
+    Empates -> extremo más reciente (ta.barssince)."""
+    hs, ls = pd.Series(high), pd.Series(low)
+    up = np.full(len(high), np.nan)
+    dn = np.full(len(high), np.nan)
+    p = int(periodo)
+    for i in range(p - 1, len(high)):
+        wh = hs.iloc[i - p + 1:i + 1].values[::-1]
+        wl = ls.iloc[i - p + 1:i + 1].values[::-1]
+        up[i] = 100.0 * (p - int(np.argmax(wh))) / p
+        dn[i] = 100.0 * (p - int(np.argmin(wl))) / p
+    return up, dn
+
+
+def _port_cmo(close, periodo):
+    """Fiel a zcsCmo(periodo) del runtime Pine."""
+    s = pd.Series(close)
+    delta = s.diff()
+    su = delta.clip(lower=0).rolling(periodo).sum()
+    sd = (-delta.clip(upper=0)).rolling(periodo).sum()
+    with np.errstate(divide='ignore', invalid='ignore'):
+        return (100.0 * (su - sd) / (su + sd)).values
+
+
+def _port_trix(close, periodo):
+    """Fiel a zcsTrix(periodo) del runtime Pine (EMAs ajustadas)."""
+    e1 = pd.Series(close).ewm(span=periodo, adjust=False).mean().values
+    e2 = pd.Series(e1).ewm(span=periodo, adjust=False).mean().values
+    e3 = pd.Series(e2).ewm(span=periodo, adjust=False).mean().values
+    trix = np.full(len(close), np.nan)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        trix[1:] = np.diff(e3) / e3[:-1] * 100.0
+    return trix
+
+
+def _port_rma_semilla_sma(serie, periodo):
+    """Fiel a ta.rma (semilla SMA de las primeras `periodo` velas)."""
+    serie = np.asarray(serie, dtype=float)
+    n = len(serie)
+    out = np.full(n, np.nan)
+    p = int(periodo)
+    if n >= p:
+        out[p - 1] = serie[:p].mean()
+        for i in range(p, n):
+            out[i] = (out[i - 1] * (p - 1) + serie[i]) / p
+    return out
+
+
+def _port_rsi_wilder(close, periodo):
+    """Fiel a ta.rsi (Wilder con RMA de semilla SMA): NaN en warmup."""
+    s = pd.Series(close)
+    delta = np.nan_to_num(s.diff().values, nan=0.0)
+    gan = np.where(delta > 0, delta, 0.0)
+    per = np.where(delta < 0, -delta, 0.0)
+    g = _port_rma_semilla_sma(gan, periodo)
+    d = _port_rma_semilla_sma(per, periodo)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        rs = g / np.where(d == 0, np.nan, d)
+    rsi = 100 - 100 / (1 + rs)
+    rsi = np.where((d == 0) & (g > 0), 100.0, rsi)
+    return rsi
+
+
+def _port_stochrsi(close, periodo):
+    """Fiel a zcsStochRsiK/D del runtime Pine (suavizados %K=3 y %D=3)."""
+    r = _port_rsi_wilder(close, periodo)
+    rs = pd.Series(r)
+    mn = rs.rolling(periodo).min().values
+    mx = rs.rolling(periodo).max().values
+    rango = mx - mn
+    raw = np.where(rango > 0, (r - mn) / np.where(rango > 0, rango, 1.0), 0.0)
+    k = pd.Series(raw).rolling(3).mean().values
+    d = pd.Series(k).rolling(3).mean().values
+    return k, d
+
+
+def _port_ichimoku(high, low, close, tenkan, kijun, senkou):
+    """Fiel a zcsIchimoku* del runtime Pine (Senkou alineadas)."""
+    hl2 = pd.Series((np.asarray(high, dtype=float)
+                     + np.asarray(low, dtype=float)) * 0.5)
+    tenkan_v = hl2.rolling(tenkan).mean().values
+    kijun_v = hl2.rolling(kijun).mean().values
+    sa = ((pd.Series(tenkan_v) + pd.Series(kijun_v)) * 0.5).values
+    sb = hl2.rolling(senkou).mean().values
+    n = len(close)
+    chikou = np.full(n, np.nan)
+    if n > 26:
+        chikou[26:] = np.asarray(close, dtype=float)[:n - 26]
+    return tenkan_v, kijun_v, sa, sb, chikou
+
+
+def _port_keltner(close, high, low, periodo, mult):
+    """Fiel a zcsKeltner* del runtime Pine: EMA ± mult×ATR (ta.atr)."""
+    media = pd.Series(close).ewm(span=periodo, adjust=False).mean().values
+    atr_v = _port_atr(high, low, close, periodo)
+    return media, media + mult * atr_v, media - mult * atr_v
+
+
+def _port_ttm(close, high, low, periodo, mult_bb, mult_kc):
+    """Fiel a zcsTtmSqueeze/Momentum del runtime Pine."""
+    c = pd.Series(close)
+    media = c.rolling(periodo).mean()
+    std = c.rolling(periodo).std(ddof=0)
+    bb_sup = media + mult_bb * std
+    bb_inf = media - mult_bb * std
+    k_media = c.ewm(span=periodo, adjust=False).mean()
+    atr_v = pd.Series(_port_atr(high, low, close, periodo))
+    kc_sup = k_media + mult_kc * atr_v
+    kc_inf = k_media - mult_kc * atr_v
+    sq = (bb_sup <= kc_sup) & (bb_inf >= kc_inf)
+    mid = pd.Series((np.asarray(high, dtype=float)
+                     + np.asarray(low, dtype=float)) * 0.5)
+    mom = (mid - mid.rolling(periodo).mean()).values
+    return sq.values, mom
+
+
+class TestAroon:
+    def test_contra_engine_tendencia(self):
+        _, h, l, c = _ohlc_tendencia()
+        p = 25
+        port = _port_aroon(h, l, p)
+        engine = _aroon_series(h, l, p)
+        for a, b in zip(port, engine):
+            np.testing.assert_allclose(a[p - 1:], b[p - 1:], atol=1e-10)
+
+    def test_contra_engine_rango(self):
+        _, h, l, c = _ohlc_rango()
+        p = 25
+        port = _port_aroon(h, l, p)
+        engine = _aroon_series(h, l, p)
+        for a, b in zip(port, engine):
+            np.testing.assert_allclose(a[p - 1:], b[p - 1:], atol=1e-10)
+
+    def test_extremo_actual_da_cien(self):
+        # forzamos el máximo en la última vela -> Aroon Up = 100 ahí
+        rng = np.random.default_rng(3)
+        n = 300
+        h = 100 + np.cumsum(rng.normal(0, 1, n))
+        h[-1] = h[:-1].max() + 1.0
+        l = h - 2.0
+        p = 25
+        up, _dn = _port_aroon(h, l, p)
+        assert abs(up[-1] - 100.0) < 1e-9
+
+
+class TestCmo:
+    def test_contra_engine_tendencia(self):
+        _, _, _, c = _ohlc_tendencia()
+        p = 14
+        port = _port_cmo(c, p)
+        engine = _cmo_serie(c, p)
+        np.testing.assert_allclose(port[p:], engine[p:], atol=1e-10)
+
+    def test_contra_engine_rango(self):
+        _, _, _, c = _ohlc_rango()
+        p = 14
+        port = _port_cmo(c, p)
+        engine = _cmo_serie(c, p)
+        np.testing.assert_allclose(port[p:], engine[p:], atol=1e-10)
+
+
+class TestTrix:
+    def test_contra_engine_tendencia(self):
+        _, _, _, c = _ohlc_tendencia()
+        p = 15
+        port = _port_trix(c, p)
+        engine = _trix_serie(c, p)
+        np.testing.assert_allclose(port[p:], engine[p:], atol=1e-10)
+
+
+class TestStochRsi:
+    def test_contra_engine_convergido(self):
+        # el motor usa un RSI con semilla ewm y el runtime ta.rsi (semilla
+        # SMA): las diferencias decaen como (1-1/p)^k, así que se compara
+        # desde un índice lejano donde ambas han convergido
+        rng = np.random.default_rng(9)
+        n = 4000
+        c = 100 + np.cumsum(rng.normal(0.001, 0.5, n))
+        p = 14
+        port = _port_stochrsi(c, p)
+        engine = _stochrsi_series(c, p)
+        for a, b in zip(port, engine):
+            np.testing.assert_allclose(a[60 * p:], b[60 * p:], atol=1e-9)
+
+
+class TestIchimoku:
+    def test_contra_engine_tendencia(self):
+        _, h, l, c = _ohlc_tendencia()
+        port = _port_ichimoku(h, l, c, 9, 26, 52)
+        engine = _ichimoku_series(h, l, c, 9, 26, 52)
+        for a, b in zip(port, engine):
+            np.testing.assert_allclose(a[51:], b[51:], atol=1e-10)
+
+    def test_chikou_es_el_cierre_de_hace_26(self):
+        _, _, _, c = _ohlc_tendencia()
+        port = _port_ichimoku(c, c, c, 9, 26, 52)
+        _, _, _, _, chikou = port
+        np.testing.assert_allclose(chikou[26:], c[:-26], atol=1e-12)
+
+
+class TestKeltner:
+    def test_contra_engine_tendencia(self):
+        _, h, l, c = _ohlc_tendencia()
+        p, mult = 20, 2.0
+        port = _port_keltner(c, h, l, p, mult)
+        engine = _keltner_series(c, h, l, p, mult)
+        for a, b in zip(port, engine):
+            np.testing.assert_allclose(a[p:], b[p:], atol=1e-10)
+
+    def test_media_es_la_ema(self):
+        _, _, _, c = _ohlc_rango()
+        p, mult = 20, 2.0
+        port = _port_keltner(c, c, c, p, mult)
+        np.testing.assert_allclose(
+            port[0], pd.Series(c).ewm(span=p, adjust=False).mean().values,
+            atol=1e-10)
+
+
+class TestTtm:
+    def test_contra_engine_tendencia(self):
+        _, h, l, c = _ohlc_tendencia()
+        p = 20
+        port = _port_ttm(c, h, l, p, 2.0, 1.5)
+        engine = _ttm_squeeze_series(c, h, l, p, 2.0, 1.5)
+        for a, b in zip(port, engine):
+            np.testing.assert_allclose(a[p:].astype(float), b[p:].astype(float),
+                                       atol=1e-10)
+
+    def test_squeeze_detecta_compresion(self):
+        # cierre plano con ruido mínimo y rango real (h/l): el ATR supera al
+        # desvío del cierre -> Bollinger queda dentro de Keltner -> squeeze
+        rng = np.random.default_rng(4)
+        n = 300
+        c = np.full(n, 100.0) + rng.normal(0, 0.002, n)
+        h, l = c + 0.01, c - 0.01
+        sq, _mom = _port_ttm(c, h, l, 20, 2.0, 1.5)
+        assert sq[100:].mean() > 0.5
+
+
+# ============================================================
 # Test de cobertura
 # ============================================================
 
@@ -575,7 +1005,13 @@ _FUNCIONES_RUNTIME = {
     'zcsEr', 'zcsKama', 'zcsDonchianSup', 'zcsDonchianInf',
     'zcsStochK', 'zcsStochD', 'zcsStdevRet', 'zcsSar',
     'zcsPercentilRodante', 'zcsCruzaArriba', 'zcsCruzaAbajo',
-    'zcsUnidadesPorRiesgo',
+    'zcsUnidadesPorRiesgo', 'zcsSupertrend', 'zcsMacd', 'zcsAdx',
+    'zcsAroonUp', 'zcsAroonDown', 'zcsCmo', 'zcsTrix',
+    'zcsStochRsiK', 'zcsStochRsiD',
+    'zcsIchimokuTenkan', 'zcsIchimokuKijun', 'zcsIchimokuSenkouA',
+    'zcsIchimokuSenkouB', 'zcsIchimokuChikou',
+    'zcsKeltnerMedia', 'zcsKeltnerSup', 'zcsKeltnerInf',
+    'zcsTtmSqueeze', 'zcsTtmMomentum',
 }
 
 
@@ -599,6 +1035,25 @@ def test_todas_las_funciones_runtime_tienen_prueba_diferencial():
         'zcsCruzaArriba': 'TestCruces',
         'zcsCruzaAbajo': 'TestCruces',
         'zcsUnidadesPorRiesgo': 'TestUnidadesPorRiesgo',
+        'zcsSupertrend': 'TestSupertrend',
+        'zcsMacd': 'TestMacd',
+        'zcsAdx': 'TestAdx',
+        'zcsAroonUp': 'TestAroon',
+        'zcsAroonDown': 'TestAroon',
+        'zcsCmo': 'TestCmo',
+        'zcsTrix': 'TestTrix',
+        'zcsStochRsiK': 'TestStochRsi',
+        'zcsStochRsiD': 'TestStochRsi',
+        'zcsIchimokuTenkan': 'TestIchimoku',
+        'zcsIchimokuKijun': 'TestIchimoku',
+        'zcsIchimokuSenkouA': 'TestIchimoku',
+        'zcsIchimokuSenkouB': 'TestIchimoku',
+        'zcsIchimokuChikou': 'TestIchimoku',
+        'zcsKeltnerMedia': 'TestKeltner',
+        'zcsKeltnerSup': 'TestKeltner',
+        'zcsKeltnerInf': 'TestKeltner',
+        'zcsTtmSqueeze': 'TestTtm',
+        'zcsTtmMomentum': 'TestTtm',
     }
     faltantes = _FUNCIONES_RUNTIME - set(cobertura)
     assert not faltantes, f"Funciones runtime sin test: {faltantes}"

@@ -211,6 +211,12 @@ _KPIS = [
          formato=_pct, color=lambda v: _escala(abs(v), 0.01, 0.03, invertido=True),
          tooltip="Pérdida que solo se supera el 5% de las velas (percentil 5)."),
 
+    dict(clave='cvar95', titulo='CVaR 95%', sub='media de la cola', fuente='global',
+         formato=_pct, color=lambda v: _escala(abs(v), 0.02, 0.05, invertido=True),
+         tooltip="Expected Shortfall: pérdida MEDIA de las velas que caen en el "
+                 "peor 5%. Siempre es mayor (en magnitud) que el VaR 95%; cuanto "
+                 "más se aleje de él, más gordas son las colas del activo."),
+
     dict(clave='es_normal', titulo='Distribución normal', sub=_sub_normalidad,
          fuente='global', formato=lambda v: "SÍ" if v else "NO",
          color=_color_normalidad,
@@ -467,6 +473,7 @@ class _Tarjeta(QFrame):
     def _mostrar_popup_hover(self):
         popup = QWidget(self, Qt.WindowType.ToolTip)
         popup.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        popup.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         popup.setStyleSheet(
             "QWidget { background-color: #0d1424; border: 2px solid #253a60;"
             " border-radius: 6px; }"

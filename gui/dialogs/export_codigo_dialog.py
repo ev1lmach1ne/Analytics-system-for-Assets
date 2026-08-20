@@ -19,14 +19,15 @@ import os
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
-    QApplication, QCheckBox, QDialog, QFileDialog, QFrame, QGridLayout,
-    QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QScrollArea,
+    QApplication, QCheckBox, QDialog, QFrame, QGridLayout,
+    QHBoxLayout, QLabel, QLineEdit, QPushButton, QScrollArea,
     QSizePolicy, QVBoxLayout,
 )
 
 import core.codegen as codegen
 from core.codegen import fidelidad
 from core.config import SISTEMAS_DIR
+from gui.dialogs.mensajes import aviso, error, informacion, elegir_directorio
 
 # Se escribe directamente bajo Sistemas/, sin un nivel intermedio: el árbol ya
 # tiene que llevar dentro la estructura que espera cada plataforma (MetaTrader
@@ -324,7 +325,7 @@ class DialogoExportarCodigo(QDialog):
         analisis = self._analisis(['tradingview'])['tradingview']
         if self._plataformas_bloqueadas_por_noticias(
                 {'tradingview': analisis}):
-            QMessageBox.warning(
+            aviso(
                 self, "Filtro de noticias no soportado",
                 "El filtro «Evitar noticias» no está permitido para "
                 "TradingView: el robot no funcionará siguiendo las mismas "
@@ -335,7 +336,7 @@ class DialogoExportarCodigo(QDialog):
                        codegen.ir.ir_sistema(self._setups, self._config)['setups']
                        if s['indice'] not in analisis['bloqueados']]
         if not exportables:
-            QMessageBox.warning(
+            aviso(
                 self, "No hay nada que copiar",
                 "Ningún setup de este sistema se puede generar todavía en "
                 "Pine Script: lo que falta es su propia señal.")
@@ -345,31 +346,31 @@ class DialogoExportarCodigo(QDialog):
             codigo = codegen.codigo_de_setup(
                 self._setups, self._config, 'tradingview', indice, self._meta)
         except Exception as e:                      # noqa: BLE001
-            QMessageBox.critical(self, "No se ha podido generar",
-                                 f"{type(e).__name__}: {e}")
+            error(self, "No se ha podido generar",
+                  f"{type(e).__name__}: {e}")
             return
         QApplication.clipboard().setText(codigo)
 
-        aviso = ""
+        nota = ""
         if len(exportables) > 1:
-            aviso = (f"\n\nEste sistema tiene {len(exportables)} setups y cada "
+            nota = (f"\n\nEste sistema tiene {len(exportables)} setups y cada "
                      f"uno es un script aparte: se ha copiado el S{indice}. "
                      f"Para los demás, usa Exportar.")
         omitido = ("\n\nOJO: hay diferencias con el backtest. Pulsa Exportar "
                    "para verlas y para tener NOTAS_DE_FIDELIDAD.md."
                    if analisis['avisos'] else "")
         self.btn_copiar.setText("✓ Copiado")
-        QMessageBox.information(
+        informacion(
             self, "Pine copiado al portapapeles",
             f"Pega con Ctrl+V en el Pine Editor de TradingView "
             f"(gráfico de {self._meta.get('activo', '?')}, "
-            f"{self._meta.get('tf', '?')}).{aviso}{omitido}")
+            f"{self._meta.get('tf', '?')}).{nota}{omitido}")
 
     def _examinar(self):
         actual = self.txt_destino.text().strip()
         if not os.path.isdir(actual):
             actual = SISTEMAS_DIR
-        ruta = QFileDialog.getExistingDirectory(
+        ruta = elegir_directorio(
             self, "Carpeta donde escribir el código", actual)
         if ruta:
             self.txt_destino.setText(ruta)
@@ -380,8 +381,8 @@ class DialogoExportarCodigo(QDialog):
             return
         nombre = self.txt_nombre.text().strip()
         if not nombre:
-            QMessageBox.warning(self, "Falta el nombre",
-                                "Pon un nombre para la carpeta del sistema.")
+            aviso(self, "Falta el nombre",
+                  "Pon un nombre para la carpeta del sistema.")
             return
         destino = self.txt_destino.text().strip() or CARPETA_DEFECTO
 
@@ -393,7 +394,7 @@ class DialogoExportarCodigo(QDialog):
         if bloqueadas:
             nombres = ', '.join(
                 codegen.plataforma(c)['nombre'] for c in sorted(bloqueadas))
-            QMessageBox.warning(
+            aviso(
                 self, "Filtro de noticias no soportado",
                 f"El filtro «Evitar noticias» no está permitido para "
                 f"{nombres}: el robot no funcionará siguiendo las mismas "
@@ -411,7 +412,7 @@ class DialogoExportarCodigo(QDialog):
                 self._setups, self._config, claves, destino, nombre,
                 self._meta)
         except Exception as e:                      # noqa: BLE001
-            QMessageBox.critical(
+            error(
                 self, "No se ha podido exportar",
                 f"{type(e).__name__}: {e}")
             return

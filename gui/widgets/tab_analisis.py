@@ -1,9 +1,9 @@
 import os, json, re, glob, pickle
 from datetime import datetime
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
-                             QLabel, QComboBox, QFrame, QFileDialog, QTextBrowser,
+                             QLabel, QComboBox, QFrame, QTextBrowser,
                              QTabWidget, QProgressBar, QScrollArea, QSizePolicy,
-                             QMessageBox, QStackedWidget)
+                             QStackedWidget)
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont, QColor
 from gui.widgets.pdf_viewer import PdfViewer
@@ -13,6 +13,7 @@ from gui.widgets.analisis_tarjetas import TarjetasKPI
 from gui.widgets.plot_common import icono_ayuda
 from gui.widgets.bombear import bombear_eventos
 from gui.widgets import STYLE_ETIQUETA_SIN_CAJA
+from gui.dialogs.mensajes import confirmar, guardar_archivo
 from core.config import tf_to_minutes
 
 _CHEVRON_SVG = os.path.join(os.path.dirname(__file__), '..', 'assets',
@@ -914,12 +915,8 @@ class TabAnalisis(QWidget):
             return
 
         label = self.periodo_combo.itemText(idx)
-        reply = QMessageBox.question(
-            self, "Confirmar eliminación",
-            f"¿Eliminar el análisis del periodo {label}?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
-        if reply != QMessageBox.StandardButton.Yes:
+        if not confirmar(self, "Confirmar eliminación",
+                         f"¿Eliminar el análisis del periodo {label}?"):
             return
 
         # Liberar el PDF actual del visor ANTES de borrarlo: en Windows el
@@ -1060,7 +1057,7 @@ class TabAnalisis(QWidget):
         rango = f"_{m.group(1)}_to_{m.group(2)}" if m else ""
         horizon = self.horizon.currentText() if self.horizon else 'General'
         sufijo_h = f"_{horizon}" if (self._page_map and horizon != 'General') else ""
-        path, _ = QFileDialog.getSaveFileName(
+        path, _ = guardar_archivo(
             self, "Guardar PDF",
             f"informe_{self._ticker}_{self._tf}{rango}{sufijo_h}.pdf",
             "PDF (*.pdf)"

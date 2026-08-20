@@ -18,7 +18,8 @@ from core.strategies import ESTRATEGIAS, _filtros_por_defecto
 
 META = {'sistema': 'sistema de prueba', 'activo': 'ZCMAIZ', 'tf': '1d'}
 
-PLANTILLAS_EMITIBLES = [p for p in ESTRATEGIAS if p != 'Patrones de velas']
+PLANTILLAS_EMITIBLES = [p for p in ESTRATEGIAS
+                        if p not in fidelidad.PLANTILLAS_SIN_EMISOR]
 
 
 def _generar(plantilla='RSI', **extra):
@@ -160,6 +161,25 @@ def test_el_break_even_en_r_usa_la_distancia_y_en_atr_el_atr():
         'RSI', be_atr=1.0, be_unidad='atr')
 
 
+def test_la_entrada_escalonada_emite_tramos():
+    """Cada tramo adicional abre posición con su propio tamaño de riesgo y el
+    estado zcsTramoActual/zcsTramoOrden para no repetir ni solapar."""
+    tramos = [{'pct': 50.0, 'trigger': 'senal', 'val': 0.0, 'condiciones': []},
+              {'pct': 50.0, 'trigger': 'retroceso', 'val': 1.0,
+               'condiciones': []}]
+    codigo = _generar('RSI', tramos=tramos)
+    assert 'zcsTramoActual' in codigo and 'zcsTramoOrden' in codigo
+    assert 'zcsLotesPorRiesgo(p_riesgo_pct / 100.0 * 0.5, distTramo)' in codigo
+    assert '(l1 <= precioIn - 1.0 * atrGestion)' in codigo
+    assert 'distTramo' in codigo
+
+
+def test_un_solo_tramo_no_genera_escalonado():
+    codigo = _generar('RSI')
+    assert 'zcsTramoActual' not in codigo
+    assert 'distTramo' not in codigo
+
+
 def test_cada_setup_tiene_su_propio_magic_number():
     """Cada setup se exporta a su EA: sin magic propio se pisarían las
     posiciones entre ellos."""
@@ -200,11 +220,11 @@ def test_la_cabecera_lleva_las_notas_de_fidelidad():
 
 def test_un_sistema_con_omisiones_avisa_al_arrancar():
     """El filtro de noticias NO sirve aquí: en MQL5 está aproximado (hay
-    calendario nativo), no omitido. La entrada escalonada sí está omitida
-    mientras el generador no la emita."""
+    calendario nativo), no omitido. Las salidas parciales sí están omitidas
+    mientras el generador no las emita."""
     codigo = _generar('RSI',
-                      tramos=[{'pct': 60.0, 'trigger': 'senal'},
-                              {'pct': 40.0, 'trigger': 'retroceso', 'val': 1.0}])
+                      parciales=[{'pct': 50.0, 'trigger': 'r', 'r': 1.5},
+                                 {'pct': 50.0, 'trigger': 'senal'}])
     assert 'AVISO DE FIDELIDAD' in codigo
     assert re.search(r'Print\("AVISO DE FIDELIDAD', codigo)
 
@@ -230,9 +250,11 @@ def test_un_nodo_desconocido_lanza():
         EmisorMQL5().expr({'op': 'inventado', 'partes': []})
 
 
-def test_el_hurst_lanza_porque_aun_no_esta_portado():
-    with pytest.raises(ValueError, match='Hurst'):
-        EmisorMQL5().declarar_serie('h_1', {'tipo': 'HURST', 'periodo': 400})
+def test_el_hurst_ya_se_emite_porque_esta_portado():
+    """El Hurst se porta al runtime (zcsHurst) y el emisor lo declara."""
+    codigo = EmisorMQL5().declarar_serie('h_1', {'tipo': 'HURST',
+                                                 'periodo': 400})
+    assert 'zcsHurst(400, 1)' in codigo
 
 
 # ══════════════ archivos ══════════════

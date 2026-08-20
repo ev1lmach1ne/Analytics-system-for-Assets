@@ -1,0 +1,15 @@
+{
+  "resumen_ejecutivo": "Cambio en 0 archivo(s) (451+ / 43- líneas).",
+  "modificaciones_clave": [
+    {
+      "archivo": "(desconocido)",
+      "motivo": "diff vacío o sin formato unificado"
+    }
+  ],
+  "impacto_tecnico": [
+    "módulos no mapeados automáticamente"
+  ],
+  "tags": [
+    "cambio_tecnico"
+  ]
+}

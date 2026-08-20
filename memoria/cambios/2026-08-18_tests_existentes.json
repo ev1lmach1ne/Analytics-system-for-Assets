@@ -1,0 +1,20 @@
+{
+  "resumen_ejecutivo": "Cambio en 2 archivo(s) (377+ / 25- líneas).",
+  "modificaciones_clave": [
+    {
+      "archivo": "tests/test_codegen_fidelidad.py",
+      "motivo": "modificación detectada en el diff (revisar hunks)"
+    },
+    {
+      "archivo": "tests/test_runtime_diferencial.py",
+      "motivo": "modificación detectada en el diff (revisar hunks)"
+    }
+  ],
+  "impacto_tecnico": [
+    "suite de pruebas (tests/)"
+  ],
+  "tags": [
+    "test_codegen_fidelidad",
+    "test_runtime_diferencial"
+  ]
+}

@@ -15,7 +15,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QApplication, QScrollArea, QPushButton, QLabel  # noqa: E402
 
 from gui.widgets.plot_common import (  # noqa: E402
-    _PopupAyuda, panel_flotante_dialog, PanelFlotanteDialog,
+    _OverlayAyuda, panel_flotante_dialog, PanelFlotanteDialog,
 )
 from gui.questdb_bootstrap import _DialogoBootstrap, _SpinnerCircular  # noqa: E402
 
@@ -26,19 +26,22 @@ def app():
 
 
 def test_popup_sin_barras_de_scroll(app):
-    popup = _PopupAyuda([('Lógica', 'texto de lógica para la primera pestaña'),
-                         ('Uso', 'texto de uso para la segunda pestaña')])
+    popup = _OverlayAyuda([('Lógica', 'texto de lógica para la primera pestaña'),
+                           ('Uso', 'texto de uso para la segunda pestaña')],
+                          None, None)
     assert not popup.findChildren(QScrollArea), \
         "el popup no debe tener barras de desplazamiento"
     assert popup.findChildren(QLabel)
+    popup.close()
 
 
 def test_popup_se_anima_al_mostrar(app):
-    popup = _PopupAyuda([('Ayuda', 'explicación breve')])
-    assert popup.windowOpacity() == 1.0
-    popup.show()
-    assert hasattr(popup, '_anim_fade')
-    assert hasattr(popup, '_anim_slide')
+    popup = _OverlayAyuda([('Ayuda', 'explicación breve')], None, None)
+    assert popup._anim_fade is None
+    popup._fade_in()
+    assert popup._anim_fade is not None
+    assert popup.graphicsEffect() is not None
+    popup.close()
 
 
 def test_dialogo_flotante_sin_marco_con_boton_cerrar(app):

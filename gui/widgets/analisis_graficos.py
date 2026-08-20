@@ -21,17 +21,18 @@ from PyQt6.QtGui import QShortcut, QKeySequence
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame,
                              QTabWidget, QScrollArea, QGroupBox, QTableWidget,
                              QTableWidgetItem, QHeaderView, QAbstractItemView,
-                             QApplication)
+                             QApplication, QToolButton, QButtonGroup)
 
 from matplotlib.collections import LineCollection
 from matplotlib.lines import Line2D
 from matplotlib.dates import date2num, AutoDateLocator, ConciseDateFormatter
 
+from core.config import tf_to_minutes
 from gui.widgets.plot_common import (
     make_canvas, style_ax, ax_placeholder, leyenda, icono_ayuda, no_crash,
-    BarraGrafico, fmt, agregar_crosshair, eje_fechas, FIG_BG, AX_FG, GRID_C,
-    VERDE, ROJO, GRIS, AMBAR, AZUL, NARANJA, TEXTO_TENUE, ER_TENDENCIA,
-    ER_TRANSICION, ER_RUIDO)
+    BarraGrafico, fmt, agregar_crosshair, agregar_hover_celdas, eje_fechas,
+    FIG_BG, AX_FG, GRID_C, VERDE, ROJO, GRIS, AMBAR, AZUL, NARANJA,
+    TEXTO_TENUE, ER_TENDENCIA, ER_TRANSICION, ER_RUIDO)
 from gui.widgets.bombear import bombear_eventos
 
 ESTILO = """
@@ -43,6 +44,18 @@ QGroupBox {
 }
 QLabel#titulo { color: #4fc3f7; font-size: 12px; font-weight: bold; }
 QLabel#aviso { color: #5a7a9a; font-size: 11px; }
+QToolButton {
+    color: #8fb3d9; background: transparent; border: 1px solid #253a60;
+    border-radius: 4px; padding: 2px 8px; font-size: 10px;
+}
+QToolButton:hover { border-color: #4a8bc2; }
+QToolButton:checked {
+    color: #4fc3f7; border-color: #4fc3f7; background-color: #0d1424;
+    font-weight: bold;
+}
+QToolButton:disabled {
+    color: #3a4a5c; border-color: #1a2538; background: transparent;
+}
 QTabWidget::pane { background-color: #0d1424; border: 1px solid #253a60; border-top: none; }
 QTabBar { background-color: #141e30; border: none; }
 QTabBar::tab {
@@ -122,10 +135,29 @@ def _campana(ax, media, std, sigmas, sufijo_freq, titulo, vars_=None):
                     f"VaR ({clave[2:]}%): {val:.2%}\n({txt})",
                     color=color, fontsize=5.5, ha='center', fontweight='bold',
                     bbox=dict(facecolor='#0d1424', alpha=0.85, edgecolor='none', pad=0.6))
+        # CVaR (Expected Shortfall): media de la cola más allá del VaR. Se
+        # dibuja en línea discontinua y sus etiquetas cuelgan por debajo de
+        # las del VaR para no solaparse.
+        for i, (clave, color) in enumerate((('cvar95', '#BA7517'), ('cvar99', ROJO))):
+            info = vars_.get(clave)
+            if info is None:
+                continue
+            val = info['val']
+            ax.axvline(val, color=color, linewidth=1.4, alpha=0.75, linestyle='--')
+            prob = info['prob']
+            txt = f"1 c/{1/prob:.1f}{sufijo_freq}" if prob > 0 else "No reg."
+            ax.text(val, -ymax * (0.30 if i == 0 else 0.42),
+                    f"CVaR ({clave[4:]}%): {val:.2%}\n({txt})",
+                    color=color, fontsize=5.5, ha='center', fontweight='bold',
+                    bbox=dict(facecolor='#0d1424', alpha=0.85, edgecolor='none', pad=0.6))
 
-    ax.set_ylim(-ymax * 0.26, ymax * 1.15)
+    # si la campana lleva CVaR, sus etiquetas cuelgan por debajo de las del
+    # VaR y hace falta abrir el límite inferior del eje
+    ymin = -ymax * (0.50 if (vars_ and any(k.startswith('cvar') for k in vars_)) else 0.26)
+    ax.set_ylim(ymin, ymax * 1.15)
     ax.set_title(titulo, fontsize=9, pad=6)
     leyenda(ax, loc='upper right', fontsize=6)
+    return x, y
 
 
 def _heatmap(fig, ax, m, xlabels, ylabels, cmap, vmin, vmax, titulo,
@@ -243,7 +275,7 @@ def _dib_precio_equity(fig, b, h):
 
     agregar_crosshair(fig, [ax1, ax2, ax3], x, [close_arr, eq_arr, dd_arr],
                       _texto_hover, nombre='precio_equity',
-                      colores=[VERDE, '#58a6ff', '#f85149'])
+                      colores=[VERDE, '#58a6ff', '#f85149'], linestyle='--')
 
 
 def _dib_estacionalidad(fig, b, h):
@@ -271,6 +303,14 @@ def _dib_estacionalidad(fig, b, h):
             if v != 0:
                 ax.text(j, v, f'{v:.1f}%', ha='center',
                         va='bottom' if v > 0 else 'top', color=AX_FG, fontsize=6.5)
+
+        def _texto_est(idx, labels=labels, vals=vals):
+            return [f"{labels[idx]} → {vals[idx]:+.2f}%"]
+
+        agregar_crosshair(fig, [ax], np.arange(len(vals)), [vals],
+                          _texto_est, nombre=f'estacionalidad_{clave}',
+                          colores=[VERDE], linestyle='--', horizontal=True,
+                          x_texto_fn=lambda i, labels=labels: labels[i])
 
 
 def _regimen_suavizado(er, ventana, umbral_tendencia=0.5, umbral_ruido=0.3):
@@ -420,6 +460,27 @@ def _dib_regimen_er(fig, b, h):
     ax_e.set_ylabel('ER', fontsize=7)
     leyenda(ax_e, loc='upper right', ncol=2, fontsize=6)
 
+    # Lupa/pan/Home sincronizados entre los dos paneles (comparten el eje X).
+    # Al compartir el eje, matplotlib oculta las fechas del panel superior y
+    # las deja solo en el inferior.
+    ax_e.sharex(ax_p)
+
+    def _texto_er(idx):
+        idx = min(idx, len(close) - 1)
+        er_val = er[idx]
+        if er_val > umbral_tendencia:
+            regimen = 'Tendencia'
+        elif er_val < umbral_ruido:
+            regimen = 'Ruido'
+        else:
+            regimen = 'Transición'
+        return [f"Precio: {fmt(close[idx], 4)}\nRégimen: {regimen}",
+                f"ER: {er_val:.3f} ({regimen})"]
+
+    agregar_crosshair(fig, [ax_p, ax_e], x_raw, [close, er], _texto_er,
+                      nombre='regimen_er', colores=[AZUL, '#d29922'],
+                      linestyle='--', horizontal=True)
+
 
 def _dib_riesgo_dia_anual(fig, b, h):
     d = b.get('riesgo_dia_anual')
@@ -429,11 +490,28 @@ def _dib_riesgo_dia_anual(fig, b, h):
     gs = fig.add_gridspec(2, 1, hspace=0.16)
 
     dia = d['diario']
-    _campana(fig.add_subplot(gs[0]), dia['media'], dia['std'], dia['sigmas'],
-             'd', 'Retorno diario (proyección)')
+    ax_d = fig.add_subplot(gs[0])
+    x_d, y_d = _campana(ax_d, dia['media'], dia['std'], dia['sigmas'],
+                        'd', 'Retorno diario (proyección)')
     anual = d['anual']
-    _campana(fig.add_subplot(gs[1]), anual['media'], anual['std'], anual['sigmas'],
-             'añ', 'Retorno anual (proyección)')
+    ax_a = fig.add_subplot(gs[1])
+    x_a, y_a = _campana(ax_a, anual['media'], anual['std'], anual['sigmas'],
+                        'añ', 'Retorno anual (proyección)')
+
+    def _texto_campana(x_curva, y_curva, media, std):
+        def _texto(idx):
+            val = x_curva[idx]
+            bandas = int(abs(val - media) / std) if std else 0
+            banda = ('>3σ' if bandas > 3 else f'{bandas}σ') if bandas else '<1σ'
+            return [f"Retorno: {val:.2%}\nDensidad: {y_curva[idx]:.3f} · {banda}"]
+        return _texto
+
+    agregar_crosshair(fig, [ax_d], x_d, [y_d],
+                      _texto_campana(x_d, y_d, dia['media'], dia['std']),
+                      nombre='campana_diaria', colores=[AZUL], linestyle='--')
+    agregar_crosshair(fig, [ax_a], x_a, [y_a],
+                      _texto_campana(x_a, y_a, anual['media'], anual['std']),
+                      nombre='campana_anual', colores=[AZUL], linestyle='--')
 
 
 def _dib_qqplot(fig, b, h):
@@ -448,7 +526,8 @@ def _dib_qqplot(fig, b, h):
     style_ax(ax)
     qq = d['qq']
     osm = np.asarray(qq['osm'], dtype=float)
-    ax.scatter(osm, np.asarray(qq['osr'], dtype=float), color='#58a6ff', s=6, alpha=0.4)
+    osr = np.asarray(qq['osr'], dtype=float)
+    ax.scatter(osm, osr, color='#58a6ff', s=6, alpha=0.4)
     ax.plot(osm, qq['slope'] * osm + qq['intercept'], color=ROJO,
             linewidth=1.1, linestyle='--')
     ax.set_title('QQ-Plot: retornos vs Normal', fontsize=9)
@@ -456,6 +535,12 @@ def _dib_qqplot(fig, b, h):
     ax.set_ylabel('Cuantiles observados', fontsize=7)
     ax.text(0.98, 0.05, f"R² ajuste: {qq['r_sq']:.4f}", transform=ax.transAxes,
             ha='right', va='bottom', fontsize=7, color=TEXTO_TENUE, fontweight='bold')
+
+    def _texto_qq(idx):
+        return [f"Q. teórico: {osm[idx]:.2f}\nQ. observado: {osr[idx]:.2%}"]
+
+    agregar_crosshair(fig, [ax], osm, [osr], _texto_qq, nombre='qqplot',
+                      colores=['#58a6ff'], linestyle='--')
 
 
 def _dib_riesgo_intradia(fig, b, h):
@@ -466,11 +551,28 @@ def _dib_riesgo_intradia(fig, b, h):
     gs = fig.add_gridspec(3, 1, hspace=0.14, height_ratios=[1, 1, 0.9])
     tf = b.get('_meta', {}).get('tf', '')
 
-    _campana(fig.add_subplot(gs[0]), d['media'], d['std'], d['sigmas'],
-             'vel', f'Retorno por vela {tf}')
-    _campana(fig.add_subplot(gs[1]), d['media'], d['std'], {}, 'vel',
-             f"VaR {'paramétrico' if d.get('es_normal') else 'histórico'} ({tf})",
-             vars_=d.get('var'))
+    ax_c1 = fig.add_subplot(gs[0])
+    x_c1, y_c1 = _campana(ax_c1, d['media'], d['std'], d['sigmas'],
+                          'vel', f'Retorno por vela {tf}')
+    ax_c2 = fig.add_subplot(gs[1])
+    x_c2, y_c2 = _campana(ax_c2, d['media'], d['std'], {}, 'vel',
+                          f"VaR {'paramétrico' if d.get('es_normal') else 'histórico'} ({tf})",
+                          vars_=d.get('var'))
+
+    def _texto_campana_vela(x_curva, y_curva, media, std):
+        def _texto(idx):
+            val = x_curva[idx]
+            bandas = int(abs(val - media) / std) if std else 0
+            banda = ('>3σ' if bandas > 3 else f'{bandas}σ') if bandas else '<1σ'
+            return [f"Retorno: {val:.2%}\nDensidad: {y_curva[idx]:.3f} · {banda}"]
+        return _texto
+
+    agregar_crosshair(fig, [ax_c1], x_c1, [y_c1],
+                      _texto_campana_vela(x_c1, y_c1, d['media'], d['std']),
+                      nombre='campana_vela', colores=[AZUL], linestyle='--')
+    agregar_crosshair(fig, [ax_c2], x_c2, [y_c2],
+                      _texto_campana_vela(x_c2, y_c2, d['media'], d['std']),
+                      nombre='campana_var', colores=[AZUL], linestyle='--')
 
     ax = fig.add_subplot(gs[2])
     style_ax(ax)
@@ -478,9 +580,11 @@ def _dib_riesgo_intradia(fig, b, h):
     if rol:
         x = _x(rol['x'])
         et = rol.get('etiqueta_ventana', '')
-        ax.plot(x, rol['var95_pct'], color='#BA7517', linewidth=0.7, label=f'VaR 95% ({et})')
-        ax.plot(x, rol['var99_pct'], color=ROJO, linewidth=0.7, label=f'VaR 99% ({et})')
-        ax.fill_between(x, rol['var95_pct'], alpha=0.08, color='#BA7517')
+        var95 = np.asarray(rol['var95_pct'], dtype=float)
+        var99 = np.asarray(rol['var99_pct'], dtype=float)
+        ax.plot(x, var95, color='#BA7517', linewidth=0.7, label=f'VaR 95% ({et})')
+        ax.plot(x, var99, color=ROJO, linewidth=0.7, label=f'VaR 99% ({et})')
+        ax.fill_between(x, var95, alpha=0.08, color='#BA7517')
         ax.axhline(d['p05_pct'], color='#BA7517', linewidth=0.8, linestyle='--', alpha=0.6,
                    label=f"P5 todo el periodo: {d['p05_pct']:.2f}%")
         ax.axhline(d['p01_pct'], color=ROJO, linewidth=0.8, linestyle='--', alpha=0.6,
@@ -488,6 +592,13 @@ def _dib_riesgo_intradia(fig, b, h):
         ax.set_title(f'Rolling VaR (ventana {et})', fontsize=9)
         _eje_fechas(ax, x)
         leyenda(ax, loc='lower left', fontsize=6)
+
+        def _texto_var(idx):
+            return [f"VaR 95%: {var95[idx]:.2f}%\nVaR 99%: {var99[idx]:.2f}%"]
+
+        agregar_crosshair(fig, [ax], x, [var95], _texto_var,
+                          nombre='rolling_var', colores=['#BA7517'],
+                          linestyle='--', horizontal=True)
     else:
         ax_placeholder(ax, "Datos insuficientes para Rolling VaR.")
     ax.set_ylabel('Pérdida %', fontsize=7)
@@ -569,6 +680,17 @@ def _dib_perfil_horario(fig, b, h):
     _marcar_sesiones(ax2, y1)
     leyenda(ax2, loc='upper right')
 
+    def _texto_hora(idx):
+        stats = d['bxp'][idx]
+        return [f"Hora {idx:02d}:00\nMediana: {stats['med']:.4f}% · Media: {stats['mean']:.4f}%\nN: {stats['n']} velas",
+                f"Retorno acum.: {vals[idx]:+.2f}%"]
+
+    medias = np.asarray(d['medias'], dtype=float)
+    agregar_crosshair(fig, [ax1, ax2], np.arange(24), [medias, vals],
+                      _texto_hora, nombre='perfil_horario',
+                      colores=[ROJO, AMBAR], linestyle='--', horizontal=True,
+                      x_texto_fn=lambda i: f"{i:02d}:00")
+
 
 def _dib_corr24(fig, b, h):
     d = b.get('corr_24')
@@ -583,6 +705,8 @@ def _dib_corr24(fig, b, h):
              'Correlación', triangular=True, fs_anot=5.5)
     ax.set_xlabel('Hora UTC', fontsize=7)
     ax.set_ylabel('Hora UTC', fontsize=7)
+    agregar_hover_celdas(fig, ax, d['m'], d['labels'], d['labels'], '{:.2f}',
+                         nombre='corr24', titulo='Correlación')
 
 
 def _dib_heatmaps(fig, b, h):
@@ -606,6 +730,83 @@ def _dib_heatmaps(fig, b, h):
                  fmt_celda='{:.3f}', fs_anot=5.8)
         ax.set_xlabel('Hora UTC', fontsize=7)
         ax.set_ylabel(ylab, fontsize=7)
+        agregar_hover_celdas(fig, ax, bloque['m'], bloque['filas'],
+                             bloque['cols'], '{:.3f}', nombre=f'heatmap_{i}')
+
+
+def _dib_cambio_acumulado(fig, b, h, periodo):
+    """Cambio acumulado medio (día/semana/mes/año), con el mismo lenguaje
+    visual que el Precio por régimen ER: panel principal con la línea
+    coloreada por tramo (verde = subida, rojo = caída) y punto final
+    resaltado con el total; panel inferior con el cambio medio por paso."""
+    d = b.get('cambio_acumulado') or {}
+    clave = {'Día': 'dia', 'Semana': 'semana', 'Mes': 'mes',
+             'Año': 'anio'}.get(periodo, periodo)
+    c = d.get(clave)
+    if not c:
+        ax_placeholder(fig.add_subplot(111), "Sin datos de cambio acumulado medio.")
+        return
+    gs = fig.add_gridspec(2, 1, hspace=0.10, height_ratios=[3, 1])
+
+    x = np.asarray(c['pasos'], dtype=float)
+    y = np.asarray(c['y'], dtype=float)
+    paso_medio = np.asarray(c['paso_medio'], dtype=float)
+    labels = c.get('labels') or [str(int(v)) for v in x]
+    n = int(c.get('n', 0))
+    total = float(c.get('total', y[-1] if len(y) else 0.0))
+    # Ticks espaciados que SIEMPRE incluyen el último paso (p. ej. las
+    # 23:00 en la curva del día), aunque el stride no caiga en él.
+    paso_ticks = max(1, len(x) // 10)
+    ticks = list(x[::paso_ticks])
+    if x[-1] not in ticks:
+        ticks.append(x[-1])
+    tick_labels = [labels[int(t)] for t in ticks]
+
+    ax_p = fig.add_subplot(gs[0])
+    style_ax(ax_p)
+    if len(y) >= 2:
+        segmentos = np.array([x, y]).T.reshape(-1, 1, 2)
+        segs = np.concatenate([segmentos[:-1], segmentos[1:]], axis=1)
+        colores = np.where(np.diff(y) >= 0, VERDE, ROJO)
+        ax_p.add_collection(LineCollection(segs, colors=colores, linewidth=1.3,
+                                           alpha=0.95, zorder=2))
+    ax_p.plot(x, y, 'o', color=AX_FG, markersize=3, zorder=3, alpha=0.7)
+    ax_p.autoscale()
+    ax_p.axhline(0, color=GRIS, linewidth=0.6, linestyle='--', alpha=0.6)
+    ax_p.plot([x[-1]], [y[-1]], 'D', markersize=7, zorder=4,
+              color=VERDE if y[-1] >= 0 else ROJO)
+    ax_p.annotate(f'Total: {total:+.2f}%', (x[-1], y[-1]),
+                  textcoords='offset points', xytext=(6, 10), fontsize=7,
+                  color=AX_FG, fontweight='bold')
+    ax_p.set_xticks(ticks)
+    ax_p.set_xticklabels(tick_labels, fontsize=6)
+    ax_p.set_title(f"Cambio acumulado medio — {periodo} ({n} periodos completos)",
+                   fontsize=9)
+    ax_p.set_ylabel('Cambio acumulado %', fontsize=7)
+    ax_p.legend(handles=[
+        Line2D([0], [0], color=VERDE, linewidth=2, label='Subida'),
+        Line2D([0], [0], color=ROJO, linewidth=2, label='Caída'),
+    ], facecolor='#141e30', edgecolor=GRID_C, labelcolor=AX_FG, fontsize=6,
+        loc='upper left', framealpha=0.5)
+
+    ax_e = fig.add_subplot(gs[1])
+    style_ax(ax_e)
+    ax_e.bar(x, paso_medio, width=0.8,
+             color=[VERDE if v >= 0 else ROJO for v in paso_medio], alpha=0.75)
+    ax_e.axhline(0, color=GRIS, linewidth=0.5, linestyle='--')
+    ax_e.set_xticks(ticks)
+    ax_e.set_xticklabels(tick_labels, fontsize=6)
+    ax_e.set_title(f"Cambio medio por paso — {periodo}", fontsize=9)
+    ax_e.set_ylabel('Cambio por paso %', fontsize=7)
+
+    def _texto_hover(idx):
+        return [f"{labels[idx]} → acumulado: {y[idx]:+.3f}%",
+                f"{labels[idx]} → paso: {paso_medio[idx]:+.3f}%"]
+
+    agregar_crosshair(fig, [ax_p, ax_e], x, [y, paso_medio],
+                      _texto_hover, nombre='cambio_acumulado',
+                      colores=[AZUL, AMBAR], linestyle='--', horizontal=True,
+                      x_texto_fn=lambda i: labels[i])
 
 
 def _dib_natr_corr(fig, b, h):
@@ -620,6 +821,8 @@ def _dib_natr_corr(fig, b, h):
              triangular=True, fs_anot=6.5)
     ax.set_xlabel('Timeframe', fontsize=7)
     ax.set_ylabel('Timeframe', fontsize=7)
+    agregar_hover_celdas(fig, ax, d['corr'], d['labels'], d['labels'],
+                         '{:.2f}', nombre='natr_corr', titulo='Correlación NATR')
 
 
 def _dib_dependencia(fig, b, h):
@@ -635,6 +838,8 @@ def _dib_dependencia(fig, b, h):
         vals = np.asarray(esc['valores'], dtype=float).reshape(-1, 1)
         _heatmap(fig, ax1, vals, ['PACF lag 1'], esc['labels'], 'coolwarm',
                  -0.5, 0.5, 'Dependencia por escala', '', fs_anot=6)
+        agregar_hover_celdas(fig, ax1, vals, esc['labels'], ['PACF lag 1'],
+                             '{:.2f}', nombre='dependencia_escalas')
     else:
         ax_placeholder(ax1, "Sin escalas")
 
@@ -649,6 +854,33 @@ def _dib_dependencia(fig, b, h):
         for a in (ax2, ax3):
             style_ax(a)
             a.set_title(a.get_title(), fontsize=9)
+
+        # Valores por lag para el tooltip (exportados por el script con los
+        # mismos defaults que plot_acf; recálculo solo si el bundle es viejo).
+        acf_vals = d.get('acf')
+        pacf_vals = d.get('pacf')
+        if acf_vals is None or len(acf_vals) < 16:
+            from statsmodels.tsa.stattools import acf as _acf
+            acf_vals = _acf(serie, nlags=15)
+        if pacf_vals is None or len(pacf_vals) < 16:
+            from statsmodels.tsa.stattools import pacf as _pacf
+            pacf_vals = _pacf(serie, nlags=15)
+        acf_vals = np.asarray(acf_vals, dtype=float)
+        pacf_vals = np.asarray(pacf_vals, dtype=float)
+        lags_acf = np.arange(len(acf_vals))
+
+        def _texto_acf(idx):
+            return [f"lag {idx} → {acf_vals[idx]:.3f}"]
+
+        def _texto_pacf(idx):
+            return [f"lag {idx} → {pacf_vals[idx]:.3f}"]
+
+        agregar_crosshair(fig, [ax2], lags_acf, [acf_vals], _texto_acf,
+                          nombre='dependencia_acf', colores=[AZUL],
+                          linestyle='--', x_texto_fn=lambda i: f"lag {i}")
+        agregar_crosshair(fig, [ax3], np.arange(len(pacf_vals)), [pacf_vals],
+                          _texto_pacf, nombre='dependencia_pacf', colores=[AZUL],
+                          linestyle='--', x_texto_fn=lambda i: f"lag {i}")
     else:
         ax_placeholder(ax2, "Serie corta")
         ax_placeholder(ax3, "Serie corta")
@@ -661,8 +893,17 @@ def _dib_dependencia(fig, b, h):
                  alpha=0.6, linestyle='--',
                  label='Random walk (ruido)' if i == 0 else None)
     if d.get('precio_real') is not None:
-        ax4.plot(d['precio_real'], color='#e6edf3', linewidth=2.2, alpha=0.95,
+        precio_real = np.asarray(d['precio_real'], dtype=float)
+        ax4.plot(precio_real, color='#e6edf3', linewidth=2.2, alpha=0.95,
                  label='Activo real', zorder=5)
+
+        def _texto_walk(idx):
+            return [f"Vela {idx}\nPrecio real: {precio_real[idx]:.2f}"]
+
+        agregar_crosshair(fig, [ax4], np.arange(len(precio_real)),
+                          [precio_real], _texto_walk, nombre='dependencia_walk',
+                          colores=['#e6edf3'], linestyle='--',
+                          x_texto_fn=lambda i: f"Vela {i}")
     ax4.set_title('Estructura vs. ruido aleatorio (simulación de precio)', fontsize=9)
     ax4.set_ylabel('Precio simulado', fontsize=7)
     leyenda(ax4, loc='upper left')
@@ -671,8 +912,9 @@ def _dib_dependencia(fig, b, h):
     style_ax(ax5)
     acf_sq = d.get('acf_sq')
     if acf_sq is not None and len(acf_sq):
+        acf_sq = np.asarray(acf_sq, dtype=float)
         lags = np.arange(len(acf_sq))
-        ml, sl, bl = ax5.stem(lags, np.asarray(acf_sq, dtype=float))
+        ml, sl, bl = ax5.stem(lags, acf_sq)
         ml.set_color('#185FA5')
         ml.set_markersize(3.5)
         sl.set_color('#185FA5')
@@ -689,6 +931,13 @@ def _dib_dependencia(fig, b, h):
             ax5.text(0.98, 0.92, f"LB p-valor: {d['lb_p']:.4f}  {'✓' if ok else '✗'}",
                      transform=ax5.transAxes, ha='right', va='top', fontsize=8,
                      color=VERDE if ok else ROJO)
+
+        def _texto_acf2(idx):
+            return [f"lag {idx} → {acf_sq[idx]:.3f}" + (f" (CI ±{ci:.3f})" if ci else "")]
+
+        agregar_crosshair(fig, [ax5], lags, [acf_sq], _texto_acf2,
+                          nombre='dependencia_acf2', colores=[AZUL],
+                          linestyle='--', x_texto_fn=lambda i: f"lag {i}")
     else:
         ax_placeholder(ax5, "No hay suficientes datos para el ACF de retornos².")
 
@@ -706,19 +955,30 @@ def _dib_dashboard_natr(fig, b, h):
     style_ax(ax_a)
     term = d.get('term')
     if term:
-        ax_a.plot(term['mins'], term['actual'], 'o-', color=AZUL, linewidth=1.3,
+        mins_a = np.asarray(term['mins'], dtype=float)
+        actual_a = np.asarray(term['actual'], dtype=float)
+        teorico_a = np.asarray(term['teorico'], dtype=float)
+        ax_a.plot(mins_a, actual_a, 'o-', color=AZUL, linewidth=1.3,
                   markersize=4, label='NATR actual', zorder=3)
-        ax_a.plot(term['mins'], term['teorico'], 'x--', color=NARANJA, linewidth=1.0,
+        ax_a.plot(mins_a, teorico_a, 'x--', color=NARANJA, linewidth=1.0,
                   markersize=4, alpha=0.75, label='Teórico √T', zorder=2)
         ax_a.set_xscale('log')
         ax_a.set_yscale('log')
-        ax_a.set_xticks(term['mins'])
+        ax_a.set_xticks(mins_a)
         ax_a.set_xticklabels(term['tfs'], rotation=30, ha='right', fontsize=6)
         est = term.get('estructura', '')
         ax_a.text(0.98, 0.05, est, transform=ax_a.transAxes, ha='right', va='bottom',
                   color=ROJO if est.startswith('BACK') else VERDE,
                   fontsize=8, fontweight='bold')
         leyenda(ax_a, loc='upper left', fontsize=6)
+
+        def _texto_a(idx):
+            return [f"{term['tfs'][idx]} → NATR {actual_a[idx]:.3f}%\n"
+                    f"Teórico √T: {teorico_a[idx]:.3f}%"]
+
+        agregar_crosshair(fig, [ax_a], mins_a, [actual_a], _texto_a,
+                          nombre='dash_term', colores=[AZUL], linestyle='--',
+                          horizontal=True, x_texto_fn=lambda i: term['tfs'][i])
     else:
         ax_placeholder(ax_a, "Sin datos para term structure.")
     ax_a.set_title('A — Term structure NATR', fontsize=9)
@@ -728,7 +988,7 @@ def _dib_dashboard_natr(fig, b, h):
     style_ax(ax_b)
     z = d.get('z')
     if z:
-        vals = z['vals']
+        vals = np.asarray(z['vals'], dtype=float)
         colores = [ROJO if v > 2 else VERDE if v < -2 else AMBAR if abs(v) > 1 else '#2a4a6a'
                    for v in vals]
         y = np.arange(len(vals))
@@ -743,6 +1003,22 @@ def _dib_dashboard_natr(fig, b, h):
             ax_b.text(max(v + 0.1, 0.15) if v >= 0 else min(v - 0.1, -0.15), i,
                       f'{v:+.2f}', va='center', fontsize=6, color=AX_FG,
                       ha='left' if v >= 0 else 'right')
+
+        # El punto marcado debe caer sobre la punta de la barra: la serie que
+        # recibe el crosshair es el índice de la barra (coordenada Y del barh).
+        # Las posiciones X (valores Z) se ordenan antes de pasarlas: el snap
+        # del crosshair usa searchsorted, que exige una X creciente.
+        orden = np.argsort(vals)
+        x_b = vals[orden]
+        y_b = y[orden].astype(float)
+
+        def _texto_b(idx, orden=orden, vals=vals):
+            i = orden[idx]
+            return [f"{z['tfs'][i]} → Z {vals[i]:+.2f}"]
+
+        agregar_crosshair(fig, [ax_b], x_b, [y_b], _texto_b,
+                          nombre='dash_z', colores=[AZUL], linestyle='--',
+                          x_texto_fn=lambda i, orden=orden: z['tfs'][orden[i]])
     else:
         ax_placeholder(ax_b, "Sin Z-scores.")
     ax_b.set_title('B — Z-score NATR por TF', fontsize=9)
@@ -760,6 +1036,20 @@ def _dib_dashboard_natr(fig, b, h):
         _eje_fechas(ax_c, sz['series'][0]['x'])
         leyenda(ax_c, loc='upper right', fontsize=6)
         titulo_c = f"C — Serie temporal Z-score ({sz.get('par')})" if sz.get('par') else 'C — Serie temporal Z-score'
+
+        x_c = _x(sz['series'][0]['x'])
+        series_c = [np.asarray(s['y'], dtype=float) for s in sz['series']]
+
+        def _texto_c(idx):
+            lineas = [f"{s['tf']}: {np.asarray(s['y'], dtype=float)[idx]:+.2f}"
+                      for s, arr in zip(sz['series'], series_c)
+                      if idx < len(arr)]
+            return ["\n".join(lineas)]
+
+        agregar_crosshair(fig, [ax_c], x_c,
+                          [series_c[0][:len(x_c)]], _texto_c,
+                          nombre='dash_zserie', colores=[AZUL], linestyle='--',
+                          horizontal=True)
     else:
         ax_placeholder(ax_c, "Sin series temporales.")
         titulo_c = 'C — Serie temporal Z-score'
@@ -783,6 +1073,21 @@ def _dib_dashboard_natr(fig, b, h):
                 ax_d.scatter(_x(r['x_actual']), [r['current']], color=color, s=22, zorder=5)
         _eje_fechas(ax_d, ratios[0]['x'])
         leyenda(ax_d, loc='upper right', fontsize=6)
+
+        r0 = ratios[0]
+        x_d0 = _x(r0['x'])
+        y_d0 = np.asarray(r0['y'], dtype=float)
+        bb0 = r0.get('bb')
+
+        def _texto_d(idx):
+            lineas = [f"{r0['label']}: {y_d0[idx]:.3f}"]
+            if bb0 and idx < len(bb0['mu']):
+                lineas.append(f"Banda μ: {bb0['mu'][idx]:.3f}")
+            return ["\n".join(lineas)]
+
+        agregar_crosshair(fig, [ax_d], x_d0, [y_d0[:len(x_d0)]], _texto_d,
+                          nombre='dash_ratio', colores=[AZUL], linestyle='--',
+                          horizontal=True)
     else:
         ax_placeholder(ax_d, "Sin ratios Short/Long disponibles.")
     ax_d.set_title('D — Ratio Short/Long (Bollinger ±2σ)', fontsize=9)
@@ -800,25 +1105,47 @@ class _Seccion(QGroupBox):
     """
 
     def __init__(self, titulo, ayuda, dibujante, alto=320, depende_ventana=False,
-                 parent=None):
+                 selector_opciones=None, parent=None):
         """`ayuda`: tupla (logica, significado, uso, resultados) — las 4
-        pestañas del popup que abre el icono_ayuda."""
+        pestañas del popup que abre el icono_ayuda.
+
+        `selector_opciones`: si se pasa, la sección lleva una fila de botones
+        exclusivos en la cabecera y el dibujante recibe la opción activa como
+        cuarto argumento `(fig, bundle, horizonte, opcion)`; pulsar un botón
+        repinta el canvas con la nueva opción sin recargar el bundle."""
         super().__init__(parent)
         self._dibujante = dibujante
         self._sucio = True
         self.depende_ventana = depende_ventana
         self._area = None   # lo asigna _PestanaScroll.add_seccion
+        self.selector_valor = None
+        self._bundle_sel = None
+        self._horizonte_sel = None
+        self._botones_opcion = {}
+
+        if selector_opciones:
+            self.selector_valor = selector_opciones[0]
+            dibujante_base = dibujante
+            self._dibujante = (lambda fig, b, h, base=dibujante_base:
+                               base(fig, b, h, self.selector_valor))
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(10, 8, 10, 10)
         lay.setSpacing(6)
 
-        self.fig, self.canvas = make_canvas(alto_min=alto)
-        self.canvas.installEventFilter(self)
-        # Que la rueda no le robe el foco al canvas: si lo hiciera, girar la
-        # rueda sobre un gráfico dejaría de permitir cambiar de pestaña con las
-        # flechas hasta volver a hacer clic fuera.
-        self.canvas.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        # El canvas matplotlib NO se crea aquí: las secciones de las pestañas
+        # ocultas del informe se construirían todas al arrancar (12 figuras
+        # por informe), bloqueando la UI varios segundos durante la precarga
+        # y haciendo que Windows mostrara copias "no responde". Se crea bajo
+        # demanda en _asegurar_canvas() (primer pintado o pestaña visible).
+        self._alto = alto
+        self.fig = None
+        self.canvas = None
+        self.barra = None
+        self._lugar_canvas = QWidget()
+        self._lugar_canvas.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self._lugar_canvas.setStyleSheet("background-color: #111828;")
+        self._lay = lay
 
         cabecera = QHBoxLayout()
         cabecera.setSpacing(6)
@@ -826,15 +1153,52 @@ class _Seccion(QGroupBox):
         lbl.setObjectName("titulo")
         cabecera.addWidget(lbl)
         cabecera.addWidget(icono_ayuda(*ayuda))
+        if selector_opciones:
+            self._selector_grupo = QButtonGroup(self)
+            self._selector_grupo.setExclusive(True)
+            for _opcion in selector_opciones:
+                boton = QToolButton(self)
+                boton.setText(_opcion)
+                boton.setCheckable(True)
+                boton.setChecked(_opcion == self.selector_valor)
+                boton.setToolTip(f"Mostrar el cambio acumulado medio de {_opcion}")
+                self._selector_grupo.addButton(boton)
+                self._botones_opcion[_opcion] = boton
+                boton.toggled.connect(
+                    lambda activo, op=_opcion: self._on_selector(op, activo))
+                cabecera.addWidget(boton)
         cabecera.addStretch()
+        self._cabecera = cabecera
+        lay.addLayout(cabecera)
+        lay.addWidget(self._lugar_canvas, 1)
+        bombear_eventos()
+
+    def _asegurar_canvas(self):
+        """Crea la figura y el canvas matplotlib la primera vez que se
+        necesitan (primera pintada con datos), sustituyendo el placeholder.
+
+        Diferir la creación ahorra ~12 figuras al arrancar (las secciones de
+        todas las pestañas del informe se construían aunque estuvieran
+        ocultas) y reparte ese coste a la carga real del análisis, donde el
+        cursor de espera y el bombeo entre pestañas ya lo cubren."""
+        if self.canvas is not None:
+            return
+        self.fig, self.canvas = make_canvas(alto_min=self._alto)
+        self.canvas.installEventFilter(self)
+        # Que la rueda no le robe el foco al canvas: si lo hiciera, girar la
+        # rueda sobre un gráfico dejaría de permitir cambiar de pestaña con las
+        # flechas hasta volver a hacer clic fuera.
+        self.canvas.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         self.barra = BarraGrafico(self.canvas, self, mostrar_coords=False)
         # La barra también se filtra: sus QToolButton pueden quedarse la rueda y
         # dejar muerta esa franja de la sección.
         self.barra.installEventFilter(self)
-        cabecera.addWidget(self.barra)
-        lay.addLayout(cabecera)
-        lay.addWidget(self.canvas, 1)
-        bombear_eventos()
+        self._cabecera.insertWidget(self._cabecera.count() - 1, self.barra)
+        idx = self._lay.indexOf(self._lugar_canvas)
+        if idx >= 0:
+            self._lay.takeAt(idx)
+            self._lugar_canvas.deleteLater()
+            self._lay.insertWidget(idx, self.canvas, 1)
 
     def eventFilter(self, obj, event):
         # FigureCanvasQTAgg acepta los eventos de rueda (los traduce a
@@ -868,10 +1232,48 @@ class _Seccion(QGroupBox):
     def marcar_sucio(self):
         self._sucio = True
 
+    def _sincronizar_selector_tf(self, bundle):
+        """En TF diario o mayor el horizonte 'Día' no tiene sentido (una sola
+        vela por día → curva 00:00/24:00 vacía): se deshabilita el botón y, si
+        era la selección activa (por defecto al cargar), pasa a 'Semana'."""
+        boton_dia = self._botones_opcion.get('Día')
+        if boton_dia is None:
+            return
+        meta = (bundle or {}).get('_meta') or {}
+        tf = meta.get('tf')
+        nat_min = tf_to_minutes(tf) if tf else None
+        es_diario = nat_min is not None and nat_min >= 1440
+        boton_dia.setEnabled(not es_diario)
+        boton_dia.setToolTip(
+            "No disponible en TF diario o mayor: con una vela por día la "
+            "curva del Día (00:00→24:00) queda vacía." if es_diario else
+            "Mostrar el cambio acumulado medio de Día")
+        if es_diario and self.selector_valor == 'Día':
+            # Cambia la selección sin reentrar en _on_selector (que repintaría
+            # el canvas en mitad de la carga del bundle).
+            for b in self._botones_opcion.values():
+                b.blockSignals(True)
+            self._botones_opcion['Día'].setChecked(False)
+            self._botones_opcion['Semana'].setChecked(True)
+            for b in self._botones_opcion.values():
+                b.blockSignals(False)
+            self.selector_valor = 'Semana'
+
+    def _on_selector(self, opcion, activo):
+        if not activo:
+            return
+        self.selector_valor = opcion
+        if self._bundle_sel is not None:
+            self.pintar(self._bundle_sel, self._horizonte_sel, forzar=True)
+
     @no_crash
     def pintar(self, bundle, horizonte, forzar=False):
         if bundle is None or (not self._sucio and not forzar):
             return
+        self._asegurar_canvas()
+        self._bundle_sel = bundle
+        self._horizonte_sel = horizonte
+        self._sincronizar_selector_tf(bundle)
         self.fig.clear()
         # Motor 'constrained' en vez de tight_layout: varias secciones llevan
         # colorbar, y tight_layout no sabe colocar esos ejes (avisa y descuadra
@@ -1050,24 +1452,64 @@ class GraficosAnalisis(QWidget):
              "y calcula el VaR al 95% y al 99% —la pérdida que solo se supera el 5%/1% de "
              "las veces— de forma paramétrica (percentil de la Normal ajustada) si los "
              "retornos pasan el test de normalidad, o histórica (percentil real de la "
-             "muestra) si no lo pasan. El panel inferior recalcula ese mismo VaR en una "
+             "muestra) si no lo pasan. Además dibuja el CVaR (Expected Shortfall), la "
+             "pérdida MEDIA cuando se supera ese umbral, con la misma lógica adaptativa "
+             "(línea discontinua). El panel inferior recalcula ese mismo VaR en una "
              "ventana móvil.",
              "El VaR 95% es la pérdida que, en una vela cualquiera, solo debería "
-             "superarse el 5% de las veces; el 99% es el equivalente más extremo. La "
-             "línea rolling muestra cómo ese umbral ha cambiado en el tiempo, frente a "
-             "los percentiles P5/P1 fijos de todo el periodo.",
+             "superarse el 5% de las veces; el 99% es el equivalente más extremo. El "
+             "CVaR (línea discontinua) es la pérdida media de esas velas que SÍ superan "
+             "el umbral: siempre es mayor (en magnitud) que el VaR. Cuanto mayor sea esa "
+             "diferencia, más gorda es la cola de pérdidas (eventos extremos más duros de "
+             "lo que la Normal proyecta). La línea rolling muestra cómo ese umbral ha "
+             "cambiado en el tiempo, frente a los percentiles P5/P1 fijos de todo el "
+             "periodo.",
              "Sirve para dimensionar el riesgo esperado por operación a nivel de vela "
              "(tamaño de posición) y para detectar en qué tramos temporales el riesgo se "
-             "disparó por encima de lo habitual.",
+             "disparó por encima de lo habitual. El CVaR es más útil que el VaR para "
+             "dimensionar, porque responde a «si se supera el umbral, ¿cuánto se pierde "
+             "de media?» en vez de quedarse en el borde.",
              "Si la línea de VaR rolling se mantiene cerca de las líneas de referencia "
              "P5/P1 todo el periodo, el riesgo por vela es estable; picos donde el "
              "rolling se dispara muy por encima de esas referencias señalan episodios de "
              "volatilidad anómala en los que operar con el tamaño de posición \"normal\" "
-             "habría sido más arriesgado de lo habitual."),
+             "habría sido más arriesgado de lo habitual. Si el CVaR se aleja mucho del "
+             "VaR en la campana, el activo tiene colas gordas: el peor caso esperado es "
+             "peor de lo que la Normal sugiere."),
             _dib_riesgo_intradia, alto=560))
         riesgo.cerrar()
 
         intradia = _PestanaScroll()
+        intradia.add_seccion(_Seccion(
+            "Cambio acumulado medio (Día/Semana/Mes/Año)",
+            ("Para cada periodo completo del histórico —día de 24h, semana, mes "
+             "o año— se calcula la trayectoria del cambio acumulado paso a paso "
+             "(hora UTC en el día, día de la semana en la semana, día del mes, "
+             "mes del año) y luego se promedian todas esas trayectorias. Los "
+             "pasos sin velas (mercado cerrado) cuentan como 0, así que la curva "
+             "queda plana donde el activo no cotiza. La semana usa Lun-Vie para "
+             "acciones/futuros/forex y Lun-Dom para cripto. Se excluye el periodo "
+             "en curso porque está incompleto.",
+             "El panel superior muestra la curva promedio del cambio acumulado "
+             "coloreada por tramo: verde cuando la curva sube, rojo cuando baja; "
+             "el rombo final marca el cambio promedio TOTAL de ese periodo. El "
+             "panel inferior muestra el cambio medio de cada paso individual, "
+             "para ver en qué momento concreto del periodo tiende a moverse el "
+             "activo. Los botones de la cabecera cambian entre Día, Semana, Mes "
+             "y Año.",
+             "Sirve para saber cómo se comporta el activo 'de media' a lo largo "
+             "de cada periodo: en qué horas/días/meses suele subir o bajar y "
+             "cuánto. Útil para comparar el comportamiento esperado del día vs "
+             "la semana vs el mes (p. ej. un activo que de media sube a "
+             "principio de mes pero cae el resto).",
+             "Una curva final positiva indica que el periodo tiende a cerrar en "
+             "positivo de media, y su pendiente dice cuándo ocurre el grueso del "
+             "movimiento. Tramos rojos largos señalan fases típicas de caída; "
+             "si el total es pequeño pero los pasos intermedios son grandes, el "
+             "activo da mucha vuelta: gana y pierde dentro del periodo sin "
+             "dejar tendencia clara."),
+            _dib_cambio_acumulado, alto=520,
+            selector_opciones=('Día', 'Semana', 'Mes', 'Año')))
         intradia.add_seccion(_Seccion(
             "Perfil horario",
             ("Para cada una de las 24 horas UTC se calcula la desviación típica de los "

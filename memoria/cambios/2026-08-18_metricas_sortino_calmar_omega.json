@@ -1,0 +1,21 @@
+{
+  "resumen_ejecutivo": "Cambio en 2 archivo(s) (687+ / 11- líneas).",
+  "modificaciones_clave": [
+    {
+      "archivo": "core/metrics.py",
+      "motivo": "modificación detectada en el diff (revisar hunks)"
+    },
+    {
+      "archivo": "gui/widgets/tab_backtest.py",
+      "motivo": "modificación detectada en el diff (revisar hunks)"
+    }
+  ],
+  "impacto_tecnico": [
+    "métricas cuantitativas (core/metrics.py)",
+    "pestaña de backtest (gui/widgets/tab_backtest.py)"
+  ],
+  "tags": [
+    "metrics",
+    "tab_backtest"
+  ]
+}

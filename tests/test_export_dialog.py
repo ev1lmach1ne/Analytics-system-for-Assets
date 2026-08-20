@@ -201,7 +201,7 @@ def test_copiar_pine_deja_el_codigo_listo_para_pegar(app, monkeypatch):
     usuario tenga que abrir el .pine con un editor para copiarlo es un rodeo
     que este botón elimina."""
     monkeypatch.setattr(
-        'gui.dialogs.export_codigo_dialog.QMessageBox.information',
+        'gui.dialogs.export_codigo_dialog.informacion',
         lambda *a, **k: None)
     dlg = DialogoExportarCodigo([_setup()], CUENTA, META)
     dlg._copiar_pine()
@@ -214,7 +214,7 @@ def test_copiar_pine_deja_el_codigo_listo_para_pegar(app, monkeypatch):
 
 def test_copiar_pine_no_escribe_nada_en_disco(app, tmp_path, monkeypatch):
     monkeypatch.setattr(
-        'gui.dialogs.export_codigo_dialog.QMessageBox.information',
+        'gui.dialogs.export_codigo_dialog.informacion',
         lambda *a, **k: None)
     dlg = DialogoExportarCodigo([_setup()], CUENTA, META)
     dlg.txt_destino.setText(str(tmp_path))
@@ -229,7 +229,7 @@ def test_copiar_pine_avisa_si_hay_varios_setups(app, monkeypatch):
     que no compila, así que se copia uno y se dice cuál."""
     mensajes = []
     monkeypatch.setattr(
-        'gui.dialogs.export_codigo_dialog.QMessageBox.information',
+        'gui.dialogs.export_codigo_dialog.informacion',
         lambda *a, **k: mensajes.append(a[2]))
     dlg = DialogoExportarCodigo([_setup(), _setup()], CUENTA, META)
     dlg._copiar_pine()
@@ -240,7 +240,7 @@ def test_copiar_pine_avisa_si_hay_varios_setups(app, monkeypatch):
 def test_copiar_pine_avisa_cuando_no_hay_nada_generable(app, monkeypatch):
     avisos = []
     monkeypatch.setattr(
-        'gui.dialogs.export_codigo_dialog.QMessageBox.warning',
+        'gui.dialogs.export_codigo_dialog.aviso',
         lambda *a, **k: avisos.append(a[2]))
     setup = {'nombre': 'patrones', 'plantilla': 'Patrones de velas',
              'params': {'patrones': ['Martillo'], 'lag_salida': 5},
@@ -271,7 +271,7 @@ def test_sin_nombre_no_se_exporta(app, tmp_path, monkeypatch):
     dlg.txt_destino.setText(str(tmp_path))
     dlg.txt_nombre.setText('   ')
     monkeypatch.setattr(
-        'gui.dialogs.export_codigo_dialog.QMessageBox.warning',
+        'gui.dialogs.export_codigo_dialog.aviso',
         lambda *a, **k: None)
     dlg._exportar()
     assert dlg.resultado is None

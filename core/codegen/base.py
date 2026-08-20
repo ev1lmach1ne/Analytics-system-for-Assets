@@ -82,6 +82,8 @@ class Emisor:
             return self.comparacion(nodo)
         if op == 'giro_sar':
             return self.giro_sar(nodo)
+        if op == 'giro_supertrend':
+            return self.giro_supertrend(nodo)
         if op == 'patron':
             return self.patron(nodo)
         raise ValueError(
@@ -96,6 +98,10 @@ class Emisor:
             return self.op_mayor(izq, der)
         if op == '<':
             return self.op_menor(izq, der)
+        if op == '>=':
+            return self.op_mayor_igual(izq, der)
+        if op == '<=':
+            return self.op_menor_igual(izq, der)
         if op == 'cruza arriba':
             return self.op_cruza_arriba(izq, der)
         if op == 'cruza abajo':
@@ -150,6 +156,10 @@ class Emisor:
         raise ValueError(
             f"{self.nombre}: no sabe emitir el giro del Parabolic SAR.")
 
+    def giro_supertrend(self, nodo):
+        raise ValueError(
+            f"{self.nombre}: no sabe emitir el giro del Supertrend.")
+
     def patron(self, nodo):
         raise ValueError(
             f"{self.nombre}: no sabe emitir el patrón de vela "
@@ -171,6 +181,12 @@ class Emisor:
 
     def op_menor(self, izq, der):
         return f"{izq} < {der}"
+
+    def op_mayor_igual(self, izq, der):
+        return f"{izq} >= {der}"
+
+    def op_menor_igual(self, izq, der):
+        return f"{izq} <= {der}"
 
     def op_cruza_arriba(self, izq, der):
         raise NotImplementedError
@@ -194,10 +210,12 @@ class Emisor:
         (bb_inf_20_2p0 frente a bb_inf_20_3p0)."""
         tipo = nodo['tipo'].lower()
         partes = [tipo]
-        for clave in ('periodo', 'desv', 'rapido', 'lento', 'periodo_k',
+        for clave in ('periodo', 'desv', 'rapido', 'lento', 'senal',
+                      'multiplicador', 'tenkan', 'kijun', 'senkou',
+                      'mult_bb', 'mult_kc', 'periodo_k',
                       'suavizado_k', 'periodo_d', 'af_inicial', 'af_paso',
                       'af_max', 'ventana', 'periodo_base', 'desviacion',
-                      'piernas'):
+                      'piernas', 'anclaje', 'k', 'modo'):
             if clave in nodo:
                 partes.append(_sufijo(nodo[clave]))
         if nodo.get('fuente') == 'close':
@@ -292,7 +310,10 @@ class Emisor:
 def _sufijo(valor):
     """Trozo de identificador a partir de un número: el punto decimal pasa a
     'p' y el signo a 'm', porque ni Pine ni MQL admiten '.' ni '-' dentro de
-    un nombre de variable."""
+    un nombre de variable. Las cadenas (p. ej. 'anclaje'/'modo' del VWAP) se
+    normalizan en minúsculas sin acentos."""
+    if isinstance(valor, str):
+        return _sin_acentos(valor).lower().replace('.', 'p').replace('-', 'm')
     if isinstance(valor, float) and valor != int(valor):
         return f"{valor:g}".replace('.', 'p').replace('-', 'm')
     return str(int(valor)).replace('-', 'm')

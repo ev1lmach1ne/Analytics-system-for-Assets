@@ -71,7 +71,7 @@ def test_categoria_conocida_pinta_un_solo_icono_con_cuatro_pestanas(app):
 
     icono = iconos[0]
     icono.mousePressEvent(None)          # el handler ignora el evento
-    tabs = icono._popup.findChild(QTabWidget)
+    tabs = icono._overlay_ayuda.findChild(QTabWidget)
     assert [tabs.tabText(i) for i in range(tabs.count())] == \
         ['Lógica', 'Significado', 'Uso', 'Resultados']
 
@@ -86,7 +86,7 @@ def test_selector_ventana_tiene_icono_junto_al_combo(app):
     assert posiciones[tab.icono_ventana] == posiciones[tab.horizon] + 1
 
     tab.icono_ventana.mousePressEvent(None)
-    tabs = tab.icono_ventana._popup.findChild(QTabWidget)
+    tabs = tab.icono_ventana._overlay_ayuda.findChild(QTabWidget)
     assert tabs.count() == 4
     assert all(t.strip() for t in AYUDA_VENTANA)
 

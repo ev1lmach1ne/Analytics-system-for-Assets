@@ -16,10 +16,11 @@ El stop y el take-profit se ponen con strategy.exit(stop=, limit=), que Pine
 comprueba contra el recorrido de la vela y rellena en el nivel — igual que el
 motor los comprueba contra low/high y rellena en el precio del nivel.
 
-Lo que NO se puede reproducir: el motor dimensiona con el ATR de la vela en
-cuya apertura entra, y ese ATR incluye el máximo, el mínimo y el cierre de esa
-misma vela. En vivo no existe todavía, así que aquí se usa el de la última
-vela cerrada. Va declarado en fidelidad.CAPACIDADES y avisado en la cabecera.
+Lo que NO se puede reproducir: el motor dimensiona con el ATR de la última
+vela cerrada antes de la entrada (atr[i-1], ver core/backtest._atr_cerrado);
+aquí se usa el de la vela de la señal, que ya está cerrada, así que coinciden
+salvo en el borde inicial de la serie. Va declarado en fidelidad.CAPACIDADES y
+avisado en la cabecera.
 """
 import os
 
@@ -76,6 +77,14 @@ class EmisorPine(Emisor):
         contrario = '-1' if nodo['sentido'] > 0 else '1'
         return f"({tend} == {signo} and {tend}[1] == {contrario})"
 
+    def giro_supertrend(self, nodo):
+        """Mismo patrón que el giro del SAR: la tendencia la expone
+        zcsSupertrend en su segunda variable de retorno."""
+        tend = self.nombre_serie(nodo['sar']) + '_tend'
+        signo = '1' if nodo['sentido'] > 0 else '-1'
+        contrario = '-1' if nodo['sentido'] > 0 else '1'
+        return f"({tend} == {signo} and {tend}[1] == {contrario})"
+
     # ══════════════ declaración de indicadores ══════════════
 
     def declarar_serie(self, nombre, nodo):
@@ -125,6 +134,58 @@ class EmisorPine(Emisor):
         if tipo == 'SAR':
             return (f"[{nombre}, {nombre}_tend] = zcsSar({arg('af_inicial')}, "
                     f"{arg('af_paso')}, {arg('af_max')})")
+        if tipo == 'SUPERTREND':
+            return (f"[{nombre}, {nombre}_tend] = zcsSupertrend("
+                    f"{arg('periodo')}, {self.num(nodo['multiplicador'])})")
+        if tipo in ('MACD_LINEA', 'MACD_SENAL', 'MACD_HIST'):
+            # cada serie declara el trío completo (zcsMacd devuelve tres
+            # valores): los nombres se derivan del tipo de cada una
+            suf = nombre[len(tipo.lower()):]
+            return (f"[macd_linea{suf}, macd_senal{suf}, macd_hist{suf}] = "
+                    f"zcsMacd({arg('rapido')}, {arg('lento')}, {arg('senal')})")
+        if tipo in ('ADX', 'DI_PLUS', 'DI_MINUS'):
+            suf = nombre[len(tipo.lower()):]
+            return (f"[adx{suf}, di_plus{suf}, di_minus{suf}] = "
+                    f"zcsAdx({arg('periodo')})")
+        if tipo in ('AROON_UP', 'AROON_DN'):
+            funcion = 'zcsAroonUp' if tipo == 'AROON_UP' else 'zcsAroonDown'
+            return f"{nombre} = {funcion}({arg('periodo')})"
+        if tipo == 'CMO':
+            return f"{nombre} = zcsCmo({arg('periodo')})"
+        if tipo == 'TRIX':
+            return f"{nombre} = zcsTrix({arg('periodo')})"
+        if tipo in ('STOCHRSI', 'STOCHRSI_D'):
+            fname = 'zcsStochRsiK' if tipo == 'STOCHRSI' else 'zcsStochRsiD'
+            return f"{nombre} = {fname}({arg('periodo')})"
+        if tipo in ('ICHIMOKU_TENKAN', 'ICHIMOKU_KIJUN', 'ICHIMOKU_SENKOU_A',
+                    'ICHIMOKU_SENKOU_B', 'ICHIMOKU_CHIKOU'):
+            fname = {'ICHIMOKU_TENKAN': 'zcsIchimokuTenkan',
+                     'ICHIMOKU_KIJUN': 'zcsIchimokuKijun',
+                     'ICHIMOKU_SENKOU_A': 'zcsIchimokuSenkouA',
+                     'ICHIMOKU_SENKOU_B': 'zcsIchimokuSenkouB',
+                     'ICHIMOKU_CHIKOU': 'zcsIchimokuChikou'}[tipo]
+            return (f"{nombre} = {fname}({arg('tenkan')}, {arg('kijun')}, "
+                    f"{arg('senkou')})")
+        if tipo in ('KELTNER_SUP', 'KELTNER_INF', 'KELTNER_MEDIA'):
+            fname = {'KELTNER_MEDIA': 'zcsKeltnerMedia',
+                     'KELTNER_SUP': 'zcsKeltnerSup',
+                     'KELTNER_INF': 'zcsKeltnerInf'}[tipo]
+            return (f"{nombre} = {fname}({arg('periodo')}, "
+                    f"{self.num(nodo['multiplicador'])})")
+        if tipo in ('TTM_SQUEEZE', 'TTM_MOMENTUM'):
+            fname = 'zcsTtmSqueeze' if tipo == 'TTM_SQUEEZE' else 'zcsTtmMomentum'
+            return (f"{nombre} = {fname}({arg('periodo')}, "
+                    f"{self.num(nodo['mult_bb'])}, {self.num(nodo['mult_kc'])})")
+        if tipo in ('VWAP_MEDIA', 'VWAP_SD', 'VWAP_SUP', 'VWAP_INF'):
+            fname = {'VWAP_MEDIA': 'zcsVwapMedia', 'VWAP_SD': 'zcsVwapSd',
+                     'VWAP_SUP': 'zcsVwapSup', 'VWAP_INF': 'zcsVwapInf'}[tipo]
+            ancla = f'"{nodo["anclaje"]}"'
+            modo_lit = f'"{nodo["modo"]}"'
+            return (f"{nombre} = {fname}({ancla}, {arg('k')}, {modo_lit})")
+        if tipo == 'ZIGZAG':
+            return (f"[{nombre}, {nombre}_tipo] = zcsZigzag("
+                    f"{self.num(nodo['desviacion'])}, "
+                    f"{self.num(nodo['piernas'])})")
         if tipo == 'PCT_ATR':
             return (f"{nombre} = zcsPercentilRodante("
                     f"zcsAtr({self.num(nodo['periodo_base'])}), "
@@ -374,11 +435,11 @@ class EmisorPine(Emisor):
         Pine ya da hechas (strategy.exit comprueba el stop contra el recorrido
         de la vela igual que el motor contra low/high)."""
         g = ir_setup['gestion']
-        return "\n".join([
+        bloques = [
             self._seccion("gestión de la posición"),
-            "// Distancia al stop. El motor la mide con el ATR de la vela en",
-            "// cuya apertura entra; en vivo ese dato aún no existe, así que",
-            "// aquí se usa el de la última vela cerrada (ver cabecera).",
+            "// Distancia al stop. El motor dimensiona con el ATR de la",
+            "// última vela cerrada antes de la entrada (atr[i-1]); aquí se usa",
+            "// el de la vela de la señal, que ya está cerrada: coinciden.",
             "distRef = p_stop_atr > 0 ? p_stop_atr * atrGestion "
             ": 2.0 * atrGestion",
             "",
@@ -391,6 +452,14 @@ class EmisorPine(Emisor):
             "var float maxFav = na",
             "var int barraEntrada = na",
             "var bool beAplicado = false",
+        ]
+        tramos = g['tramos']
+        if len(tramos) > 1:
+            bloques += [
+                "var int tramoActual = 1   // tramo que falta por añadir",
+                "var bool tramoOrden = false   // ya se pidió el del vela en curso",
+            ]
+        bloques += [
             "",
             "// ── entradas: al open de la vela siguiente a la señal ──",
             "if plano and puedeOperar",
@@ -410,8 +479,15 @@ class EmisorPine(Emisor):
             "    maxFav := strategy.position_avg_price",
             "    barraEntrada := bar_index",
             "    beAplicado := false",
-            "    stopActual := enLargo ? strategy.position_avg_price - "
-            "distEntrada : strategy.position_avg_price + distEntrada",
+        ]
+        if len(tramos) > 1:
+            bloques.append("    tramoActual := 1")
+        bloques += [
+            "    // el stop base solo existe si se pidió: sin él, BE y trailing",
+            "    // lo crean desde cero cuando disparan, igual que el motor",
+            "    stopActual := p_stop_atr > 0 ? (enLargo ? "
+            "strategy.position_avg_price - distEntrada : "
+            "strategy.position_avg_price + distEntrada) : na",
             "",
             "// ── gestión con la posición abierta ──",
             "if strategy.position_size != 0",
@@ -419,6 +495,10 @@ class EmisorPine(Emisor):
             "    precioIn = strategy.position_avg_price",
             "    maxFav := enLargo ? math.max(maxFav, high) "
             ": math.min(maxFav, low)",
+        ]
+        if len(tramos) > 1:
+            bloques += self._tramos(ir_setup, tramos[1:])
+        bloques += [
             "",
             "    // break-even: mueve el stop a la entrada cuando el avance a",
             "    // favor supera el umbral. La referencia se remide con el ATR",
@@ -427,23 +507,28 @@ class EmisorPine(Emisor):
                              else "atrGestion"),
             "    if p_be_atr > 0 and not beAplicado and "
             "(maxFav - precioIn) * dir >= p_be_atr * refBe",
-            "        stopActual := precioIn",
+            "        stopActual := na(stopActual) ? precioIn : (enLargo ? "
+            "math.max(stopActual, precioIn) : math.min(stopActual, precioIn))",
             "        beAplicado := true",
             "",
             "    // trailing: el stop sigue al extremo alcanzado y nunca afloja",
             "    if p_trailing_atr > 0",
             "        candidato = maxFav - p_trailing_atr * atrGestion * dir",
-            "        stopActual := enLargo ? math.max(stopActual, candidato) "
-            ": math.min(stopActual, candidato)",
+            "        stopActual := na(stopActual) ? candidato : (enLargo ? "
+            "math.max(stopActual, candidato) : "
+            "math.min(stopActual, candidato))",
             "",
             "    tpNivel = p_tp_r > 0 ? precioIn + p_tp_r * distEntrada * dir "
             ": na",
+            "    // el stop se aplica aunque no haya stop base: BE y trailing",
+            "    // pueden crearlo desde cero, igual que el motor",
+            "    hayStop = p_stop_atr > 0 or p_be_atr > 0 or p_trailing_atr > 0",
             "    if enLargo",
             '        strategy.exit("SalidaL", from_entry="L", '
-            'stop=p_stop_atr > 0 ? stopActual : na, limit=tpNivel)',
+            'stop=hayStop ? stopActual : na, limit=tpNivel)',
             "    else",
             '        strategy.exit("SalidaS", from_entry="S", '
-            'stop=p_stop_atr > 0 ? stopActual : na, limit=tpNivel)',
+            'stop=hayStop ? stopActual : na, limit=tpNivel)',
             "",
             "    // salida por señal de la plantilla",
             f"    if enLargo and {_VAR_SENAL['salidas_long']} and "
@@ -457,7 +542,78 @@ class EmisorPine(Emisor):
             "    if p_salida_velas > 0 and bar_index - barraEntrada >= "
             "p_salida_velas",
             '        strategy.close_all(comment="Tiempo")',
-        ])
+        ]
+        return "\n".join(bloques)
+
+    def _tramos(self, ir_setup, tramos):
+        """Tramos de entrada escalonada (2º en adelante).
+
+        Cada tramo añade posición al open de la vela siguiente a su disparador,
+        con un tamaño = riesgo_total × pct/100 / distancia_al_stop (con el mismo
+        suelo del 25% de la distancia de referencia que usa el motor). El
+        presupuesto no se suma: cada tramo arriesga su parte del riesgo total
+        del setup, que es exactamente lo que prometió el backtest."""
+        from core.codegen.ir import condiciones_de_lado
+        lineas = ["",
+                  "    // ── entrada escalonada: tramos adicionales ──",
+                  "    tramoOrden := false",
+                  "    // distancia al stop para dimensionar el tramo (suelo 25%)",
+                  "    distTramo = math.max(na(stopActual) ? distRef : "
+                  "math.abs(precioIn - stopActual), 0.25 * distRef)"]
+        for k, t in enumerate(tramos, 1):
+            cond = condiciones_de_lado(t['condiciones'], 'long')
+            cond_s = condiciones_de_lado(t['condiciones'], 'short')
+            pct = float(t['pct']) / 100.0
+            nombre = f"T{k}"
+            lineas += [
+                "",
+                f"    if tramoActual == {k} and not tramoOrden",
+                "        disparaT = false",
+                "        if enLargo",
+                f"            disparaT := {self._tramo_trig(t, 'long')}",
+                "            if disparaT and "
+                + (self.expr(cond) if cond is not None else "true"),
+                f"                qtyT = zcsUnidadesPorRiesgo(strategy.equity, "
+                f"p_riesgo_pct * {self.num(pct)}, distTramo)",
+                "                if qtyT > 0",
+                f'                    strategy.order("{nombre}", '
+                'strategy.long, qty=qtyT)',
+                "                    tramoActual += 1",
+                "                    tramoOrden := true",
+                "        if enCorto and not tramoOrden",
+                f"            disparaT := {self._tramo_trig(t, 'short')}",
+                "            if disparaT and "
+                + (self.expr(cond_s) if cond_s is not None else "true"),
+                f"                qtyT = zcsUnidadesPorRiesgo(strategy.equity, "
+                f"p_riesgo_pct * {self.num(pct)}, distTramo)",
+                "                if qtyT > 0",
+                f'                    strategy.order("{nombre}", '
+                'strategy.short, qty=qtyT)',
+                "                tramoActual += 1",
+                "                tramoOrden := true",
+            ]
+        return lineas
+
+    def _tramo_trig(self, t, lado):
+        """Expresión booleana del disparador de un tramo para un lado."""
+        val = float(t.get('val', 0.0))
+        trig = t['trigger']
+        if trig == 'senal':
+            return ("entradaLong and filtroLong" if lado == 'long'
+                    else "entradaShort and filtroShort")
+        if trig == 'velas':
+            return f"bar_index - barraEntrada >= {self.num(int(val))}"
+        if trig == 'retroceso':
+            return (f"low <= precioIn - {self.num(val)} * atrGestion"
+                    if lado == 'long'
+                    else f"high >= precioIn + {self.num(val)} * atrGestion")
+        if trig == 'avance':
+            return (f"high >= precioIn + {self.num(val)} * distRef"
+                    if lado == 'long'
+                    else f"low <= precioIn - {self.num(val)} * distRef")
+        if trig == 'cond':
+            return "true"   # lo decide solo la condición de abajo
+        return "false"
 
     def _aviso_runtime(self, avisos):
         """Aviso en ejecución de lo que se ha omitido. Sobrevive a que alguien
