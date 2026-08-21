@@ -1,0 +1,26 @@
+{
+  "etiqueta": "resumen_diario",
+  "fecha": "2026-08-20",
+  "resumen_diario": "1 cambio(s) técnico(s) consolidados el 2026-08-20.",
+  "temas_principales": [
+    "______",
+    "________________________",
+    "app",
+    "backtest"
+  ],
+  "modulos_afectados": [
+    "punto de entrada de la aplicación (app.py)",
+    "motor de backtest (core/backtest.py)",
+    "exportador de código Pine/MQL5 (core/codegen/)",
+    "suite de pruebas (tests/)"
+  ],
+  "decisiones_clave": [
+    "Cambio en 8 archivo(s) (567+ / 49- líneas)."
+  ],
+  "tags": [
+    "______",
+    "________________________",
+    "app",
+    "backtest"
+  ]
+}
